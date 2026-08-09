@@ -132,6 +132,9 @@ pub struct UiState {
     pub wireframe_available: bool,
     pub picking_color: bool,
     pub add_primitive: Primitive,
+    /// How far past the silhouette a stroke may reach for the surface, in
+    /// interface points. Zero means the cursor must be on the model.
+    pub brush_reach: f32,
     /// Bytes the last frame sent to the GPU, shown in the statistics.
     pub upload_bytes: u64,
     pub nav: NavWidget,
@@ -171,6 +174,7 @@ impl Default for UiState {
             wireframe_available: true,
             picking_color: false,
             add_primitive: Primitive::Sphere,
+            brush_reach: 10.0,
             upload_bytes: 0,
             nav: NavWidget::default(),
             show_nav: true,
@@ -654,6 +658,18 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
     BigSlider::new(&mut s.brush.auto_smooth, 0.0..=1.0, "Auto smooth")
         .height(m.row)
         .show(ui);
+    BigSlider::new(&mut st.brush_reach, 0.0..=40.0, "Reach past the edge")
+        .decimals(0)
+        .suffix(" px")
+        .height(m.row)
+        .show(ui);
+    ui.label(
+        egui::RichText::new(
+            "How far off the silhouette a stroke will still find the surface. Keep it small: the wider it is, the harder it is to miss the model on purpose.",
+        )
+        .small()
+        .color(p.dim),
+    );
 
     widgets::section_title(ui, "PRESSURE");
     widgets::toggle(ui, &mut s.brush.pressure_radius, "Pressure drives radius", m.row);

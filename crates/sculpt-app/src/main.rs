@@ -239,11 +239,32 @@ impl State {
     }
 
     /// The pick a brush should use: the surface under the cursor, or the
-    /// nearest surface within a brush radius of the ray when the cursor is
-    /// just off the silhouette. Grabbing the edge of a form needs the latter.
+    /// nearest surface just off the silhouette. Grabbing the edge of a form
+    /// needs the latter.
+    ///
+    /// The reach is a screen distance, not a world one. A brush radius of reach
+    /// sounds generous until you try to swing the camera: every click anywhere
+    /// near the model would find it and start sculpting. A few points is enough
+    /// to catch the edge and small enough to still be able to miss on purpose.
     fn pick_for_brush(&self, p: Vec2) -> Option<sculpt_core::SceneHit> {
         let (o, d) = self.ray_at(p);
-        self.sculptor.pick_soft(o, d, self.sculptor.brush.radius)
+        let reach = self.reach_in_world();
+        if reach <= 0.0 {
+            return self.sculptor.pick(o, d);
+        }
+        self.sculptor.pick_soft(o, d, reach)
+    }
+
+    /// Converts the configured screen reach into world units, measured at the
+    /// pivot, which is as good a stand-in for the model's depth as we have.
+    fn reach_in_world(&self) -> f32 {
+        let points = self.ui.brush_reach;
+        if points <= 0.0 {
+            return 0.0;
+        }
+        let (_, h) = self.viewport();
+        let per_world = self.camera.pixels_per_world(self.camera.target(), h).max(1e-6);
+        points * self.egui_ctx.pixels_per_point() / per_world
     }
 
     /// Intersects the cursor ray with a view-facing plane through `anchor`.
