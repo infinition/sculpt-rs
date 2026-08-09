@@ -6,6 +6,7 @@
 //! are and what colour everything is are all yours to change from the UI tab.
 
 use crate::camera::{Camera, Projection, ViewPreset};
+use crate::gizmo::{Gizmo, GizmoMode};
 use crate::icons::Icon;
 use crate::matcap;
 use crate::renderer::{FrameSettings, Shading};
@@ -126,6 +127,10 @@ pub struct UiState {
     pub wireframe_available: bool,
     pub picking_color: bool,
     pub add_primitive: Primitive,
+    /// Interface scale being dragged, applied when the drag ends. Zooming
+    /// rescales the coordinate space the slider itself lives in, so committing
+    /// mid-gesture would move the rail out from under the finger.
+    pub ui_scale_draft: f32,
 }
 
 impl Default for UiState {
@@ -151,6 +156,7 @@ impl Default for UiState {
             wireframe_available: true,
             picking_color: false,
             add_primitive: Primitive::Sphere,
+            ui_scale_draft: UiTheme::default().ui_scale,
         }
     }
 }
@@ -184,6 +190,7 @@ pub fn draw(
     s: &mut Sculptor,
     st: &mut UiState,
     cam: &mut Camera,
+    giz: &mut Gizmo,
     overlay: &Overlay,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
@@ -192,12 +199,12 @@ pub fn draw(
 
     {
         let mut cx = Ctx { p, m, actions: &mut actions };
-        top_bar(root, s, st, cam, &mut cx);
+        top_bar(root, s, st, cam, giz, &mut cx);
         if st.show_rail {
             brush_rail(root, s, st, &cx);
         }
         if st.show_panel {
-            settings_dock(root, s, st, cam, &mut cx);
+            settings_dock(root, s, st, cam, giz, &mut cx);
         }
     }
     viewport_overlay(root, s, st, overlay, p);
@@ -224,6 +231,7 @@ fn top_bar(
     s: &mut Sculptor,
     st: &mut UiState,
     cam: &mut Camera,
+    giz: &mut Gizmo,
     cx: &mut Ctx,
 ) {
     let (p, m) = (cx.p, cx.m);
@@ -313,6 +321,18 @@ fn top_bar(
                 {
                     cx.actions.push(Action::FrameView);
                 }
+                // One button cycles the gizmo through its three modes and off.
+                let (gizmo_icon, gizmo_tip) = match giz.mode {
+                    GizmoMode::Off => (Icon::Move, "Transform gizmo: off   T"),
+                    GizmoMode::Move => (Icon::Move, "Gizmo: move   T"),
+                    GizmoMode::Rotate => (Icon::Twist, "Gizmo: rotate   T"),
+                    GizmoMode::Scale => (Icon::Scale, "Gizmo: scale   T"),
+                };
+                if widgets::icon_button(ui, gizmo_icon, b, giz.mode != GizmoMode::Off, gizmo_tip)
+                    .clicked()
+                {
+                    giz.mode = next_gizmo_mode(giz.mode);
+                }
                 if widgets::icon_button(
                     ui,
                     Icon::Camera,
@@ -360,6 +380,16 @@ fn top_bar(
                 });
             });
         });
+}
+
+/// Off, move, rotate, scale, and back to off.
+pub fn next_gizmo_mode(mode: GizmoMode) -> GizmoMode {
+    match mode {
+        GizmoMode::Off => GizmoMode::Move,
+        GizmoMode::Move => GizmoMode::Rotate,
+        GizmoMode::Rotate => GizmoMode::Scale,
+        GizmoMode::Scale => GizmoMode::Off,
+    }
 }
 
 fn separator(ui: &mut egui::Ui, height: f32, p: Palette) {
@@ -460,6 +490,7 @@ fn settings_dock(
     s: &mut Sculptor,
     st: &mut UiState,
     cam: &mut Camera,
+    giz: &mut Gizmo,
     cx: &mut Ctx,
 ) {
     let (p, m) = (cx.p, cx.m);
@@ -485,7 +516,7 @@ fn settings_dock(
                 .show(ui, |ui| match st.tab {
                     Tab::Brush => brush_tab(ui, s, st, cx),
                     Tab::Model => model_tab(ui, s, st, cx),
-                    Tab::Scene => scene_tab(ui, s, st, cx),
+                    Tab::Scene => scene_tab(ui, s, st, giz, cx),
                     Tab::View => view_tab(ui, st, cam, cx),
                     Tab::Interface => interface_tab(ui, st, cx),
                 });
@@ -825,7 +856,13 @@ fn model_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
     mask_controls(ui, st, cx);
 }
 
-fn scene_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
+fn scene_tab(
+    ui: &mut egui::Ui,
+    s: &mut Sculptor,
+    st: &mut UiState,
+    giz: &mut Gizmo,
+    cx: &mut Ctx,
+) {
     let (p, m) = (cx.p, cx.m);
     widgets::section_title(ui, "OBJECTS");
     let active = s.scene.active;
@@ -898,6 +935,30 @@ fn scene_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
     }
     if replace {
         cx.actions.push(Action::New(prim));
+    }
+
+    widgets::section_title(ui, "GIZMO");
+    let labels: Vec<&str> = GizmoMode::ALL.iter().map(|g| g.label()).collect();
+    let current = GizmoMode::ALL
+        .iter()
+        .position(|g| *g == giz.mode)
+        .unwrap_or(0);
+    if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+        giz.mode = GizmoMode::ALL[i];
+    }
+    ui.add_enabled_ui(giz.mode != GizmoMode::Off, |ui| {
+        widgets::toggle(ui, &mut giz.local_space, "Follow the object's axes", m.row);
+        BigSlider::new(&mut giz.size, 50.0..=180.0, "Handle size")
+            .decimals(0)
+            .height(m.row)
+            .show(ui);
+    });
+    if giz.mode != GizmoMode::Off {
+        ui.label(
+            egui::RichText::new("Drag a handle to transform. The brush stays out of the way while the pointer is over one.")
+                .small()
+                .color(p.dim),
+        );
     }
 
     widgets::section_title(ui, "PLACEMENT");
@@ -1097,10 +1158,25 @@ fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
 
     widgets::section_title(ui, "SIZE");
     widgets::toggle(ui, &mut t.touch, "Touch layout", m.row);
-    BigSlider::new(&mut t.ui_scale, 0.6..=2.2, "Interface scale")
+
+    // Zooming the interface moves this very slider, so the drag runs against a
+    // draft and only lands when the pointer is released.
+    let scale = BigSlider::new(&mut st.ui_scale_draft, 0.6..=2.2, "Interface scale")
         .decimals(2)
         .height(m.row)
         .show(ui);
+    if scale.drag_stopped() || (scale.changed() && !scale.dragged()) {
+        st.theme.ui_scale = st.ui_scale_draft;
+    }
+    if scale.dragged() && (st.ui_scale_draft - st.theme.ui_scale).abs() > 0.005 {
+        ui.label(
+            egui::RichText::new(format!("release to apply {:.2}", st.ui_scale_draft))
+                .small()
+                .color(p.accent),
+        );
+    }
+
+    let t = &mut st.theme;
     BigSlider::new(&mut t.text_scale, 0.7..=1.8, "Text size")
         .decimals(2)
         .height(m.row)

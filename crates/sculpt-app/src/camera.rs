@@ -66,6 +66,7 @@ struct Pose {
     pitch: f32,
 }
 
+#[derive(Clone)]
 pub struct Camera {
     live: Pose,
     goal: Pose,
@@ -232,6 +233,11 @@ impl Camera {
         let p0 = near.xyz() / near.w;
         let p1 = far.xyz() / far.w;
         (p0, (p1 - p0).normalize_or(-Vec3::Z))
+    }
+
+    /// How many pixels one world unit covers at `world_pos`.
+    pub fn pixels_per_world(&self, world_pos: Vec3, h: f32) -> f32 {
+        self.world_radius_to_pixels(world_pos, 1.0, h)
     }
 
     /// Pixel radius of a world-space sphere at `world_pos`, for drawing the

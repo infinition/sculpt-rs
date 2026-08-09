@@ -1,6 +1,7 @@
 //! sculpt-rs: a dynamic-topology 3D sculpting tool.
 
 mod camera;
+mod gizmo;
 mod icons;
 mod input;
 mod matcap;
@@ -10,6 +11,7 @@ mod ui;
 mod widgets;
 
 use camera::{Camera, Projection, ViewPreset};
+use gizmo::Gizmo;
 use glam::{Vec2, Vec3};
 use input::{Gesture, Input, TouchOutcome};
 use renderer::Renderer;
@@ -60,6 +62,7 @@ struct State {
     camera: Camera,
     input: Input,
     ui: UiState,
+    gizmo: Gizmo,
     stroke: Stroke,
     last_frame: Instant,
     /// Object whose buffers need re-uploading, or `None` for all of them.
@@ -187,6 +190,7 @@ impl State {
             camera,
             input: Input::default(),
             ui,
+            gizmo: Gizmo::default(),
             stroke: Stroke::default(),
             last_frame: Instant::now(),
             dirty_object: None,
@@ -237,6 +241,60 @@ impl State {
     }
 
     // ---- strokes ------------------------------------------------------------
+
+    /// The frame data the gizmo needs, in the units it expects.
+    fn gizmo_view(&self) -> gizmo::View<'_> {
+        gizmo::View {
+            camera: &self.camera,
+            size: self.viewport(),
+            pixels_per_point: self.egui_ctx.pixels_per_point(),
+        }
+    }
+
+    fn cursor_points(&self) -> egui::Pos2 {
+        let ppp = self.egui_ctx.pixels_per_point().max(1e-3);
+        egui::pos2(self.input.cursor.x / ppp, self.input.cursor.y / ppp)
+    }
+
+    /// Offers the click to the gizmo. Returns true when it took it.
+    fn gizmo_press(&mut self) -> bool {
+        let Some(t) = self.sculptor.scene.active().map(|o| o.transform) else {
+            return false;
+        };
+        let cursor = self.cursor_points();
+        let view = gizmo::View {
+            camera: &self.camera,
+            size: self.viewport(),
+            pixels_per_point: self.egui_ctx.pixels_per_point(),
+        };
+        let took = self.gizmo.press(cursor, &view, &t);
+        if took {
+            // One undo step per drag, recorded before anything moves.
+            let index = self.sculptor.scene.active;
+            self.sculptor.history.push_placement(&self.sculptor.scene, index);
+        }
+        took
+    }
+
+    fn gizmo_drag(&mut self) {
+        if !self.gizmo.is_dragging() {
+            return;
+        }
+        let Some(t) = self.sculptor.scene.active().map(|o| o.transform) else {
+            return;
+        };
+        let cursor = self.cursor_points();
+        let view = gizmo::View {
+            camera: &self.camera,
+            size: self.viewport(),
+            pixels_per_point: self.egui_ctx.pixels_per_point(),
+        };
+        if let Some(next) = self.gizmo.drag(cursor, &view, &t) {
+            if let Some(o) = self.sculptor.scene.active_mut() {
+                o.transform = next;
+            }
+        }
+    }
 
     fn begin_stroke(&mut self, pressure: f32) {
         let cursor = self.input.cursor;
@@ -697,6 +755,7 @@ impl State {
             KeyCode::KeyG => self.ui.settings.grid = !self.ui.settings.grid,
             KeyCode::KeyF => actions.push(Action::FrameView),
             KeyCode::KeyH => self.ui.show_help = !self.ui.show_help,
+            KeyCode::KeyT => self.gizmo.mode = ui::next_gizmo_mode(self.gizmo.mode),
             KeyCode::Tab => self.ui.show_panel = !self.ui.show_panel,
             KeyCode::BracketLeft => {
                 self.sculptor.brush.radius = (self.sculptor.brush.radius * 0.85).max(0.003)
@@ -787,12 +846,31 @@ impl State {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let ctx = self.egui_ctx.clone();
         let mut actions = Vec::new();
+        // The gizmo draws after the interface, from a snapshot of the camera:
+        // the panels hold the live one mutably, and a frame of lag on a set of
+        // handles is invisible.
+        let camera_snapshot = self.camera.clone();
+        let viewport = self.viewport();
         let full_output = {
             let sculptor = &mut self.sculptor;
             let ui_state = &mut self.ui;
             let cam = &mut self.camera;
+            let giz = &mut self.gizmo;
             ctx.run_ui(raw_input, |root| {
-                actions = ui::draw(root, sculptor, ui_state, cam, &overlay);
+                actions = ui::draw(root, sculptor, ui_state, cam, giz, &overlay);
+
+                if let Some(t) = sculptor.scene.active().map(|o| o.transform) {
+                    let view = gizmo::View {
+                        camera: &camera_snapshot,
+                        size: viewport,
+                        pixels_per_point: root.ctx().pixels_per_point(),
+                    };
+                    let painter = root.ctx().layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("gizmo"),
+                    ));
+                    giz.draw(root, &painter, &view, &t, &theme::Palette::of(root.ctx()));
+                }
             })
         };
         self.egui_state
@@ -897,7 +975,20 @@ impl State {
     fn build_overlay(&self) -> Overlay {
         let ppp = self.egui_ctx.pixels_per_point();
         let over_ui = self.egui_ctx.egui_wants_pointer_input();
-        let hit = (!over_ui && !self.input.touch_active())
+        // A handle under the cursor means the next click moves the object, so
+        // showing a brush ring there would be a lie.
+        let over_gizmo = self
+            .sculptor
+            .scene
+            .active()
+            .map(|o| o.transform)
+            .and_then(|t| {
+                self.gizmo
+                    .handle_at(self.cursor_points(), &self.gizmo_view(), &t)
+            })
+            .is_some()
+            || self.gizmo.is_dragging();
+        let hit = (!over_ui && !over_gizmo && !self.input.touch_active())
             .then(|| self.pick_at(self.input.cursor))
             .flatten();
 
@@ -991,6 +1082,8 @@ impl ApplicationHandler for App {
                 let delta = st.input.move_cursor(position.x as f32, position.y as f32);
                 if let Some(g) = st.input.mouse_navigation(delta) {
                     st.apply_gesture(g);
+                } else if st.gizmo.is_dragging() {
+                    st.gizmo_drag();
                 } else if st.stroke.active {
                     st.continue_stroke(1.0);
                 }
@@ -1010,10 +1103,12 @@ impl ApplicationHandler for App {
                     MouseButton::Left => {
                         st.input.lmb = down;
                         if down {
-                            if !egui_captured && !st.input.alt {
+                            // The gizmo gets first refusal, then the brush.
+                            if !egui_captured && !st.input.alt && !st.gizmo_press() {
                                 st.begin_stroke(1.0);
                             }
                         } else {
+                            st.gizmo.release();
                             st.end_stroke();
                         }
                     }

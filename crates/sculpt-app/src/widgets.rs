@@ -227,14 +227,35 @@ impl<'a> BigSlider<'a> {
         let (rect, mut response) =
             ui.allocate_exact_size(Vec2::new(width, self.height), Sense::click_and_drag());
 
-        if response.is_pointer_button_down_on() {
+        // Jump to where the press landed, then track the drag as a delta.
+        //
+        // Reading the absolute pointer position every frame looks equivalent
+        // and is not: a slider that resizes the interface moves its own rail
+        // out from under the cursor, and the next frame reads a position that
+        // has nothing to do with the gesture. That feedback loop slams the
+        // value to one end. A delta has no such loop.
+        let mut t = self.to_normalised(*self.value);
+        let width = rect.width().max(1e-3);
+        let mut edited = false;
+
+        if response.drag_started() || (response.clicked() && !response.dragged()) {
             if let Some(pos) = ui.ctx().pointer_interact_pos() {
-                let t = (pos.x - rect.left()) / rect.width().max(1e-3);
-                let next = self.from_normalised(t);
-                if (next - *self.value).abs() > f32::EPSILON {
-                    *self.value = next;
-                    response.mark_changed();
-                }
+                t = ((pos.x - rect.left()) / width).clamp(0.0, 1.0);
+                edited = true;
+            }
+        }
+        if response.dragged() {
+            let delta = response.drag_delta().x;
+            if delta != 0.0 {
+                t = (t + delta / width).clamp(0.0, 1.0);
+                edited = true;
+            }
+        }
+        if edited {
+            let next = self.from_normalised(t);
+            if (next - *self.value).abs() > f32::EPSILON {
+                *self.value = next;
+                response.mark_changed();
             }
         }
 
