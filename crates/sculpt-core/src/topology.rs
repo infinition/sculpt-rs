@@ -674,6 +674,78 @@ pub fn extract_masked(mesh: &Mesh, thickness: f32) -> Option<Mesh> {
 }
 
 // ---------------------------------------------------------------------------
+// Colour fill
+// ---------------------------------------------------------------------------
+
+/// Floods colour outward from one face.
+///
+/// `Region` walks the face graph and refuses to cross an edge whose dihedral
+/// angle is sharper than `angle_deg`, which is what makes a flat panel fill as
+/// one piece while the bevel beside it stays untouched. Masked vertices are
+/// left alone, so a mask doubles as a fill boundary.
+pub fn fill(
+    mesh: &mut Mesh,
+    start_face: u32,
+    scope: crate::brush::FillScope,
+    color: Vec3,
+    blend: crate::brush::BlendMode,
+    amount: f32,
+    angle_deg: f32,
+) -> usize {
+    use crate::brush::FillScope;
+
+    let faces: Vec<u32> = match scope {
+        FillScope::Object => (0..mesh.face_count() as u32).collect(),
+        FillScope::Face => vec![start_face],
+        FillScope::Region => {
+            if start_face as usize >= mesh.face_count() {
+                return 0;
+            }
+            let limit = angle_deg.to_radians().cos();
+            let mut seen = vec![false; mesh.face_count()];
+            let mut stack = vec![start_face];
+            let mut out = Vec::new();
+            seen[start_face as usize] = true;
+            while let Some(f) = stack.pop() {
+                out.push(f);
+                let n0 = mesh.face_normal(f).normalize_or(Vec3::Y);
+                let tri = mesh.faces[f as usize];
+                for k in 0..3 {
+                    let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                    for nb in mesh.faces_around_edge(a, b) {
+                        if nb == f || seen[nb as usize] {
+                            continue;
+                        }
+                        let n1 = mesh.face_normal(nb).normalize_or(Vec3::Y);
+                        if n0.dot(n1) < limit {
+                            continue; // too sharp a crease to spill over
+                        }
+                        seen[nb as usize] = true;
+                        stack.push(nb);
+                    }
+                }
+            }
+            out
+        }
+    };
+
+    let mut touched: Vec<u32> = Vec::with_capacity(faces.len() * 3);
+    for f in faces {
+        touched.extend_from_slice(&mesh.faces[f as usize]);
+    }
+    touched.sort_unstable();
+    touched.dedup();
+
+    for &v in &touched {
+        let vx = &mut mesh.verts[v as usize];
+        let t = (amount * (1.0 - vx.mask)).clamp(0.0, 1.0);
+        let blended = blend.apply(vx.col, color);
+        vx.col = vx.col.lerp(blended, t);
+    }
+    touched.len()
+}
+
+// ---------------------------------------------------------------------------
 // Symmetry
 // ---------------------------------------------------------------------------
 

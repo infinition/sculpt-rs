@@ -20,15 +20,17 @@ const MAX_OBJECTS: u64 = 64;
 pub enum Shading {
     Matcap,
     Pbr,
+    Unlit,
     Normals,
     Cavity,
     Clay,
 }
 
 impl Shading {
-    pub const ALL: [Shading; 5] = [
+    pub const ALL: [Shading; 6] = [
         Shading::Matcap,
         Shading::Pbr,
+        Shading::Unlit,
         Shading::Normals,
         Shading::Cavity,
         Shading::Clay,
@@ -38,6 +40,7 @@ impl Shading {
         match self {
             Shading::Matcap => "Matcap",
             Shading::Pbr => "Lit",
+            Shading::Unlit => "Unlit",
             Shading::Normals => "Normals",
             Shading::Cavity => "Cavity",
             Shading::Clay => "Clay",
@@ -51,7 +54,14 @@ impl Shading {
             Shading::Normals => 2.0,
             Shading::Cavity => 3.0,
             Shading::Clay => 4.0,
+            Shading::Unlit => 5.0,
         }
+    }
+
+    /// Unlit shows the painted colour and nothing else, so the vertex colour
+    /// switch has no say while it is on.
+    pub fn forces_vertex_color(self) -> bool {
+        self == Shading::Unlit
     }
 }
 
@@ -540,7 +550,11 @@ impl Renderer {
             eye: [eye.x, eye.y, eye.z, 1.0],
             params: [
                 if s.show_mask { 1.0 } else { 0.0 },
-                if s.vertex_color { 1.0 } else { 0.0 },
+                if s.vertex_color || s.shading.forces_vertex_color() {
+                    1.0
+                } else {
+                    0.0
+                },
                 s.shading.code(),
                 s.opacity.clamp(0.05, 1.0),
             ],

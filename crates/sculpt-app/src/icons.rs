@@ -23,6 +23,9 @@ pub enum Icon {
     Twist,
     Scale,
     Paint,
+    Smudge,
+    ColorBlur,
+    Fill,
     Mask,
     // Actions
     Undo,
@@ -68,6 +71,9 @@ impl Icon {
             BrushKind::Twist => Icon::Twist,
             BrushKind::Scale => Icon::Scale,
             BrushKind::Paint => Icon::Paint,
+            BrushKind::Smudge => Icon::Smudge,
+            BrushKind::ColorBlur => Icon::ColorBlur,
+            BrushKind::Fill => Icon::Fill,
             BrushKind::Mask => Icon::Mask,
         }
     }
@@ -268,6 +274,28 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             k.filled(&[(0.5, 0.06), (0.72, 0.5), (0.5, 0.72), (0.28, 0.5)]);
             k.line(&[(0.5, 0.72), (0.5, 0.94)]);
             k.line(&[(0.3, 0.94), (0.7, 0.94)]);
+        }
+        Smudge => {
+            // A finger dragging colour, leaving a tapering smear.
+            k.line(&[(0.08, 0.86), (0.42, 0.52)]);
+            k.line(&[(0.2, 0.9), (0.54, 0.56)]);
+            k.disc(0.66, 0.4, 0.13);
+            k.arc(0.66, 0.4, 0.26, -2.2, 0.9);
+        }
+        ColorBlur => {
+            // Sharp edge on the left dissolving into a soft one on the right.
+            k.line(&[(0.16, 0.1), (0.16, 0.9)]);
+            k.line(&[(0.38, 0.16), (0.38, 0.84)]);
+            k.line(&[(0.58, 0.24), (0.58, 0.76)]);
+            k.line(&[(0.78, 0.34), (0.78, 0.66)]);
+            k.disc(0.94, 0.5, 0.05);
+        }
+        Fill => {
+            // A tipped bucket pouring onto a surface.
+            k.closed(&[(0.1, 0.3), (0.58, 0.06), (0.72, 0.42), (0.24, 0.66)]);
+            k.line(&[(0.62, 0.24), (0.86, 0.34)]);
+            k.filled(&[(0.86, 0.42), (0.96, 0.62), (0.76, 0.62)]);
+            k.line(&[(0.06, 0.92), (0.94, 0.92)]);
         }
         Mask => {
             // Half-protected disc.

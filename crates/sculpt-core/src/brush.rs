@@ -26,11 +26,14 @@ pub enum BrushKind {
     Twist,
     Scale,
     Paint,
+    Smudge,
+    ColorBlur,
+    Fill,
     Mask,
 }
 
 impl BrushKind {
-    pub const ALL: [BrushKind; 13] = [
+    pub const ALL: [BrushKind; 16] = [
         BrushKind::Draw,
         BrushKind::Clay,
         BrushKind::Flatten,
@@ -43,6 +46,9 @@ impl BrushKind {
         BrushKind::Twist,
         BrushKind::Scale,
         BrushKind::Paint,
+        BrushKind::Smudge,
+        BrushKind::ColorBlur,
+        BrushKind::Fill,
         BrushKind::Mask,
     ];
 
@@ -60,6 +66,9 @@ impl BrushKind {
             BrushKind::Twist => "Twist",
             BrushKind::Scale => "Scale",
             BrushKind::Paint => "Paint",
+            BrushKind::Smudge => "Smudge",
+            BrushKind::ColorBlur => "Blur",
+            BrushKind::Fill => "Fill",
             BrushKind::Mask => "Mask",
         }
     }
@@ -79,13 +88,24 @@ impl BrushKind {
             BrushKind::Twist => "Rotate a region around the view axis",
             BrushKind::Scale => "Grow or shrink a region",
             BrushKind::Paint => "Paint colour and material",
+            BrushKind::Smudge => "Drag colour across the surface",
+            BrushKind::ColorBlur => "Soften colour into its neighbours",
+            BrushKind::Fill => "Flood a face or a whole region with colour",
             BrushKind::Mask => "Protect a region from sculpting",
         }
     }
 
     /// Brushes that move geometry and therefore need dyntopo + normal updates.
     pub fn deforms(self) -> bool {
-        !matches!(self, BrushKind::Paint | BrushKind::Mask)
+        !self.paints() && !matches!(self, BrushKind::Mask)
+    }
+
+    /// Brushes that write colour rather than geometry.
+    pub fn paints(self) -> bool {
+        matches!(
+            self,
+            BrushKind::Paint | BrushKind::Smudge | BrushKind::ColorBlur | BrushKind::Fill
+        )
     }
 
     /// Brushes driven by cursor motion rather than by surface position; these
@@ -99,8 +119,120 @@ impl BrushKind {
 
     /// Brushes for which a negative pass is meaningful.
     pub fn has_negative(self) -> bool {
-        !matches!(self, BrushKind::Move | BrushKind::Drag | BrushKind::Paint)
+        !matches!(
+            self,
+            BrushKind::Move | BrushKind::Drag | BrushKind::Paint | BrushKind::Fill
+        )
     }
+
+    /// Tools that act on a single click rather than over a stroke.
+    pub fn is_click_tool(self) -> bool {
+        self == BrushKind::Fill
+    }
+}
+
+/// How a painted colour combines with what is already on the surface.
+///
+/// The set a hand-painting workflow expects: build shadows with Multiply,
+/// build highlights with Screen or Add, and keep the value while shifting the
+/// hue with Overlay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Add,
+    Subtract,
+    Overlay,
+    Darken,
+    Lighten,
+    Hue,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 9] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Add,
+        BlendMode::Subtract,
+        BlendMode::Overlay,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Hue,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Add => "Add",
+            BlendMode::Subtract => "Subtract",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::Hue => "Hue",
+        }
+    }
+
+    /// Combines the brush colour `src` over the surface colour `dst`.
+    pub fn apply(self, dst: Vec3, src: Vec3) -> Vec3 {
+        let per = |f: fn(f32, f32) -> f32| Vec3::new(f(dst.x, src.x), f(dst.y, src.y), f(dst.z, src.z));
+        match self {
+            BlendMode::Normal => src,
+            BlendMode::Multiply => dst * src,
+            BlendMode::Screen => Vec3::ONE - (Vec3::ONE - dst) * (Vec3::ONE - src),
+            BlendMode::Add => (dst + src).min(Vec3::ONE),
+            BlendMode::Subtract => (dst - src).max(Vec3::ZERO),
+            BlendMode::Overlay => per(|d, s| {
+                if d < 0.5 {
+                    2.0 * d * s
+                } else {
+                    1.0 - 2.0 * (1.0 - d) * (1.0 - s)
+                }
+            }),
+            BlendMode::Darken => dst.min(src),
+            BlendMode::Lighten => dst.max(src),
+            // Keep the surface luminance, take the brush chroma.
+            BlendMode::Hue => {
+                let lum = |c: Vec3| 0.299 * c.x + 0.587 * c.y + 0.114 * c.z;
+                let (ld, ls) = (lum(dst), lum(src));
+                (src + Vec3::splat(ld - ls)).clamp(Vec3::ZERO, Vec3::ONE)
+            }
+        }
+    }
+}
+
+/// How far a fill spreads from the face it was started on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FillScope {
+    /// Only the triangle under the cursor.
+    Face,
+    /// Everything reachable without crossing an edge sharper than the angle
+    /// threshold, which is what makes a flat panel fill as one piece.
+    Region,
+    /// The whole object.
+    Object,
+}
+
+impl FillScope {
+    pub const ALL: [FillScope; 3] = [FillScope::Face, FillScope::Region, FillScope::Object];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FillScope::Face => "Face",
+            FillScope::Region => "Region",
+            FillScope::Object => "Object",
+        }
+    }
+}
+
+/// State carried from one dab of a stroke to the next.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StrokeState {
+    /// Colour the smudge tool is currently carrying.
+    pub pickup: Option<Vec3>,
 }
 
 /// Radial weighting inside the brush disc.
@@ -182,6 +314,15 @@ pub struct Brush {
     pub paint_metal: f32,
     pub paint_albedo: bool,
     pub paint_material: bool,
+    pub blend: BlendMode,
+    /// How much colour a single dab deposits, separate from the falloff. Low
+    /// flow with repeated passes is how soft shading is built up.
+    pub flow: f32,
+    pub fill_scope: FillScope,
+    /// Degrees; edges sharper than this stop a region fill.
+    pub fill_angle: f32,
+    /// How readily the smudge tool picks up new colour as it travels.
+    pub smudge_pickup: f32,
 }
 
 impl Default for Brush {
@@ -202,6 +343,11 @@ impl Default for Brush {
             paint_metal: 0.0,
             paint_albedo: true,
             paint_material: false,
+            blend: BlendMode::Normal,
+            flow: 1.0,
+            fill_scope: FillScope::Region,
+            fill_angle: 35.0,
+            smudge_pickup: 0.35,
         }
     }
 }
@@ -235,6 +381,12 @@ impl Brush {
             }
             BrushKind::Scale => b.strength = 0.6,
             BrushKind::Paint => b.strength = 0.6,
+            BrushKind::Smudge => {
+                b.strength = 0.5;
+                b.radius = 0.12;
+            }
+            BrushKind::ColorBlur => b.strength = 0.5,
+            BrushKind::Fill => b.strength = 1.0,
             BrushKind::Mask => b.strength = 0.7,
         }
         b
@@ -341,7 +493,12 @@ impl StrokeInput {
 }
 
 /// Applies one brush dab. Returns the vertices it touched.
-pub fn apply(mesh: &mut Mesh, b: &Brush, input: &StrokeInput) -> Vec<u32> {
+pub fn apply(
+    mesh: &mut Mesh,
+    b: &Brush,
+    input: &StrokeInput,
+    state: &mut StrokeState,
+) -> Vec<u32> {
     let pressure = input.pressure.clamp(0.05, 1.0);
     let radius = if b.pressure_radius { b.radius * pressure } else { b.radius };
     let strength = if b.pressure_strength { b.strength * pressure } else { b.strength };
@@ -375,11 +532,13 @@ pub fn apply(mesh: &mut Mesh, b: &Brush, input: &StrokeInput) -> Vec<u32> {
 
     match b.kind {
         BrushKind::Paint => {
+            let flow = b.flow.clamp(0.0, 1.0);
             for (&v, &w) in verts.iter().zip(&weights) {
                 let vx = &mut mesh.verts[v as usize];
-                let t = (w * strength).clamp(0.0, 1.0);
+                let t = (w * strength * flow).clamp(0.0, 1.0);
                 if b.paint_albedo {
-                    vx.col = vx.col.lerp(b.paint_color, t);
+                    let blended = b.blend.apply(vx.col, b.paint_color);
+                    vx.col = vx.col.lerp(blended, t);
                 }
                 if b.paint_material {
                     vx.rough += (b.paint_rough - vx.rough) * t;
@@ -387,6 +546,49 @@ pub fn apply(mesh: &mut Mesh, b: &Brush, input: &StrokeInput) -> Vec<u32> {
                 }
             }
             return verts;
+        }
+        BrushKind::Smudge => {
+            // Carry a colour along the stroke, trading a little of it for the
+            // surface at every step. That trade is what makes the trail fade.
+            let local = weighted_mean_color(mesh, &verts, &weights);
+            let carried = state.pickup.unwrap_or(local);
+            let pickup = b.smudge_pickup.clamp(0.0, 1.0);
+            for (&v, &w) in verts.iter().zip(&weights) {
+                let vx = &mut mesh.verts[v as usize];
+                let t = (w * strength).clamp(0.0, 1.0);
+                vx.col = vx.col.lerp(carried, t);
+            }
+            state.pickup = Some(carried.lerp(local, pickup * strength));
+            return verts;
+        }
+        BrushKind::ColorBlur => {
+            let blurred: Vec<Vec3> = verts
+                .par_iter()
+                .zip(weights.par_iter())
+                .map(|(&v, &w)| {
+                    let nb = mesh.neighbors(v);
+                    let vx = &mesh.verts[v as usize];
+                    if nb.is_empty() || w <= 0.0 {
+                        return vx.col;
+                    }
+                    let mut mean = Vec3::ZERO;
+                    for &n in &nb {
+                        mean += mesh.verts[n as usize].col;
+                    }
+                    mean /= nb.len() as f32;
+                    // Inverted, this sharpens instead.
+                    let target = if b.negative { vx.col * 2.0 - mean } else { mean };
+                    vx.col.lerp(target.clamp(Vec3::ZERO, Vec3::ONE), (w * strength).clamp(0.0, 1.0))
+                })
+                .collect();
+            for (&v, c) in verts.iter().zip(blurred) {
+                mesh.verts[v as usize].col = c;
+            }
+            return verts;
+        }
+        BrushKind::Fill => {
+            // Handled by `topology::fill` from a click, not from a dab.
+            return Vec::new();
         }
         BrushKind::Mask => {
             for (&v, &w) in verts.iter().zip(&weights) {
@@ -484,7 +686,8 @@ pub fn apply(mesh: &mut Mesh, b: &Brush, input: &StrokeInput) -> Vec<u32> {
                     q * local - local
                 }
                 BrushKind::Scale => (p - input.point) * (w * strength * input.pinch),
-                BrushKind::Paint | BrushKind::Mask => Vec3::ZERO,
+                // Colour tools and masking never move a vertex.
+                _ => Vec3::ZERO,
             }
         })
         .collect();
@@ -499,6 +702,21 @@ pub fn apply(mesh: &mut Mesh, b: &Brush, input: &StrokeInput) -> Vec<u32> {
 
     mesh.commit_moves(&verts);
     verts
+}
+
+/// Falloff-weighted average colour of a vertex set.
+fn weighted_mean_color(mesh: &Mesh, verts: &[u32], weights: &[f32]) -> Vec3 {
+    let mut sum = Vec3::ZERO;
+    let mut total = 0.0;
+    for (&v, &w) in verts.iter().zip(weights) {
+        sum += mesh.verts[v as usize].col * w;
+        total += w;
+    }
+    if total > 1e-6 {
+        sum / total
+    } else {
+        Vec3::splat(0.85)
+    }
 }
 
 /// Laplacian relaxation of a vertex set, weighted per vertex.

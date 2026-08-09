@@ -260,6 +260,14 @@ impl State {
             self.full_resync = true;
         }
 
+        // Fill acts on the click, not on the drag that follows.
+        if self.sculptor.brush.kind == BrushKind::Fill {
+            let n = self.sculptor.fill_at(&hit);
+            self.dirty_object = Some(self.sculptor.scene.active);
+            self.ui.say(format!("filled {n} vertices"));
+            return;
+        }
+
         self.sculptor.begin_stroke();
         self.sculptor.brush.negative = self.input.ctrl;
         self.stroke = Stroke {
@@ -932,7 +940,8 @@ fn tool_index(code: KeyCode, shift: bool) -> Option<usize> {
         KeyCode::Digit0 => 9,
         _ => return None,
     };
-    Some(if shift && base < 3 { base + 10 } else { base })
+    // Shift reaches the tools past the tenth.
+    Some(if shift && base < 6 { base + 10 } else { base })
 }
 
 #[derive(Default)]

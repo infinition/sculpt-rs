@@ -12,7 +12,7 @@ use crate::renderer::{FrameSettings, Shading};
 use crate::theme::{ColorPreset, Metrics, Palette, Side, UiTheme};
 use crate::widgets::{self, BigSlider};
 use egui::{Align2, Color32, CornerRadius, Frame, Margin, Sense, Stroke, Vec2};
-use sculpt_core::{Axis, BrushKind, Falloff, RemeshOptions, Sculptor};
+use sculpt_core::{Axis, BlendMode, BrushKind, Falloff, FillScope, RemeshOptions, Sculptor};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Primitive {
@@ -446,9 +446,7 @@ pub fn shortcut_for(index: usize) -> String {
     match index {
         0..=8 => format!("{}", index + 1),
         9 => "0".into(),
-        10 => "Shift+1".into(),
-        11 => "Shift+2".into(),
-        12 => "Shift+3".into(),
+        10..=15 => format!("Shift+{}", index - 9),
         _ => "-".into(),
     }
 }
@@ -546,8 +544,8 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
         m.row,
     );
 
-    if kind == BrushKind::Paint {
-        widgets::section_title(ui, "PAINT");
+    if kind.paints() {
+        widgets::section_title(ui, "COLOUR");
         let mut rgb = [
             s.brush.paint_color.x,
             s.brush.paint_color.y,
@@ -556,17 +554,6 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
         if widgets::color_row(ui, "Colour", &mut rgb, m.row).changed() {
             s.brush.paint_color = glam::Vec3::from_array(rgb);
         }
-        widgets::toggle(ui, &mut s.brush.paint_albedo, "Paint colour", m.row);
-        widgets::toggle(ui, &mut s.brush.paint_material, "Paint material", m.row);
-        let material = s.brush.paint_material;
-        ui.add_enabled_ui(material, |ui| {
-            BigSlider::new(&mut s.brush.paint_rough, 0.02..=1.0, "Roughness")
-                .height(m.row)
-                .show(ui);
-            BigSlider::new(&mut s.brush.paint_metal, 0.0..=1.0, "Metalness")
-                .height(m.row)
-                .show(ui);
-        });
         if widgets::wide_button(
             ui,
             Icon::Palette,
@@ -577,6 +564,77 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
         .clicked()
         {
             cx.actions.push(Action::PickColorMode);
+        }
+
+        if matches!(kind, BrushKind::Paint | BrushKind::Fill) {
+            let labels: Vec<&str> = BlendMode::ALL.iter().map(|b| b.label()).collect();
+            let current = BlendMode::ALL
+                .iter()
+                .position(|b| *b == s.brush.blend)
+                .unwrap_or(0);
+            if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+                s.brush.blend = BlendMode::ALL[i];
+            }
+        }
+
+        if kind == BrushKind::Paint {
+            BigSlider::new(&mut s.brush.flow, 0.02..=1.0, "Flow")
+                .height(m.row)
+                .show(ui);
+            widgets::toggle(ui, &mut s.brush.paint_albedo, "Paint colour", m.row);
+            widgets::toggle(ui, &mut s.brush.paint_material, "Paint material", m.row);
+            let material = s.brush.paint_material;
+            ui.add_enabled_ui(material, |ui| {
+                BigSlider::new(&mut s.brush.paint_rough, 0.02..=1.0, "Roughness")
+                    .height(m.row)
+                    .show(ui);
+                BigSlider::new(&mut s.brush.paint_metal, 0.0..=1.0, "Metalness")
+                    .height(m.row)
+                    .show(ui);
+            });
+        }
+
+        if kind == BrushKind::Smudge {
+            BigSlider::new(&mut s.brush.smudge_pickup, 0.0..=1.0, "Pick up")
+                .height(m.row)
+                .show(ui);
+            ui.label(
+                egui::RichText::new("Low pick up drags one colour a long way.")
+                    .small()
+                    .color(p.dim),
+            );
+        }
+
+        if kind == BrushKind::Fill {
+            widgets::section_title(ui, "SPREAD");
+            let labels: Vec<&str> = FillScope::ALL.iter().map(|f| f.label()).collect();
+            let current = FillScope::ALL
+                .iter()
+                .position(|f| *f == s.brush.fill_scope)
+                .unwrap_or(0);
+            if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+                s.brush.fill_scope = FillScope::ALL[i];
+            }
+            let region = s.brush.fill_scope == FillScope::Region;
+            ui.add_enabled_ui(region, |ui| {
+                BigSlider::new(&mut s.brush.fill_angle, 1.0..=180.0, "Stop at")
+                    .decimals(0)
+                    .suffix("°")
+                    .height(m.row)
+                    .show(ui);
+            });
+            ui.label(
+                egui::RichText::new("A fill spills across the surface until it meets an edge sharper than that, or a masked vertex.")
+                    .small()
+                    .color(p.dim),
+            );
+        }
+
+        if st.settings.shading != Shading::Unlit {
+            ui.add_space(4.0);
+            if widgets::wide_button(ui, Icon::Palette, "Switch to unlit", m.row, false).clicked() {
+                st.settings.shading = Shading::Unlit;
+            }
         }
     }
 

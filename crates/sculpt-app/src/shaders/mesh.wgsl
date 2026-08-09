@@ -141,6 +141,10 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         let d = length(dpdx(nw)) + length(dpdy(nw));
         let cav = clamp(1.0 - d * g.extra.x, 0.0, 1.0);
         c = matcap(normalize(nv)) * tint * mix(0.25, 1.0, cav);
+    } else if (mode == 5) {
+        // Unlit: the painted colour and nothing else, which is the only way to
+        // judge hand-painted work without the shading lying to you.
+        c = in.col;
     } else {
         // Untextured clay, the neutral view for judging form.
         let ndl = max(dot(normalize(nv), normalize(vec3<f32>(-0.3, 0.5, 0.8))), 0.0);

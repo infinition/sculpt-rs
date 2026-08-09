@@ -16,7 +16,7 @@ pub mod scene;
 pub mod topology;
 
 pub use accel::Grid;
-pub use brush::{Axis, Brush, BrushKind, Falloff, StrokeInput};
+pub use brush::{Axis, BlendMode, Brush, BrushKind, Falloff, FillScope, StrokeInput};
 pub use dyntopo::Dyntopo;
 pub use history::History;
 pub use mesh::{Mesh, Vertex};
@@ -53,6 +53,7 @@ pub struct Sculptor {
     /// Set when the index buffer needs a re-upload.
     pub topology_dirty: bool,
     stroking: bool,
+    stroke_state: brush::StrokeState,
 }
 
 impl Sculptor {
@@ -73,6 +74,7 @@ impl Sculptor {
             verts_dirty: true,
             topology_dirty: true,
             stroking: false,
+            stroke_state: brush::StrokeState::default(),
             scene,
         };
         s.brush = s.presets[Self::preset_index(BrushKind::Clay)];
@@ -156,6 +158,7 @@ impl Sculptor {
             let idx = self.scene.active;
             self.history.push_geometry(&self.scene, idx);
             self.stroking = true;
+            self.stroke_state = brush::StrokeState::default();
         }
     }
 
@@ -212,14 +215,44 @@ impl Sculptor {
             }
         }
 
+        let mut state = self.stroke_state;
         let Some(mesh) = self.mesh_mut() else { return };
-        let touched = brush::apply(mesh, &brush, input);
+        let touched = brush::apply(mesh, &brush, input, &mut state);
         if !touched.is_empty() {
             if deforms {
                 mesh.update_normals(&touched);
             }
             self.verts_dirty = true;
         }
+        self.stroke_state = state;
+    }
+
+    /// Floods colour from a picked face. Fill is a click tool, so it records
+    /// its own undo step rather than riding on a stroke.
+    pub fn fill_at(&mut self, hit: &SceneHit) -> usize {
+        if self.brush.kind != BrushKind::Fill {
+            return 0;
+        }
+        let b = self.brush;
+        self.select(hit.object);
+        self.checkpoint();
+        let face = hit.local.face;
+        let n = self
+            .mesh_mut()
+            .map(|m| {
+                topology::fill(
+                    m,
+                    face,
+                    b.fill_scope,
+                    b.paint_color,
+                    b.blend,
+                    b.strength,
+                    b.fill_angle,
+                )
+            })
+            .unwrap_or(0);
+        self.verts_dirty = true;
+        n
     }
 
     // ---- history ------------------------------------------------------------
@@ -699,6 +732,64 @@ mod tests {
             .fold(0.0f32, f32::max);
         assert!(left_max > 1.0, "the mirrored side should have moved too");
         assert!((far_right - left_max).abs() < 1e-3, "both sides should match");
+    }
+
+    #[test]
+    fn blend_modes_go_the_right_way() {
+        let grey = Vec3::splat(0.5);
+        let half = Vec3::splat(0.5);
+        assert!(BlendMode::Multiply.apply(grey, half).x < grey.x);
+        assert!(BlendMode::Screen.apply(grey, half).x > grey.x);
+        assert!(BlendMode::Add.apply(grey, half).x > grey.x);
+        assert!(BlendMode::Subtract.apply(grey, half).x < grey.x);
+        assert_eq!(BlendMode::Normal.apply(grey, Vec3::X), Vec3::X);
+        // Hue keeps the surface luminance.
+        let lum = |c: Vec3| 0.299 * c.x + 0.587 * c.y + 0.114 * c.z;
+        let out = BlendMode::Hue.apply(grey, Vec3::new(0.2, 0.4, 0.9));
+        assert!((lum(out) - lum(grey)).abs() < 0.02);
+    }
+
+    #[test]
+    fn region_fill_stops_at_a_crease() {
+        // A cube face is flat, and every edge around it turns ninety degrees,
+        // so a region fill should colour one side and go no further.
+        let mut m = primitives::cube(4);
+        let touched = topology::fill(
+            &mut m,
+            0,
+            FillScope::Face,
+            Vec3::X,
+            BlendMode::Normal,
+            1.0,
+            35.0,
+        );
+        assert_eq!(touched, 3, "a face fill covers one triangle");
+
+        let mut m = primitives::cube(4);
+        let touched = topology::fill(
+            &mut m,
+            0,
+            FillScope::Region,
+            Vec3::X,
+            BlendMode::Normal,
+            1.0,
+            35.0,
+        );
+        // One side of a 4x4 subdivided cube has five by five vertices.
+        assert_eq!(touched, 25, "the fill should stop at the cube's edges");
+        let red = m.verts.iter().filter(|v| v.col.x > 0.9 && v.col.y < 0.1).count();
+        assert_eq!(red, 25);
+    }
+
+    #[test]
+    fn masked_vertices_resist_a_fill() {
+        let mut m = primitives::cube(4);
+        for v in m.verts.iter_mut() {
+            v.mask = 1.0;
+        }
+        let before = m.verts[0].col;
+        topology::fill(&mut m, 0, FillScope::Object, Vec3::X, BlendMode::Normal, 1.0, 35.0);
+        assert_eq!(m.verts[0].col, before);
     }
 
     #[test]
