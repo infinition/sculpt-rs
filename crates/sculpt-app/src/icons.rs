@@ -54,6 +54,9 @@ pub enum Icon {
     Close,
     Pin,
     Reset,
+    Lock,
+    Unlock,
+    Align,
 }
 
 impl Icon {
@@ -461,6 +464,26 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             k.arc(0.5, 0.5, 0.36, 0.7, std::f32::consts::TAU - 0.2);
             k.head((0.5 + 0.36 * 0.76, 0.5 + 0.36 * 0.64), (-0.6, 0.9), 0.14);
             k.disc(0.5, 0.5, 0.06);
+        }
+        Lock => {
+            k.closed(&[(0.16, 0.46), (0.84, 0.46), (0.84, 0.96), (0.16, 0.96)]);
+            k.arc(0.5, 0.46, 0.22, std::f32::consts::PI, std::f32::consts::TAU);
+            k.line(&[(0.28, 0.46), (0.28, 0.34)]);
+            k.line(&[(0.72, 0.46), (0.72, 0.34)]);
+            k.disc(0.5, 0.7, 0.07);
+        }
+        Unlock => {
+            // Same body, shackle swung open to the right.
+            k.closed(&[(0.16, 0.46), (0.84, 0.46), (0.84, 0.96), (0.16, 0.96)]);
+            k.arc(0.74, 0.42, 0.22, std::f32::consts::PI, std::f32::consts::TAU);
+            k.line(&[(0.52, 0.42), (0.52, 0.3)]);
+            k.disc(0.5, 0.7, 0.07);
+        }
+        Align => {
+            // A shape snapping onto a guide line.
+            k.line(&[(0.5, 0.04), (0.5, 0.96)]);
+            k.closed(&[(0.56, 0.24), (0.94, 0.24), (0.94, 0.76), (0.56, 0.76)]);
+            k.arrow((0.3, 0.5), (0.46, 0.5), 0.14);
         }
     }
 }

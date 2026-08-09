@@ -117,6 +117,52 @@ pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
         .min_by(|x, y| x.t.partial_cmp(&y.t).unwrap_or(std::cmp::Ordering::Equal))
 }
 
+/// Nearest surface point to a ray that misses, within `max_dist` of the ray.
+///
+/// This is what lets a stroke start just off the silhouette. Grabbing the edge
+/// of a form means putting the cursor slightly outside it, and a plain ray cast
+/// answers "nothing there"; this answers "the surface is right here".
+///
+/// Deliberately a linear scan: it only runs when the ray missed, which is the
+/// cheap case for everything else, and it keeps the result exact.
+pub fn nearest_to_ray(mesh: &Mesh, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<Hit> {
+    if mesh.verts.is_empty() {
+        return None;
+    }
+    let d = dir.normalize_or(-Vec3::Z);
+    let limit = max_dist * max_dist;
+
+    let best = mesh
+        .verts
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, v)| {
+            let to = v.pos - origin;
+            let along = to.dot(d);
+            if along <= 0.0 {
+                return None; // behind the camera
+            }
+            let off = (to - d * along).length_squared();
+            (off <= limit).then_some((off, along, i as u32))
+        })
+        // Nearest to the ray line, and among those the nearest to the eye.
+        .min_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        })?;
+
+    let (_, along, index) = best;
+    let v = &mesh.verts[index as usize];
+    let face = mesh.vfaces[index as usize].first().copied().unwrap_or(0);
+    Some(Hit {
+        face,
+        point: v.pos,
+        normal: v.nrm,
+        t: along,
+    })
+}
+
 /// Nearest vertex to a point within `radius`, for colour picking and snapping.
 pub fn nearest_vertex(mesh: &Mesh, p: Vec3, radius: f32) -> Option<u32> {
     verts_in_sphere(mesh, p, radius)

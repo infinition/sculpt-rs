@@ -141,9 +141,12 @@ struct ObjectData {
     _pad: [f32; 12],
 }
 
-/// Vertex buffers are also storage buffers so the scatter pass can write them.
+/// Vertex and index buffers are also storage buffers so the scatter passes can
+/// write them.
 const VERTEX_USAGE: wgpu::BufferUsages =
     wgpu::BufferUsages::VERTEX.union(wgpu::BufferUsages::STORAGE);
+const INDEX_USAGE: wgpu::BufferUsages =
+    wgpu::BufferUsages::INDEX.union(wgpu::BufferUsages::STORAGE);
 
 /// GPU mirror of one mesh.
 struct MeshBuffers {
@@ -162,7 +165,7 @@ impl MeshBuffers {
         Self {
             vbuf: empty_buffer(device, "vertices", VERTEX_USAGE),
             vcap: 1024,
-            ibuf: empty_buffer(device, "indices", wgpu::BufferUsages::INDEX),
+            ibuf: empty_buffer(device, "indices", INDEX_USAGE),
             icap: 1024,
             index_count: 0,
             generation: 0,
@@ -185,7 +188,7 @@ impl MeshBuffers {
         let idata: &[u8] = bytemuck::cast_slice(&mesh.faces);
         if idata.len() as u64 > self.icap {
             self.icap = (idata.len() as u64 * 3 / 2).next_power_of_two();
-            self.ibuf = sized_buffer(device, "indices", self.icap, wgpu::BufferUsages::INDEX);
+            self.ibuf = sized_buffer(device, "indices", self.icap, INDEX_USAGE);
         }
         if !idata.is_empty() {
             queue.write_buffer(&self.ibuf, 0, idata);
@@ -195,27 +198,148 @@ impl MeshBuffers {
     }
 }
 
-/// The sparse upload path: a list of vertex indices and their new data, pushed
-/// to the GPU and scattered into place by a compute pass.
-struct Scatter {
+/// Words per vertex and per triangle; these must match the shader strides.
+const VERTEX_FLOATS: usize = 12;
+const FACE_WORDS: usize = 3;
+
+/// One sparse upload channel: a list of destination slots and the data to put
+/// in them, pushed to the GPU and scattered into place by a compute pass.
+struct ScatterPass {
     pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
-    index_buf: wgpu::Buffer,
+    slot_buf: wgpu::Buffer,
     data_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
+    /// Slots the buffers can hold.
     capacity: u32,
-    /// Cached bind group, keyed by the vertex buffer it was built against.
+    /// Words per slot.
+    stride: usize,
+    /// Cached bind group, keyed by the object and buffer generation it was
+    /// built against.
     bind: Option<(usize, u32, wgpu::BindGroup)>,
-    staged_indices: Vec<u32>,
-    staged_data: Vec<f32>,
+}
+
+impl ScatterPass {
+    fn new(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        source: wgpu::ShaderSource<'_>,
+        label: &str,
+        stride: usize,
+    ) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scatter pipeline layout"),
+            bind_group_layouts: &[Some(layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let capacity = 4096;
+        Self {
+            pipeline,
+            slot_buf: sized_buffer(device, "scatter slots", capacity as u64 * 4, wgpu::BufferUsages::STORAGE),
+            data_buf: sized_buffer(
+                device,
+                "scatter data",
+                capacity as u64 * stride as u64 * 4,
+                wgpu::BufferUsages::STORAGE,
+            ),
+            params_buf: sized_buffer(device, "scatter params", 16, wgpu::BufferUsages::UNIFORM),
+            capacity,
+            stride,
+            bind: None,
+        }
+    }
+
+    fn reserve(&mut self, device: &wgpu::Device, count: u32) {
+        if count <= self.capacity {
+            return;
+        }
+        self.capacity = count.next_power_of_two();
+        self.slot_buf = sized_buffer(
+            device,
+            "scatter slots",
+            self.capacity as u64 * 4,
+            wgpu::BufferUsages::STORAGE,
+        );
+        self.data_buf = sized_buffer(
+            device,
+            "scatter data",
+            self.capacity as u64 * self.stride as u64 * 4,
+            wgpu::BufferUsages::STORAGE,
+        );
+        self.bind = None;
+    }
+
+    /// Queues the scatter. `slots` and `data` must already be staged, and
+    /// `destination` is the buffer being written into.
+    fn dispatch(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        layout: &wgpu::BindGroupLayout,
+        destination: &wgpu::Buffer,
+        key: (usize, u32),
+        slots: &[u32],
+        data: &[u8],
+    ) {
+        let count = slots.len() as u32;
+        if count == 0 {
+            return;
+        }
+        self.reserve(device, count);
+        queue.write_buffer(&self.slot_buf, 0, bytemuck::cast_slice(slots));
+        queue.write_buffer(&self.data_buf, 0, data);
+        queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&[count, 0u32, 0, 0]));
+
+        let stale = !matches!(&self.bind, Some((o, g, _)) if (*o, *g) == key);
+        if stale {
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("scatter bind"),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: destination.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.slot_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: self.data_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: self.params_buf.as_entire_binding() },
+                ],
+            });
+            self.bind = Some((key.0, key.1, bind));
+        }
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("scatter"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        if let Some((_, _, bind)) = &self.bind {
+            pass.set_bind_group(0, bind, &[]);
+        }
+        pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+    }
+}
+
+/// Both sparse channels, sharing one bind group layout.
+struct Scatter {
+    layout: wgpu::BindGroupLayout,
+    verts: ScatterPass,
+    faces: ScatterPass,
+    vertex_data: Vec<f32>,
+    face_data: Vec<u32>,
 }
 
 impl Scatter {
     fn new(device: &wgpu::Device) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("scatter"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/scatter.wgsl").into()),
-        });
         let storage = |read_only: bool| wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only },
             has_dynamic_offset: false,
@@ -243,72 +367,29 @@ impl Scatter {
                 ),
             ],
         });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("scatter pipeline layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("scatter"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let capacity = 4096;
-        Self {
-            pipeline,
-            layout,
-            index_buf: sized_buffer(
-                device,
-                "scatter indices",
-                capacity as u64 * 4,
-                wgpu::BufferUsages::STORAGE,
-            ),
-            data_buf: sized_buffer(
-                device,
-                "scatter data",
-                capacity as u64 * VERTEX_FLOATS as u64 * 4,
-                wgpu::BufferUsages::STORAGE,
-            ),
-            params_buf: sized_buffer(
-                device,
-                "scatter params",
-                16,
-                wgpu::BufferUsages::UNIFORM,
-            ),
-            capacity,
-            bind: None,
-            staged_indices: Vec::new(),
-            staged_data: Vec::new(),
-        }
-    }
-
-    fn reserve(&mut self, device: &wgpu::Device, count: u32) {
-        if count <= self.capacity {
-            return;
-        }
-        self.capacity = count.next_power_of_two();
-        self.index_buf = sized_buffer(
+        let verts = ScatterPass::new(
             device,
+            &layout,
+            wgpu::ShaderSource::Wgsl(include_str!("shaders/scatter.wgsl").into()),
+            "scatter vertices",
+            VERTEX_FLOATS,
+        );
+        let faces = ScatterPass::new(
+            device,
+            &layout,
+            wgpu::ShaderSource::Wgsl(include_str!("shaders/scatter_index.wgsl").into()),
             "scatter indices",
-            self.capacity as u64 * 4,
-            wgpu::BufferUsages::STORAGE,
+            FACE_WORDS,
         );
-        self.data_buf = sized_buffer(
-            device,
-            "scatter data",
-            self.capacity as u64 * VERTEX_FLOATS as u64 * 4,
-            wgpu::BufferUsages::STORAGE,
-        );
-        self.bind = None;
+        Self {
+            layout,
+            verts,
+            faces,
+            vertex_data: Vec::new(),
+            face_data: Vec::new(),
+        }
     }
 }
-
-/// Floats in one vertex; must match the shader's stride.
-const VERTEX_FLOATS: usize = 12;
 
 pub struct Renderer {
     mesh_pipeline: wgpu::RenderPipeline,
@@ -668,11 +749,11 @@ impl Renderer {
         self.last_upload_bytes = bytes;
     }
 
-    /// Sends only the vertices in `dirty` and scatters them into place.
+    /// Sends only the vertices and triangles that changed, and scatters them
+    /// into place with a pair of compute passes.
     ///
-    /// Falls back to a whole-buffer upload when the touched set is big enough
-    /// that the sparse path would cost more than it saves, or when the object
-    /// has never been uploaded.
+    /// Returns false when the change is too broad or the buffers would have to
+    /// grow, in which case the caller should fall back to a whole upload.
     pub fn sync_sparse(
         &mut self,
         device: &wgpu::Device,
@@ -680,85 +761,95 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         scene: &Scene,
         object: usize,
-        dirty: &mut Vec<u32>,
-    ) {
+        dirty_verts: &mut Vec<u32>,
+        dirty_faces: &mut Vec<u32>,
+    ) -> bool {
         let Some(obj) = scene.objects.get(object) else {
-            return;
+            return true;
         };
         while self.meshes.len() < scene.objects.len() {
             self.meshes.push(MeshBuffers::new(device));
         }
-        let total = obj.mesh.verts.len();
-        if total == 0 || dirty.is_empty() {
+        let mesh = &obj.mesh;
+        let (vcount, fcount) = (mesh.verts.len(), mesh.faces.len());
+        if vcount == 0 {
             self.last_upload_bytes = 0;
-            return;
+            return true;
         }
 
-        dirty.sort_unstable();
-        dirty.dedup();
-        dirty.retain(|&v| (v as usize) < total);
-        // Past a quarter of the mesh the index list and the scattered writes
-        // stop being a saving.
-        if dirty.len() * 4 >= total {
-            let n = self.meshes[object].upload(device, queue, &obj.mesh);
-            self.last_upload_bytes = n;
-            return;
+        // A buffer that has to grow cannot be patched in place.
+        let buffers = &self.meshes[object];
+        let needed_v = (vcount * std::mem::size_of::<sculpt_core::Vertex>()) as u64;
+        let needed_i = (fcount * std::mem::size_of::<[u32; 3]>()) as u64;
+        if needed_v > buffers.vcap || needed_i > buffers.icap {
+            return false;
         }
 
-        let s = &mut self.scatter;
-        s.reserve(device, dirty.len() as u32);
-        s.staged_indices.clear();
-        s.staged_data.clear();
-        s.staged_data.reserve(dirty.len() * VERTEX_FLOATS);
-        for &v in dirty.iter() {
-            s.staged_indices.push(v);
-            let vx = &obj.mesh.verts[v as usize];
-            s.staged_data.extend_from_slice(&[
-                vx.pos.x, vx.pos.y, vx.pos.z,
-                vx.nrm.x, vx.nrm.y, vx.nrm.z,
-                vx.col.x, vx.col.y, vx.col.z,
-                vx.mask, vx.rough, vx.metal,
-            ]);
+        prune(dirty_verts, vcount);
+        prune(dirty_faces, fcount);
+        // Past a quarter of the mesh the slot lists stop being a saving.
+        if dirty_verts.len() * 4 >= vcount || dirty_faces.len() * 4 >= fcount.max(1) {
+            return false;
         }
-
-        let count = s.staged_indices.len() as u32;
-        queue.write_buffer(&s.index_buf, 0, bytemuck::cast_slice(&s.staged_indices));
-        queue.write_buffer(&s.data_buf, 0, bytemuck::cast_slice(&s.staged_data));
-        queue.write_buffer(&s.params_buf, 0, bytemuck::cast_slice(&[count, 0u32, 0, 0]));
 
         let generation = self.meshes[object].generation;
-        let stale = !matches!(&s.bind, Some((o, g, _)) if *o == object && *g == generation);
-        if stale {
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("scatter bind"),
-                layout: &s.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.meshes[object].vbuf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry { binding: 1, resource: s.index_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: s.data_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: s.params_buf.as_entire_binding() },
-                ],
-            });
-            s.bind = Some((object, generation, bind));
-        }
+        let key = (object, generation);
+        let mut sent = 0u64;
 
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("scatter vertices"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&s.pipeline);
-            if let Some((_, _, bind)) = &s.bind {
-                pass.set_bind_group(0, bind, &[]);
+        if !dirty_verts.is_empty() {
+            let s = &mut self.scatter;
+            s.vertex_data.clear();
+            s.vertex_data.reserve(dirty_verts.len() * VERTEX_FLOATS);
+            for &v in dirty_verts.iter() {
+                let vx = &mesh.verts[v as usize];
+                s.vertex_data.extend_from_slice(&[
+                    vx.pos.x, vx.pos.y, vx.pos.z,
+                    vx.nrm.x, vx.nrm.y, vx.nrm.z,
+                    vx.col.x, vx.col.y, vx.col.z,
+                    vx.mask, vx.rough, vx.metal,
+                ]);
             }
-            pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+            let data: &[u8] = bytemuck::cast_slice(&s.vertex_data);
+            sent += (dirty_verts.len() * 4 + data.len()) as u64;
+            let layout = &s.layout;
+            s.verts.dispatch(
+                device,
+                queue,
+                encoder,
+                layout,
+                &self.meshes[object].vbuf,
+                key,
+                dirty_verts,
+                data,
+            );
         }
 
-        self.last_upload_bytes =
-            (s.staged_indices.len() * 4 + s.staged_data.len() * 4) as u64;
+        if !dirty_faces.is_empty() {
+            let s = &mut self.scatter;
+            s.face_data.clear();
+            s.face_data.reserve(dirty_faces.len() * FACE_WORDS);
+            for &f in dirty_faces.iter() {
+                s.face_data.extend_from_slice(&mesh.faces[f as usize]);
+            }
+            let data: &[u8] = bytemuck::cast_slice(&s.face_data);
+            sent += (dirty_faces.len() * 4 + data.len()) as u64;
+            let layout = &s.layout;
+            s.faces.dispatch(
+                device,
+                queue,
+                encoder,
+                layout,
+                &self.meshes[object].ibuf,
+                key,
+                dirty_faces,
+                data,
+            );
+        }
+
+        // The draw range follows the face count even when no triangle moved.
+        self.meshes[object].index_count = (fcount * 3) as u32;
+        self.last_upload_bytes = sent;
+        true
     }
 
     /// Writes the per-frame and per-object uniforms.
@@ -873,6 +964,13 @@ impl Renderer {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Sorts, deduplicates and drops slots past the end of the array.
+fn prune(slots: &mut Vec<u32>, len: usize) {
+    slots.sort_unstable();
+    slots.dedup();
+    slots.retain(|&s| (s as usize) < len);
+}
 
 fn empty_buffer(device: &wgpu::Device, label: &str, usage: wgpu::BufferUsages) -> wgpu::Buffer {
     sized_buffer(device, label, 1024, usage)

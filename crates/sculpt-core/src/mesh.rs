@@ -66,6 +66,16 @@ pub struct Mesh {
     pub vfaces: Vec<FaceList>,
     /// Spatial index. `None` means "not built yet or invalidated".
     pub accel: Option<Grid>,
+    /// Slots written since the last upload, so a renderer can send just those.
+    ///
+    /// Every mutation below records what it touched. This is the difference
+    /// between sending a few kilobytes and re-sending a hundred megabyte mesh
+    /// on every frame of a stroke. Duplicates are fine; the consumer sorts.
+    pub dirty_verts: Vec<u32>,
+    pub dirty_faces: Vec<u32>,
+    /// Set by anything that rewrites the arrays wholesale, where per-slot
+    /// tracking would be meaningless.
+    pub fully_dirty: bool,
 }
 
 impl Mesh {
@@ -79,7 +89,7 @@ impl Mesh {
             verts: positions.iter().map(|p| Vertex::new(*p)).collect(),
             faces: faces.to_vec(),
             vfaces: vec![FaceList::new(); positions.len()],
-            accel: None,
+            ..Default::default()
         };
         m.rebuild_adjacency();
         m.recompute_normals();
@@ -103,6 +113,42 @@ impl Mesh {
             }
         }
         self.accel = None;
+        self.mark_fully_dirty();
+    }
+
+    // ---- change tracking ----------------------------------------------------
+
+    /// Declares that everything changed, which is what a wholesale rewrite of
+    /// the arrays amounts to.
+    pub fn mark_fully_dirty(&mut self) {
+        self.fully_dirty = true;
+        self.dirty_verts.clear();
+        self.dirty_faces.clear();
+    }
+
+    #[inline]
+    fn touch_vert(&mut self, v: u32) {
+        if !self.fully_dirty {
+            self.dirty_verts.push(v);
+        }
+    }
+
+    #[inline]
+    fn touch_face(&mut self, f: u32) {
+        if !self.fully_dirty {
+            self.dirty_faces.push(f);
+        }
+    }
+
+    /// Hands over what changed and starts a fresh round.
+    pub fn take_dirty(&mut self) -> (Vec<u32>, Vec<u32>, bool) {
+        let full = self.fully_dirty;
+        self.fully_dirty = false;
+        (
+            std::mem::take(&mut self.dirty_verts),
+            std::mem::take(&mut self.dirty_faces),
+            full,
+        )
     }
 
     // ---- spatial index ------------------------------------------------------
@@ -134,6 +180,7 @@ impl Mesh {
 
     /// Refiles a vertex and, when it changed cell, its incident faces.
     fn refile(&mut self, v: u32) {
+        self.touch_vert(v);
         if self.accel.is_none() {
             return;
         }
@@ -161,11 +208,22 @@ impl Mesh {
     /// batch their writes and call this once, which is much cheaper than going
     /// through [`Mesh::set_pos`] per vertex.
     pub fn commit_moves(&mut self, moved: &[u32]) {
+        if !self.fully_dirty {
+            self.dirty_verts.extend_from_slice(moved);
+        }
         if self.accel.is_none() {
             return;
         }
         for &v in moved {
             self.refile(v);
+        }
+    }
+
+    /// Records that these vertices were written without moving, which is what
+    /// a colour or mask brush does.
+    pub fn commit_attributes(&mut self, touched: &[u32]) {
+        if !self.fully_dirty {
+            self.dirty_verts.extend_from_slice(touched);
         }
     }
 
@@ -178,6 +236,7 @@ impl Mesh {
         }
         self.verts.push(v);
         self.vfaces.push(FaceList::new());
+        self.touch_vert(id);
         id
     }
 
@@ -193,6 +252,7 @@ impl Mesh {
                 g.push_face(fi, c, r);
             }
         }
+        self.touch_face(fi);
         fi
     }
 
@@ -219,6 +279,10 @@ impl Mesh {
             g.swap_remove_face(f);
         }
         self.faces.swap_remove(fi);
+        // The last face now lives in this slot, so this slot's data changed.
+        if fi < self.faces.len() {
+            self.touch_face(f);
+        }
     }
 
     /// Removes an isolated vertex, moving the last vertex into its slot.
@@ -235,6 +299,8 @@ impl Mesh {
                         *x = v;
                     }
                 }
+                // Those faces now name a different vertex index.
+                self.touch_face(f);
             }
         }
         if let Some(g) = &mut self.accel {
@@ -242,6 +308,9 @@ impl Mesh {
         }
         self.verts.swap_remove(vi);
         self.vfaces.swap_remove(vi);
+        if vi < self.verts.len() {
+            self.touch_vert(v);
+        }
     }
 
     /// The one or two faces sharing edge `(a, b)`.
@@ -372,6 +441,7 @@ impl Mesh {
 
         let merged = Vertex::lerp_attrs(&self.verts[a as usize], &self.verts[b as usize], 0.5);
         self.verts[a as usize] = merged;
+        self.touch_vert(a);
 
         let mut doomed: SmallVec<[u32; 2]> = fs;
         doomed.sort_unstable_by(|x, y| y.cmp(x));
@@ -388,6 +458,7 @@ impl Mesh {
                 }
             }
             self.vfaces[a as usize].push(f);
+            self.touch_face(f);
         }
         self.vfaces[b as usize].clear();
         self.remove_vertex(b);
@@ -430,6 +501,7 @@ impl Mesh {
         for (v, n) in self.verts.iter_mut().zip(normals) {
             v.nrm = n;
         }
+        self.mark_fully_dirty();
     }
 
     /// Recomputes normals for `verts` and their ring-1 neighbours only.
@@ -450,6 +522,9 @@ impl Mesh {
                 n += self.face_normal(f);
             }
             self.verts[v as usize].nrm = n.normalize_or(Vec3::Y);
+        }
+        if !self.fully_dirty {
+            self.dirty_verts.extend_from_slice(&set);
         }
         set
     }
@@ -485,6 +560,7 @@ impl Mesh {
         let s = 1.0 / r;
         self.verts.par_iter_mut().for_each(|v| v.pos = (v.pos - c) * s);
         self.invalidate_accel();
+        self.mark_fully_dirty();
     }
 
     /// Applies an arbitrary affine transform, fixing up normals and winding.
@@ -499,6 +575,7 @@ impl Mesh {
             self.rebuild_adjacency();
         }
         self.invalidate_accel();
+        self.mark_fully_dirty();
     }
 
     /// Mean edge length, used to seed the dyntopo detail size.

@@ -5,6 +5,7 @@ mod gizmo;
 mod icons;
 mod input;
 mod matcap;
+mod navwidget;
 mod renderer;
 mod theme;
 mod ui;
@@ -126,10 +127,16 @@ impl State {
         config.desired_maximum_frame_latency = 2;
         surface.configure(&device, &config);
 
-        let flags = adapter.get_texture_format_features(format).flags;
+        // A sample count is only usable when the colour format and the depth
+        // format both accept it. Asking for one the depth buffer cannot do is a
+        // validation error, which on this path means the window simply closes.
+        let colour_flags = adapter.get_texture_format_features(format).flags;
+        let depth_flags = adapter
+            .get_texture_format_features(renderer::DEPTH_FORMAT)
+            .flags;
         let max_samples = [8u32, 4, 2]
             .into_iter()
-            .find(|n| flags.sample_count_supported(*n))
+            .find(|n| colour_flags.sample_count_supported(*n) && depth_flags.sample_count_supported(*n))
             .unwrap_or(1);
         let samples = max_samples.min(4);
 
@@ -171,6 +178,7 @@ impl State {
         let ui = UiState {
             wireframe_available: wire_supported,
             msaa_available: max_samples > 1,
+            max_samples,
             sample_count: samples,
             ..Default::default()
         };
@@ -223,9 +231,18 @@ impl State {
         self.camera.ray(p.x, p.y, w, h)
     }
 
+    #[allow(dead_code)]
     fn pick_at(&self, p: Vec2) -> Option<sculpt_core::SceneHit> {
         let (o, d) = self.ray_at(p);
         self.sculptor.pick(o, d)
+    }
+
+    /// The pick a brush should use: the surface under the cursor, or the
+    /// nearest surface within a brush radius of the ray when the cursor is
+    /// just off the silhouette. Grabbing the edge of a form needs the latter.
+    fn pick_for_brush(&self, p: Vec2) -> Option<sculpt_core::SceneHit> {
+        let (o, d) = self.ray_at(p);
+        self.sculptor.pick_soft(o, d, self.sculptor.brush.radius)
     }
 
     /// Intersects the cursor ray with a view-facing plane through `anchor`.
@@ -298,7 +315,7 @@ impl State {
 
     fn begin_stroke(&mut self, pressure: f32) {
         let cursor = self.input.cursor;
-        let Some(hit) = self.pick_at(cursor) else {
+        let Some(hit) = self.pick_for_brush(cursor) else {
             return;
         };
 
@@ -370,7 +387,7 @@ impl State {
             return;
         }
 
-        let Some(hit) = self.pick_at(cursor) else {
+        let Some(hit) = self.pick_for_brush(cursor) else {
             return;
         };
         let mut to = (hit.world.point, hit.world.normal);
@@ -558,10 +575,13 @@ impl State {
                 }
                 Action::Subdivide(smooth) => {
                     let before = self.sculptor.mesh().face_count();
-                    self.sculptor.subdivide(smooth);
-                    let after = self.sculptor.mesh().face_count();
-                    self.full_resync = true;
-                    self.ui.say(format!("{before} to {after} triangles"));
+                    match self.sculptor.subdivide(smooth) {
+                        Ok(after) => {
+                            self.full_resync = true;
+                            self.ui.say(format!("{before} to {after} triangles"));
+                        }
+                        Err(why) => self.ui.say(why),
+                    }
                 }
                 Action::Decimate => {
                     let ratio = self.ui.decimate_ratio;
@@ -826,31 +846,35 @@ impl State {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
-        // Upload whatever the sculptor touched. A stroke that only moved
-        // vertices can go through the sparse path; anything structural, and
-        // anything that changed the index buffer, needs the whole thing.
-        let structural = self.full_resync || self.sculptor.topology_dirty;
+        // Upload whatever the sculptor touched. The mesh records which slots it
+        // wrote, so a stroke sends a few kilobytes instead of the whole model;
+        // a scene change, or a mesh that outgrew its buffers, still goes in
+        // full.
+        let (mut dirty_verts, mut dirty_faces, fully_dirty) = self.sculptor.take_dirty();
+        let object = self.sculptor.scene.active;
+        let changed = self.sculptor.verts_dirty || self.sculptor.topology_dirty;
         let sparse_ok = self.ui.settings.gpu_scatter
-            && !structural
-            && self.sculptor.verts_dirty
-            && self.dirty_object == Some(self.sculptor.scene.active);
+            && !self.full_resync
+            && !fully_dirty
+            && changed
+            && self.dirty_object == Some(object);
 
+        let mut done = false;
         if sparse_ok {
-            let object = self.sculptor.scene.active;
-            let mut dirty = self.sculptor.take_dirty_verts();
-            self.renderer.sync_sparse(
+            done = self.renderer.sync_sparse(
                 &self.device,
                 &self.queue,
                 &mut encoder,
                 &self.sculptor.scene,
                 object,
-                &mut dirty,
+                &mut dirty_verts,
+                &mut dirty_faces,
             );
-        } else if structural || self.sculptor.verts_dirty {
-            let dirty = if structural { None } else { self.dirty_object };
+        }
+        if !done && (self.full_resync || changed) {
+            let target = if self.full_resync { None } else { self.dirty_object };
             self.renderer
-                .sync(&self.device, &self.queue, &self.sculptor.scene, dirty);
-            self.sculptor.dirty_verts.clear();
+                .sync(&self.device, &self.queue, &self.sculptor.scene, target);
         }
         self.ui.upload_bytes = self.renderer.last_upload_bytes;
         self.sculptor.verts_dirty = false;
@@ -1010,7 +1034,7 @@ impl State {
             .is_some()
             || self.gizmo.is_dragging();
         let hit = (!over_ui && !over_gizmo && !self.input.touch_active())
-            .then(|| self.pick_at(self.input.cursor))
+            .then(|| self.pick_for_brush(self.input.cursor))
             .flatten();
 
         let cursor = hit.as_ref().map(|h| {
@@ -1029,11 +1053,34 @@ impl State {
             (n.x, -n.y)
         });
 
+        // When the pick reached past the cursor to find the surface, say so.
+        let cursor_point = egui::pos2(self.input.cursor.x / ppp, self.input.cursor.y / ppp);
+        let anchor = hit.as_ref().and_then(|h| {
+            let at = self.project_to_points(h.world.point)?;
+            ((at - cursor_point).length() > 6.0).then_some(at)
+        });
+
         Overlay {
             cursor,
             cursor_tilt: tilt,
+            anchor,
             stroking: self.stroke.active,
         }
+    }
+
+    /// Projects a world point into interface points.
+    fn project_to_points(&self, p: Vec3) -> Option<egui::Pos2> {
+        let (w, h) = self.viewport();
+        let clip = self.camera.view_proj(self.aspect()) * glam::Vec4::new(p.x, p.y, p.z, 1.0);
+        if clip.w <= 1e-6 {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        let ppp = self.egui_ctx.pixels_per_point().max(1e-3);
+        Some(egui::pos2(
+            (ndc.x * 0.5 + 0.5) * w / ppp,
+            (0.5 - ndc.y * 0.5) * h / ppp,
+        ))
     }
 }
 

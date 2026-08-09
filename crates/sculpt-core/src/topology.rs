@@ -109,7 +109,7 @@ fn finish(verts: Vec<Vertex>, faces: Vec<[u32; 3]>) -> Mesh {
         vfaces: vec![Default::default(); verts.len()],
         verts,
         faces,
-        accel: None,
+        ..Default::default()
     };
     m.rebuild_adjacency();
     m.recompute_normals();

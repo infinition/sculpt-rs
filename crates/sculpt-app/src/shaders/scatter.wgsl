@@ -25,9 +25,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (i >= params.x) {
         return;
     }
-    let to = indices[i] * STRIDE;
-    let from = i * STRIDE;
+    // `from` and `to` are reserved words in WGSL, hence the longer names.
+    let write_at = indices[i] * STRIDE;
+    let read_at = i * STRIDE;
     for (var k = 0u; k < STRIDE; k = k + 1u) {
-        destination[to + k] = source[from + k];
+        destination[write_at + k] = source[read_at + k];
     }
 }

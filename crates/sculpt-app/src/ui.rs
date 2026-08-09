@@ -9,6 +9,7 @@ use crate::camera::{Camera, Projection, ViewPreset};
 use crate::gizmo::{Gizmo, GizmoMode};
 use crate::icons::Icon;
 use crate::matcap;
+use crate::navwidget::{self, NavAction, NavWidget};
 use crate::renderer::{FrameSettings, Shading};
 use crate::theme::{ColorPreset, Metrics, Palette, Side, UiTheme};
 use crate::widgets::{self, BigSlider};
@@ -124,11 +125,15 @@ pub struct UiState {
     pub subdivide_smooth: bool,
     pub sample_count: u32,
     pub msaa_available: bool,
+    /// Highest sample count this GPU accepts for both colour and depth.
+    pub max_samples: u32,
     pub wireframe_available: bool,
     pub picking_color: bool,
     pub add_primitive: Primitive,
     /// Bytes the last frame sent to the GPU, shown in the statistics.
     pub upload_bytes: u64,
+    pub nav: NavWidget,
+    pub show_nav: bool,
     /// Interface scale being dragged, applied when the drag ends. Zooming
     /// rescales the coordinate space the slider itself lives in, so committing
     /// mid-gesture would move the rail out from under the finger.
@@ -155,10 +160,13 @@ impl Default for UiState {
             subdivide_smooth: true,
             sample_count: 4,
             msaa_available: true,
+            max_samples: 4,
             wireframe_available: true,
             picking_color: false,
             add_primitive: Primitive::Sphere,
             upload_bytes: 0,
+            nav: NavWidget::default(),
+            show_nav: true,
             ui_scale_draft: UiTheme::default().ui_scale,
         }
     }
@@ -177,6 +185,10 @@ pub struct Overlay {
     pub cursor: Option<(egui::Pos2, f32)>,
     /// Surface normal under the cursor, projected to screen, for the tilt spoke.
     pub cursor_tilt: Option<(f32, f32)>,
+    /// Where the brush will actually bite, when that is not under the cursor.
+    /// Set while the cursor sits off the silhouette and the stroke is reaching
+    /// for the nearest surface instead.
+    pub anchor: Option<egui::Pos2>,
     pub stroking: bool,
 }
 
@@ -208,6 +220,32 @@ pub fn draw(
         }
         if st.show_panel {
             settings_dock(root, s, st, cam, giz, &mut cx);
+        }
+    }
+
+    // Whatever the docks left over is the viewport, and that is where the
+    // orientation widget belongs.
+    if st.show_nav {
+        let viewport = root.available_rect_before_wrap();
+        if let Some(a) = st.nav.show(root.ctx(), viewport, cam, &p, &m) {
+            match a {
+                NavAction::View(preset) => cam.set_preset(preset),
+                NavAction::Align => {
+                    let (preset, _) = navwidget::nearest_view(cam);
+                    cam.set_preset(preset);
+                }
+                NavAction::Frame => actions.push(Action::FrameView),
+                NavAction::ToggleProjection => {
+                    cam.projection = match cam.projection {
+                        Projection::Perspective => Projection::Orthographic,
+                        Projection::Orthographic => Projection::Perspective,
+                    }
+                }
+                NavAction::ToggleLock => {
+                    cam.locked = !cam.locked;
+                    st.say(if cam.locked { "view locked" } else { "view unlocked" });
+                }
+            }
         }
     }
     viewport_overlay(root, s, st, overlay, p);
@@ -517,6 +555,11 @@ fn settings_dock(
                 .inner_margin(Margin::same(m.pad as i8)),
         )
         .show(root, |ui| {
+            // Explanatory text has to wrap. Left to itself a label asks for its
+            // full unbroken width, and a resizable dock grows to grant it,
+            // which is how one long sentence swallows the viewport.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+
             let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
             let current = Tab::ALL.iter().position(|t| *t == st.tab).unwrap_or(0);
             if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
@@ -524,14 +567,18 @@ fn settings_dock(
             }
             ui.add_space(6.0);
 
+            let inner_width = ui.available_width();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| match st.tab {
-                    Tab::Brush => brush_tab(ui, s, st, cx),
-                    Tab::Model => model_tab(ui, s, st, cx),
-                    Tab::Scene => scene_tab(ui, s, st, giz, cx),
-                    Tab::View => view_tab(ui, st, cam, cx),
-                    Tab::Interface => interface_tab(ui, st, cx),
+                .show(ui, |ui| {
+                    ui.set_max_width(inner_width);
+                    match st.tab {
+                        Tab::Brush => brush_tab(ui, s, st, cx),
+                        Tab::Model => model_tab(ui, s, st, cx),
+                        Tab::Scene => scene_tab(ui, s, st, giz, cx),
+                        Tab::View => view_tab(ui, st, cam, cx),
+                        Tab::Interface => interface_tab(ui, st, cx),
+                    }
                 });
         });
 }
@@ -1149,13 +1196,26 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
     );
 
     widgets::section_title(ui, "ANTI-ALIASING");
+    // Only offer what this GPU actually accepts: asking for a sample count the
+    // depth buffer cannot do is a validation error, not a soft failure.
     let msaa_ok = st.msaa_available;
+    let counts: Vec<u32> = [1u32, 2, 4, 8]
+        .into_iter()
+        .filter(|c| *c <= st.max_samples)
+        .collect();
+    let labels: Vec<&str> = counts
+        .iter()
+        .map(|c| match c {
+            1 => "Off",
+            2 => "2x",
+            4 => "4x",
+            _ => "8x",
+        })
+        .collect();
     let picked = ui
         .add_enabled_ui(msaa_ok, |ui| {
-            let counts = [1u32, 2, 4, 8];
-            let current = counts.iter().position(|c| *c == st.sample_count).unwrap_or(2);
-            widgets::segmented(ui, &["Off", "2x", "4x", "8x"], current, m.row)
-                .map(|i| counts[i])
+            let current = counts.iter().position(|c| *c == st.sample_count).unwrap_or(0);
+            widgets::segmented(ui, &labels, current, m.row).map(|i| counts[i])
         })
         .inner;
     if let Some(n) = picked {
@@ -1294,6 +1354,15 @@ fn viewport_overlay(
                 [pos, egui::pos2(pos.x + nx * radius, pos.y + ny * radius)],
                 Stroke::new(1.0, Color32::from_white_alpha(110)),
             );
+        }
+        // Off the silhouette the brush still bites, just not under the pointer.
+        // Marking the spot is the difference between a tool that feels broken
+        // and one that feels like it is reaching.
+        if let Some(anchor) = overlay.anchor {
+            let mark = Color32::from_rgb(240, 90, 90);
+            painter.line_segment([pos, anchor], Stroke::new(1.0, mark.gamma_multiply(0.45)));
+            painter.circle_stroke(anchor, 7.0, Stroke::new(1.2, mark.gamma_multiply(0.8)));
+            painter.circle_filled(anchor, 2.0, mark);
         }
     }
 

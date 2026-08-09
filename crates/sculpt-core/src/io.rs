@@ -583,7 +583,7 @@ pub fn read_scene(path: &Path) -> IoResult<Scene> {
             .collect();
         o += fbytes;
 
-        let mut mesh = Mesh { verts, faces, vfaces: Vec::new(), accel: None };
+        let mut mesh = Mesh { verts, faces, vfaces: Vec::new(), ..Default::default() };
         mesh.rebuild_adjacency();
         let mut obj = Object::new(name, mesh);
         obj.transform = Transform { position, rotation, scale };

@@ -79,6 +79,10 @@ pub struct Camera {
     /// Radians of orbit per pixel of drag.
     pub orbit_speed: f32,
     pub invert_orbit_y: bool,
+    /// Blocks navigation input. Explicit commands, like snapping to a named
+    /// view, still go through: the lock is there to stop a stroke nudging the
+    /// camera, not to freeze the whole application.
+    pub locked: bool,
 }
 
 impl Default for Camera {
@@ -94,11 +98,17 @@ impl Default for Camera {
             smoothing: 0.55,
             orbit_speed: 0.008,
             invert_orbit_y: false,
+            locked: false,
         }
     }
 }
 
 impl Camera {
+    /// The point the camera orbits.
+    pub fn target(&self) -> Vec3 {
+        self.live.target
+    }
+
     pub fn eye(&self) -> Vec3 {
         let (sy, cy) = self.live.yaw.sin_cos();
         let (sp, cp) = self.live.pitch.sin_cos();
@@ -153,6 +163,9 @@ impl Camera {
     // ---- navigation ---------------------------------------------------------
 
     pub fn orbit(&mut self, dx: f32, dy: f32) {
+        if self.locked {
+            return;
+        }
         const LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
         let sign = if self.invert_orbit_y { -1.0 } else { 1.0 };
         self.goal.yaw -= dx * self.orbit_speed;
@@ -160,6 +173,9 @@ impl Camera {
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32, viewport_h: f32) {
+        if self.locked {
+            return;
+        }
         // Scale so a pixel of drag moves the same amount of surface regardless
         // of zoom level.
         let half = match self.projection {
@@ -174,11 +190,17 @@ impl Camera {
     }
 
     pub fn zoom(&mut self, scroll: f32) {
+        if self.locked {
+            return;
+        }
         self.goal.distance = (self.goal.distance * (1.0 - scroll * 0.12)).clamp(0.02, 200.0);
     }
 
     /// Multiplicative zoom, for pinch gestures.
     pub fn zoom_by(&mut self, factor: f32) {
+        if self.locked {
+            return;
+        }
         self.goal.distance = (self.goal.distance / factor.max(1e-3)).clamp(0.02, 200.0);
     }
 

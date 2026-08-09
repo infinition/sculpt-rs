@@ -52,9 +52,6 @@ pub struct Sculptor {
     pub verts_dirty: bool,
     /// Set when the index buffer needs a re-upload.
     pub topology_dirty: bool,
-    /// Vertices written since the last upload, so a renderer can send just
-    /// those instead of the whole buffer. May contain duplicates.
-    pub dirty_verts: Vec<u32>,
     stroking: bool,
     stroke_state: brush::StrokeState,
 }
@@ -76,7 +73,6 @@ impl Sculptor {
             history: History::default(),
             verts_dirty: true,
             topology_dirty: true,
-            dirty_verts: Vec::new(),
             stroking: false,
             stroke_state: brush::StrokeState::default(),
             scene,
@@ -224,20 +220,23 @@ impl Sculptor {
         let touched = brush::apply(mesh, &brush, input, &mut state);
         if !touched.is_empty() {
             if deforms {
-                // Normals change one ring further out than the positions did.
-                let ring = mesh.update_normals(&touched);
-                self.dirty_verts.extend_from_slice(&ring);
+                // Normals change one ring further out than the positions did,
+                // and `update_normals` records that wider set itself.
+                mesh.update_normals(&touched);
             } else {
-                self.dirty_verts.extend_from_slice(&touched);
+                mesh.commit_attributes(&touched);
             }
             self.verts_dirty = true;
         }
         self.stroke_state = state;
     }
 
-    /// Hands over the vertices written since the last call and clears the list.
-    pub fn take_dirty_verts(&mut self) -> Vec<u32> {
-        std::mem::take(&mut self.dirty_verts)
+    /// Hands over what the active mesh changed since the last call.
+    pub fn take_dirty(&mut self) -> (Vec<u32>, Vec<u32>, bool) {
+        match self.mesh_mut() {
+            Some(m) => m.take_dirty(),
+            None => (Vec::new(), Vec::new(), true),
+        }
     }
 
     /// Floods colour from a picked face. Fill is a click tool, so it records
@@ -336,13 +335,32 @@ impl Sculptor {
 
     // ---- topology commands --------------------------------------------------
 
-    pub fn subdivide(&mut self, smooth: bool) {
+    /// Splits every triangle into four.
+    ///
+    /// Refuses when the result would not fit: one subdivision quadruples the
+    /// triangles and roughly quadruples the memory, and the allocation failure
+    /// that follows is an abort, not something a caller can recover from. The
+    /// ceiling is the same one dynamic topology respects.
+    pub fn subdivide(&mut self, smooth: bool) -> Result<usize, String> {
+        let (verts, faces) = (self.mesh().vert_count(), self.mesh().face_count());
+        // A closed mesh has three halves of an edge per face, and every edge
+        // gains a vertex.
+        let projected_verts = verts + faces * 3 / 2;
+        let ceiling = self.dyntopo.max_verts;
+        if projected_verts > ceiling {
+            return Err(format!(
+                "subdividing would reach {:.1} M vertices, over the {:.1} M ceiling",
+                projected_verts as f64 / 1.0e6,
+                ceiling as f64 / 1.0e6
+            ));
+        }
         self.checkpoint();
         if let Some(o) = self.scene.active_mut() {
             o.mesh = topology::subdivide(&o.mesh, smooth);
         }
         self.reset_detail_to_mesh();
         self.mark_all_dirty();
+        Ok(self.mesh().face_count())
     }
 
     pub fn decimate(&mut self, ratio: f32) {
@@ -475,6 +493,55 @@ impl Sculptor {
                     let p = m.transform_point3(local.point);
                     let n = m.transform_vector3(local.normal).normalize_or(Vec3::Y);
                     Hit { face: local.face, point: p, normal: n, t: (p - origin).dot(dir) }
+                }
+            };
+            if best.as_ref().is_none_or(|b| world.t < b.world.t) {
+                best = Some(SceneHit { object: i, world, local });
+            }
+        }
+        best
+    }
+
+    /// Like [`Sculptor::pick`], but when the ray misses everything it reaches
+    /// for the nearest surface within `reach` of the ray.
+    ///
+    /// Sculpting the edge of a form means putting the cursor just outside it,
+    /// where a strict ray cast reports nothing. `reach` is normally the brush
+    /// radius, so the rule is simply: if the brush would touch the surface, the
+    /// stroke works.
+    pub fn pick_soft(&self, origin: Vec3, dir: Vec3, reach: f32) -> Option<SceneHit> {
+        if let Some(hit) = self.pick(origin, dir) {
+            return Some(hit);
+        }
+        let mut best: Option<SceneHit> = None;
+        for (i, o) in self.scene.objects.iter().enumerate() {
+            if !o.visible || o.mesh.verts.is_empty() {
+                continue;
+            }
+            let identity = o.transform.is_identity();
+            let (lo, ld, scale) = if identity {
+                (origin, dir, 1.0)
+            } else {
+                let inv = o.transform.inverse_matrix();
+                (
+                    inv.transform_point3(origin),
+                    inv.transform_vector3(dir).normalize_or(-Vec3::Z),
+                    o.transform.mean_scale().max(1e-6),
+                )
+            };
+            let Some(local) = query::nearest_to_ray(&o.mesh, lo, ld, reach / scale) else {
+                continue;
+            };
+            let world = if identity {
+                local
+            } else {
+                let m = o.transform.matrix();
+                let p = m.transform_point3(local.point);
+                Hit {
+                    face: local.face,
+                    point: p,
+                    normal: m.transform_vector3(local.normal).normalize_or(Vec3::Y),
+                    t: (p - origin).dot(dir),
                 }
             };
             if best.as_ref().is_none_or(|b| world.t < b.world.t) {
