@@ -81,6 +81,16 @@ pub struct Wheel {
     /// already down and will not press again without letting go, so the choice
     /// has to land on release, which is how a radial menu has always worked.
     opened_held: Option<bool>,
+    /// Pointer state last frame, so a release is detected as an edge rather
+    /// than trusted from an event.
+    ///
+    /// Remote desktops and pen digitisers both like to emit a stray release
+    /// while the finger is still down. Watching the level go from down to up
+    /// ignores those; watching the event does not.
+    was_down: bool,
+    /// Frames since the menu opened. The first few ignore a release entirely,
+    /// which absorbs the event storm that opening tends to sit in the middle of.
+    frames: u32,
 }
 
 impl Default for Wheel {
@@ -93,6 +103,8 @@ impl Default for Wheel {
             grab: Grab::None,
             last_sculpt: BrushKind::Clay,
             opened_held: None,
+            was_down: false,
+            frames: 0,
         }
     }
 }
@@ -103,6 +115,8 @@ impl Wheel {
         self.center = at;
         self.grab = Grab::None;
         self.opened_held = None;
+        self.was_down = true;
+        self.frames = 0;
         if !s.brush.kind.paints() {
             self.last_sculpt = s.brush.kind;
         }
@@ -188,9 +202,21 @@ impl Wheel {
         });
         // First frame decides how this menu was summoned.
         let held_open = *self.opened_held.get_or_insert(down);
+        self.frames = self.frames.saturating_add(1);
+
+        // A release is the level going from down to up, not the event saying
+        // so. A remote desktop that turns touches into mouse messages, and a
+        // digitiser that reports a hover between two contact reports, both emit
+        // releases the hand never made; an edge on the level ignores them. The
+        // first few frames ignore releases outright, since opening the menu
+        // sits in the middle of exactly that kind of event storm.
+        let settled = self.frames > 3;
+        let release_edge = settled && self.was_down && !down;
+        self.was_down = down;
+
         // A press picks when the pointer is free; a release picks when the
         // finger that opened the menu is still on the glass.
-        let choose = if held_open { released } else { pressed };
+        let choose = if held_open { release_edge } else { pressed };
 
         if !down {
             self.grab = Grab::None;
@@ -237,10 +263,11 @@ impl Wheel {
         // Opened by holding a button, the menu belongs to that finger: it lives
         // until the finger lifts, and the lift is also the choice. The
         // key-summoned menu ignores this and waits for the key instead.
-        if held_open && released {
+        if held_open && release_edge {
             self.open = false;
             self.grab = Grab::None;
         }
+        let _ = released;
     }
 
     // ---- pages ---------------------------------------------------------------

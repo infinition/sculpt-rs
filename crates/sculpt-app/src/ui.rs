@@ -339,7 +339,6 @@ pub fn draw(
                 // the other half under your hand.
                 st.wheel.open_at(viewport.center(), s);
             }
-            HudAction::Orbit(d) => cam.orbit(d.x, d.y),
             HudAction::Pan(d) => cam.pan(d.x, d.y, viewport.height().max(1.0)),
             HudAction::Zoom(amount) => cam.zoom(amount),
         }
@@ -1477,23 +1476,33 @@ fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
         .show(ui);
 
     widgets::section_title(ui, "FLOATING CONTROLS");
-    widgets::toggle(ui, &mut st.hud.show_brush, "Size and force pills", m.row);
-    widgets::toggle(ui, &mut st.hud.show_nav, "Orbit, pan and zoom buttons", m.row);
     widgets::toggle(ui, &mut st.show_nav, "Orientation ball", m.row);
-    BigSlider::new(&mut st.hud.size, 34.0..=90.0, "Button size")
-        .decimals(0)
-        .height(m.row)
-        .show(ui);
     widgets::toggle(ui, &mut st.hud.arrange, "Arrange: drag them anywhere", m.row);
     if st.hud.arrange {
         ui.label(
-            egui::RichText::new("Drag either cluster to move it. Turn this off to use them again.")
+            egui::RichText::new("Drag any button to move it. Turn this off to use them again.")
                 .small()
                 .color(p.accent),
         );
     }
+    // Each button gets its own line: shown or not, and how big.
+    for pod in st.hud.pods.iter_mut() {
+        ui.horizontal(|ui| {
+            let icon = if pod.visible { Icon::Eye } else { Icon::EyeOff };
+            if widgets::icon_button(ui, icon, m.row, false, "Show or hide").clicked() {
+                pod.visible = !pod.visible;
+            }
+            ui.scope(|ui| {
+                ui.set_width(ui.available_width().max(60.0));
+                BigSlider::new(&mut pod.size, 30.0..=110.0, pod.kind.label())
+                    .decimals(0)
+                    .height(m.row)
+                    .show(ui);
+            });
+        });
+    }
     if widgets::wide_button(ui, Icon::Reset, "Put them back", m.row, false).clicked() {
-        st.hud.reset_positions();
+        st.hud.reset();
     }
 
     widgets::section_title(ui, "INPUT");

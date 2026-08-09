@@ -111,9 +111,11 @@ impl NavWidget {
         let ball = self.size;
         let buttons = if self.show_buttons { m.button + 6.0 } else { 0.0 };
         let width = ball.max(m.button * 4.0 + 12.0);
+        // Buttons, ball, then the name plate under it.
+        let badge = 24.0;
         let area = Rect::from_min_size(
             Pos2::new(viewport.right() - width - pad, viewport.top() + pad),
-            Vec2::new(width, ball + buttons),
+            Vec2::new(width, ball + buttons + badge),
         );
         // Nothing to draw if the viewport is too small to hold it.
         if area.width() > viewport.width() || area.height() > viewport.height() {
@@ -126,21 +128,25 @@ impl NavWidget {
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.set_width(area.width());
-                let ball_rect = Rect::from_center_size(
-                    Pos2::new(area.center().x, area.top() + ball * 0.5),
-                    Vec2::splat(ball),
-                );
-                action = self.draw_ball(ui, ball_rect, camera, p);
-
+                // The buttons sit above the ball: they are the things you reach
+                // for on purpose, and putting them at the top keeps them clear
+                // of whatever else floats in that corner.
                 if self.show_buttons {
                     let row = Rect::from_min_size(
-                        Pos2::new(area.left(), ball_rect.bottom() + 2.0),
+                        area.min,
                         Vec2::new(area.width(), m.button),
                     );
-                    if let Some(a) = self.draw_buttons(ui, row, camera, m) {
-                        action = Some(a);
-                    }
+                    action = self.draw_buttons(ui, row, camera, m);
                 }
+                let ball_top = if self.show_buttons { area.top() + buttons } else { area.top() };
+                let ball_rect = Rect::from_center_size(
+                    Pos2::new(area.center().x, ball_top + ball * 0.5),
+                    Vec2::splat(ball),
+                );
+                if let Some(a) = self.draw_ball(ui, ball_rect, camera, p) {
+                    action = Some(a);
+                }
+                self.draw_badge(ui, ball_rect, camera, p);
             });
         action
     }
@@ -215,36 +221,20 @@ impl NavWidget {
                 fill,
                 Stroke::new(if *positive { 0.0 } else { 1.5 }, base.gamma_multiply(0.8)),
             );
-            if *positive || over {
+            // Only the three positive axes are named. Lettering the far side as
+            // well, even on hover, turns the ball into an eye chart, and the
+            // colour already says which axis it is.
+            if *positive {
                 painter.text(
                     *pos,
                     Align2::CENTER_CENTER,
                     *label,
                     FontId::proportional(r * 1.1),
-                    if *positive { p.bg } else { base },
+                    p.bg,
                 );
             }
         }
 
-        // Name of the view we are closest to, under the ball.
-        let (preset, alignment) = nearest_view(camera);
-        let aligned = alignment > 0.995;
-        painter.text(
-            Pos2::new(center.x, rect.bottom() - 6.0),
-            Align2::CENTER_CENTER,
-            preset.label(),
-            FontId::proportional(11.0),
-            if aligned { p.accent } else { p.dim },
-        );
-        if camera.locked {
-            painter.text(
-                Pos2::new(center.x, rect.top() + 8.0),
-                Align2::CENTER_CENTER,
-                "locked",
-                FontId::proportional(9.5),
-                p.accent,
-            );
-        }
 
         // One press, three possible meanings, resolved by what happens next:
         // move and it spins the model, wait and it locks the view, do neither
@@ -299,6 +289,43 @@ impl NavWidget {
             );
         }
         action
+    }
+
+    /// The name of the view we are closest to, in a small plate under the ball.
+    ///
+    /// It used to sit inside the ball, where it crossed the axes and whatever
+    /// the ball was drawn over. Underneath it reads cleanly and never covers
+    /// anything.
+    fn draw_badge(&self, ui: &egui::Ui, ball: Rect, camera: &Camera, p: &Palette) {
+        let (preset, alignment) = nearest_view(camera);
+        let aligned = alignment > 0.995;
+        let text = if camera.locked {
+            format!("{}  ·  locked", preset.label())
+        } else {
+            preset.label().to_string()
+        };
+        let painter = ui.painter();
+        let galley = painter.layout_no_wrap(text, FontId::proportional(10.5), p.dim);
+        let plate = Rect::from_center_size(
+            Pos2::new(ball.center().x, ball.bottom() + 11.0),
+            galley.size() + Vec2::new(14.0, 6.0),
+        );
+        let colour = if camera.locked || aligned { p.accent } else { p.dim };
+        painter.rect(
+            plate,
+            egui::CornerRadius::same((plate.height() * 0.5) as u8),
+            p.panel.gamma_multiply(0.92),
+            Stroke::new(1.0, if camera.locked || aligned { colour } else { p.line }),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            Pos2::new(
+                plate.center().x - galley.size().x * 0.5,
+                plate.center().y - galley.size().y * 0.5,
+            ),
+            galley,
+            colour,
+        );
     }
 
     fn draw_buttons(
