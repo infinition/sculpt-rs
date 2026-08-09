@@ -103,6 +103,12 @@ impl Wheel {
         self.grab = Grab::None;
     }
 
+    /// True while the centre pad is being dragged, which is when the viewport
+    /// should be showing what the brush now looks like.
+    pub fn is_adjusting(&self) -> bool {
+        self.open && matches!(self.grab, Grab::Pad { .. })
+    }
+
     /// Draws the menu and applies what the pointer presses or drags.
     pub fn show(&mut self, ctx: &egui::Context, s: &mut Sculptor, p: &Palette) {
         if !self.open {

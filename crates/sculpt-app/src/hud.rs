@@ -53,6 +53,9 @@ pub struct Hud {
     pressed_at: Option<f64>,
     wheel_open: bool,
     dragging: Option<Cluster>,
+    /// True while a size or force pill is being dragged, so the viewport can
+    /// show what the brush now looks like.
+    adjusting: bool,
 }
 
 impl Default for Hud {
@@ -68,6 +71,7 @@ impl Default for Hud {
             pressed_at: None,
             wheel_open: false,
             dragging: None,
+            adjusting: false,
         }
     }
 }
@@ -88,6 +92,7 @@ impl Hud {
         p: &Palette,
     ) -> Vec<HudAction> {
         let mut actions = Vec::new();
+        self.adjusting = false;
         if self.show_brush {
             self.brush_cluster(ctx, viewport, s, p, &mut actions);
         }
@@ -95,6 +100,11 @@ impl Hud {
             self.nav_cluster(ctx, viewport, p, &mut actions);
         }
         actions
+    }
+
+    /// True while size or force is being dragged.
+    pub fn is_adjusting(&self) -> bool {
+        self.adjusting
     }
 
     fn place(&self, viewport: Rect, at: Vec2, size: Vec2) -> Rect {
@@ -196,12 +206,14 @@ impl Hud {
                 let left = left_rect(rect, pill);
                 if let Some(t) = self.pill_drag(ui, left, "size") {
                     s.brush.radius = (s.brush.radius * 8f32.powf(t)).clamp(0.003, 1.5);
+                    self.adjusting = true;
                 }
                 self.draw_pill(ui, left, "Size", s.brush.radius, 0.003, 1.5, true, p);
 
                 let right = right_rect(rect, pill);
                 if let Some(t) = self.pill_drag(ui, right, "force") {
                     s.brush.strength = (s.brush.strength + t).clamp(0.0, 1.0);
+                    self.adjusting = true;
                 }
                 self.draw_pill(ui, right, "Force", s.brush.strength, 0.0, 1.0, false, p);
 

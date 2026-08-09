@@ -1252,7 +1252,10 @@ impl ApplicationHandler for App {
                 if code == st.ui.wheel_key {
                     if pressed {
                         if !st.ui.wheel.open && !event.repeat {
-                            let at = st.cursor_points();
+                            let at = st
+                                .ui
+                                .anchor
+                                .resolve(st.cursor_points(), st.ui.viewport);
                             st.ui.wheel.open_at(at, &st.sculptor);
                             // A stroke and a menu at the same time helps nobody.
                             st.end_stroke();

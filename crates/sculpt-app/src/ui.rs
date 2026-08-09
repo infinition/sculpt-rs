@@ -88,6 +88,35 @@ pub enum Action {
     ResetTheme,
 }
 
+/// Where things that pop up should appear.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    /// Wherever the pointer is, which is where you are already looking.
+    Cursor,
+    /// The middle of the viewport, which never moves and never lands under a
+    /// dock. Easier to reach on a tablet held in two hands.
+    Center,
+}
+
+impl Anchor {
+    pub const ALL: [Anchor; 2] = [Anchor::Cursor, Anchor::Center];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Anchor::Cursor => "At the cursor",
+            Anchor::Center => "In the middle",
+        }
+    }
+
+    /// Resolves to a point, given where the pointer is and what the viewport is.
+    pub fn resolve(self, cursor: egui::Pos2, viewport: egui::Rect) -> egui::Pos2 {
+        match self {
+            Anchor::Cursor => cursor,
+            Anchor::Center => viewport.center(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Brush,
@@ -144,6 +173,11 @@ pub struct UiState {
     pub hud: Hud,
     pub bindings: Bindings,
     pub wheel: Wheel,
+    /// Where the radial menu and the brush preview appear.
+    pub anchor: Anchor,
+    /// The viewport as it was last frame, so code outside the interface can
+    /// place things in it.
+    pub viewport: egui::Rect,
     /// Key that summons the radial menu while held.
     pub wheel_key: KeyCode,
     /// True while waiting for the user to press the key they want.
@@ -185,6 +219,8 @@ impl Default for UiState {
             hud: Hud::default(),
             bindings: Bindings::default(),
             wheel: Wheel::default(),
+            anchor: Anchor::Cursor,
+            viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)),
             wheel_key: KeyCode::Space,
             rebinding_wheel: false,
             ui_scale_draft: UiTheme::default().ui_scale,
@@ -271,9 +307,19 @@ pub fn draw(
     }
     // Floating controls sit over the viewport, under the radial menu.
     let viewport = root.available_rect_before_wrap();
+    st.viewport = viewport;
+    let cursor = root.ctx().pointer_latest_pos().unwrap_or(viewport.center());
     for a in st.hud.show(root.ctx(), viewport, s, &p) {
         match a {
-            HudAction::OpenWheel(at) => st.wheel.open_at(at, s),
+            HudAction::OpenWheel(at) => {
+                // The button asks for its own centre; the setting may prefer
+                // the cursor or the middle of the viewport.
+                let where_to = match st.anchor {
+                    Anchor::Cursor => at,
+                    Anchor::Center => viewport.center(),
+                };
+                st.wheel.open_at(where_to, s);
+            }
             HudAction::CloseWheel => st.wheel.close(),
             HudAction::Orbit(d) => cam.orbit(d.x, d.y),
             HudAction::Pan(d) => cam.pan(d.x, d.y, viewport.height().max(1.0)),
@@ -282,10 +328,49 @@ pub fn draw(
     }
 
     viewport_overlay(root, s, st, overlay, p);
+
+    // While size or force is being dragged, show the brush at its new size so
+    // the number is not the only thing to go on.
+    if st.hud.is_adjusting() || st.wheel.is_adjusting() {
+        let at = st.anchor.resolve(cursor, viewport);
+        brush_preview(root.ctx(), at, s, cam, viewport, p);
+    }
+
     // Last, so it covers everything else while it is up.
     st.wheel.show(root.ctx(), s, &p);
 
     actions
+}
+
+/// A ghost of the brush, drawn at the anchor while its size is being changed.
+///
+/// Measured at the pivot rather than under the cursor: there may be no surface
+/// under the cursor at all, and the pivot is where the model is.
+fn brush_preview(
+    ctx: &egui::Context,
+    at: egui::Pos2,
+    s: &Sculptor,
+    cam: &Camera,
+    viewport: egui::Rect,
+    p: Palette,
+) {
+    let ppp = ctx.pixels_per_point().max(1e-3);
+    let height_px = viewport.height() * ppp;
+    let radius = cam.world_radius_to_pixels(cam.target(), s.brush.radius, height_px) / ppp;
+    if !radius.is_finite() || radius <= 0.5 {
+        return;
+    }
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("brush_preview"),
+    ));
+    painter.circle_stroke(at, radius, Stroke::new(1.6, p.accent));
+    painter.circle_stroke(
+        at,
+        radius * s.brush.strength.clamp(0.05, 1.0),
+        Stroke::new(1.0, p.accent.gamma_multiply(0.45)),
+    );
+    painter.circle_filled(at, 2.0, p.accent);
 }
 
 /// A readable name for a key, for the shortcut display.
@@ -1439,6 +1524,17 @@ fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
         .decimals(0)
         .height(m.row)
         .show(ui);
+
+    ui.label(
+        egui::RichText::new("Where the menu and the brush preview appear")
+            .small()
+            .color(p.dim),
+    );
+    let labels: Vec<&str> = Anchor::ALL.iter().map(|a| a.label()).collect();
+    let current = Anchor::ALL.iter().position(|a| *a == st.anchor).unwrap_or(0);
+    if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+        st.anchor = Anchor::ALL[i];
+    }
 
     widgets::section_title(ui, "LAYOUT");
     ui.label(egui::RichText::new("Tool rail").small().color(p.dim));
