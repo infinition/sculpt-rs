@@ -1,33 +1,47 @@
 //! Spatial queries.
 //!
-//! Deliberately brute force over `rayon` rather than an octree. Dynamic
-//! topology rewrites the vertex and face arrays on every stroke step, so an
-//! incremental acceleration structure costs more in invalidation bookkeeping
-//! than it saves below a few million vertices. Swap in a BVH here when that
-//! stops being true; nothing else in the crate needs to change.
+//! Every entry point tries the mesh's spatial grid first and falls back to a
+//! parallel linear scan when there is none, or when the grid decides the query
+//! would degenerate (a brush swallowing the whole model, say). The fallback is
+//! what the tests exercise, so both paths stay honest.
 
 use crate::mesh::Mesh;
 use glam::Vec3;
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 
 /// Indices of every vertex inside the sphere.
 pub fn verts_in_sphere(mesh: &Mesh, center: Vec3, radius: f32) -> Vec<u32> {
+    if let Some(g) = &mesh.accel {
+        if let Some(v) = g.verts_in_sphere(mesh, center, radius) {
+            return v;
+        }
+    }
     let r2 = radius * radius;
     mesh.verts
         .par_iter()
         .enumerate()
-        .filter_map(|(i, v)| {
-            if v.pos.distance_squared(center) <= r2 {
-                Some(i as u32)
-            } else {
-                None
-            }
-        })
+        .filter_map(|(i, v)| (v.pos.distance_squared(center) <= r2).then_some(i as u32))
         .collect()
 }
 
 /// Faces with at least one vertex inside the sphere.
 pub fn faces_in_sphere(mesh: &Mesh, center: Vec3, radius: f32) -> Vec<u32> {
+    if mesh.accel.is_some() {
+        // Cheaper than a second grid: a face qualifies exactly when one of its
+        // vertices does, and adjacency already gives us that.
+        let verts = verts_in_sphere(mesh, center, radius);
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        let mut out = Vec::with_capacity(verts.len() * 2);
+        for v in verts {
+            for &f in &mesh.vfaces[v as usize] {
+                if seen.insert(f) {
+                    out.push(f);
+                }
+            }
+        }
+        return out;
+    }
     let r2 = radius * radius;
     mesh.faces
         .par_iter()
@@ -36,11 +50,7 @@ pub fn faces_in_sphere(mesh: &Mesh, center: Vec3, radius: f32) -> Vec<u32> {
             let hit = tri
                 .iter()
                 .any(|&v| mesh.verts[v as usize].pos.distance_squared(center) <= r2);
-            if hit {
-                Some(i as u32)
-            } else {
-                None
-            }
+            hit.then_some(i as u32)
         })
         .collect()
 }
@@ -53,44 +63,65 @@ pub struct Hit {
     pub t: f32,
 }
 
-/// Moller-Trumbore against every face, keeping the nearest hit.
-pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
-    const EPS: f32 = 1e-7;
+const EPS: f32 = 1e-7;
 
-    let best = mesh
-        .faces
+/// Moller-Trumbore against one face.
+#[inline]
+pub fn ray_face(mesh: &Mesh, fi: u32, origin: Vec3, dir: Vec3) -> Option<Hit> {
+    let [a, b, c] = mesh.faces[fi as usize];
+    let pa = mesh.verts[a as usize].pos;
+    let pb = mesh.verts[b as usize].pos;
+    let pc = mesh.verts[c as usize].pos;
+
+    let e1 = pb - pa;
+    let e2 = pc - pa;
+    let h = dir.cross(e2);
+    let det = e1.dot(h);
+    if det.abs() < EPS {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let s = origin - pa;
+    let u = s.dot(h) * inv;
+    if !(-EPS..=1.0 + EPS).contains(&u) {
+        return None;
+    }
+    let q = s.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < -EPS || u + v > 1.0 + EPS {
+        return None;
+    }
+    let t = e2.dot(q) * inv;
+    if t <= EPS {
+        return None;
+    }
+    Some(Hit {
+        face: fi,
+        point: origin + dir * t,
+        normal: e1.cross(e2).normalize_or(Vec3::Y),
+        t,
+    })
+}
+
+/// Nearest surface hit along the ray.
+pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
+    if let Some(g) = &mesh.accel {
+        if let Some(res) = g.raycast(mesh, origin, dir) {
+            return res;
+        }
+    }
+    mesh.faces
         .par_iter()
         .enumerate()
-        .filter_map(|(fi, &[a, b, c])| {
-            let pa = mesh.verts[a as usize].pos;
-            let pb = mesh.verts[b as usize].pos;
-            let pc = mesh.verts[c as usize].pos;
+        .filter_map(|(fi, _)| ray_face(mesh, fi as u32, origin, dir))
+        .min_by(|x, y| x.t.partial_cmp(&y.t).unwrap_or(std::cmp::Ordering::Equal))
+}
 
-            let e1 = pb - pa;
-            let e2 = pc - pa;
-            let h = dir.cross(e2);
-            let det = e1.dot(h);
-            if det.abs() < EPS {
-                return None;
-            }
-            let inv = 1.0 / det;
-            let s = origin - pa;
-            let u = s.dot(h) * inv;
-            if !(-EPS..=1.0 + EPS).contains(&u) {
-                return None;
-            }
-            let q = s.cross(e1);
-            let v = dir.dot(q) * inv;
-            if v < -EPS || u + v > 1.0 + EPS {
-                return None;
-            }
-            let t = e2.dot(q) * inv;
-            if t <= EPS {
-                return None;
-            }
-            Some((t, fi as u32, e1.cross(e2).normalize_or(Vec3::Y)))
-        })
-        .min_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    best.map(|(t, face, normal)| Hit { face, point: origin + dir * t, normal, t })
+/// Nearest vertex to a point within `radius`, for colour picking and snapping.
+pub fn nearest_vertex(mesh: &Mesh, p: Vec3, radius: f32) -> Option<u32> {
+    verts_in_sphere(mesh, p, radius)
+        .into_iter()
+        .map(|v| (v, mesh.verts[v as usize].pos.distance_squared(p)))
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(v, _)| v)
 }

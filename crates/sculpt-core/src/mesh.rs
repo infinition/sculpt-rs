@@ -3,11 +3,15 @@
 //! Both `verts` and `faces` are kept gap-free so they can be handed to the GPU
 //! without a compaction pass. Removal therefore uses `swap_remove` plus an index
 //! fixup for the element that got moved into the hole.
+//!
+//! The mesh also owns an optional spatial grid (see [`crate::accel`]). Every
+//! mutation that goes through the methods here keeps it in sync; anything that
+//! rewrites the arrays wholesale drops it and lets the next query rebuild.
 
+use crate::accel::Grid;
 use glam::Vec3;
 use rayon::prelude::*;
 use smallvec::SmallVec;
-
 
 /// Incident faces of a vertex. Regular sculpted meshes sit around valence 6.
 pub type FaceList = SmallVec<[u32; 8]>;
@@ -22,11 +26,35 @@ pub struct Vertex {
     pub col: Vec3,
     /// 0 = freely sculptable, 1 = fully protected.
     pub mask: f32,
+    /// PBR roughness, painted like colour.
+    pub rough: f32,
+    /// PBR metalness.
+    pub metal: f32,
 }
 
 impl Vertex {
     pub fn new(pos: Vec3) -> Self {
-        Self { pos, nrm: Vec3::Y, col: Vec3::splat(0.85), mask: 0.0 }
+        Self {
+            pos,
+            nrm: Vec3::Y,
+            col: Vec3::splat(0.85),
+            mask: 0.0,
+            rough: 0.6,
+            metal: 0.0,
+        }
+    }
+
+    /// Linear blend of everything but the position, used when a new vertex is
+    /// born between two existing ones.
+    pub fn lerp_attrs(a: &Vertex, b: &Vertex, t: f32) -> Vertex {
+        Vertex {
+            pos: a.pos.lerp(b.pos, t),
+            nrm: a.nrm.lerp(b.nrm, t).normalize_or(Vec3::Y),
+            col: a.col.lerp(b.col, t),
+            mask: a.mask + (b.mask - a.mask) * t,
+            rough: a.rough + (b.rough - a.rough) * t,
+            metal: a.metal + (b.metal - a.metal) * t,
+        }
     }
 }
 
@@ -36,6 +64,8 @@ pub struct Mesh {
     pub faces: Vec<[u32; 3]>,
     /// `vfaces[v]` lists every face index referencing `v`.
     pub vfaces: Vec<FaceList>,
+    /// Spatial index. `None` means "not built yet or invalidated".
+    pub accel: Option<Grid>,
 }
 
 impl Mesh {
@@ -49,6 +79,7 @@ impl Mesh {
             verts: positions.iter().map(|p| Vertex::new(*p)).collect(),
             faces: faces.to_vec(),
             vfaces: vec![FaceList::new(); positions.len()],
+            accel: None,
         };
         m.rebuild_adjacency();
         m.recompute_normals();
@@ -71,12 +102,83 @@ impl Mesh {
                 self.vfaces[v as usize].push(fi as u32);
             }
         }
+        self.accel = None;
     }
 
+    // ---- spatial index ------------------------------------------------------
+
+    /// Makes sure a grid exists and is scaled for queries of about `radius`.
+    pub fn ensure_accel(&mut self, radius: f32) {
+        let rebuild = match &self.accel {
+            None => true,
+            Some(g) => g.wants_rebuild(radius),
+        };
+        if rebuild {
+            self.accel = Some(Grid::build(self, crate::accel::ideal_cell(radius)));
+        }
+    }
+
+    pub fn invalidate_accel(&mut self) {
+        self.accel = None;
+    }
+
+    #[inline]
+    pub fn face_sphere(&self, f: u32) -> (Vec3, f32) {
+        let [a, b, c] = self.faces[f as usize];
+        let pa = self.verts[a as usize].pos;
+        let pb = self.verts[b as usize].pos;
+        let pc = self.verts[c as usize].pos;
+        let mid = (pa + pb + pc) / 3.0;
+        (mid, pa.distance(mid).max(pb.distance(mid)).max(pc.distance(mid)))
+    }
+
+    /// Refiles a vertex and, when it changed cell, its incident faces.
+    fn refile(&mut self, v: u32) {
+        if self.accel.is_none() {
+            return;
+        }
+        let p = self.verts[v as usize].pos;
+        let moved = self.accel.as_mut().map(|g| g.move_vertex(v, p)).unwrap_or(false);
+        if !moved {
+            return;
+        }
+        let faces: FaceList = self.vfaces[v as usize].clone();
+        for f in faces {
+            let (c, r) = self.face_sphere(f);
+            if let Some(g) = &mut self.accel {
+                g.move_face(f, c, r);
+            }
+        }
+    }
+
+    /// Moves one vertex, keeping the spatial index correct.
+    pub fn set_pos(&mut self, v: u32, p: Vec3) {
+        self.verts[v as usize].pos = p;
+        self.refile(v);
+    }
+
+    /// Tells the index that these vertices were written to directly. Brushes
+    /// batch their writes and call this once, which is much cheaper than going
+    /// through [`Mesh::set_pos`] per vertex.
+    pub fn commit_moves(&mut self, moved: &[u32]) {
+        if self.accel.is_none() {
+            return;
+        }
+        for &v in moved {
+            self.refile(v);
+        }
+    }
+
+    // ---- topology -----------------------------------------------------------
+
     pub fn add_vertex(&mut self, v: Vertex) -> u32 {
+        let id = self.verts.len() as u32;
+        if let Some(g) = &mut self.accel {
+            g.push_vertex(id, v.pos);
+        }
         self.verts.push(v);
         self.vfaces.push(FaceList::new());
-        (self.verts.len() - 1) as u32
+        id
     }
 
     pub fn add_face(&mut self, tri: [u32; 3]) -> u32 {
@@ -84,6 +186,12 @@ impl Mesh {
         self.faces.push(tri);
         for &v in &tri {
             self.vfaces[v as usize].push(fi);
+        }
+        if self.accel.is_some() {
+            let (c, r) = self.face_sphere(fi);
+            if let Some(g) = &mut self.accel {
+                g.push_face(fi, c, r);
+            }
         }
         fi
     }
@@ -107,6 +215,9 @@ impl Mesh {
                 }
             }
         }
+        if let Some(g) = &mut self.accel {
+            g.swap_remove_face(f);
+        }
         self.faces.swap_remove(fi);
     }
 
@@ -125,6 +236,9 @@ impl Mesh {
                     }
                 }
             }
+        }
+        if let Some(g) = &mut self.accel {
+            g.swap_remove_vertex(v);
         }
         self.verts.swap_remove(vi);
         self.vfaces.swap_remove(vi);
@@ -184,14 +298,7 @@ impl Mesh {
         if fs.is_empty() {
             return None;
         }
-        let va = self.verts[a as usize];
-        let vb = self.verts[b as usize];
-        let mid = Vertex {
-            pos: (va.pos + vb.pos) * 0.5,
-            nrm: (va.nrm + vb.nrm).normalize_or(Vec3::Y),
-            col: (va.col + vb.col) * 0.5,
-            mask: (va.mask + vb.mask) * 0.5,
-        };
+        let mid = Vertex::lerp_attrs(&self.verts[a as usize], &self.verts[b as usize], 0.5);
         let m = self.add_vertex(mid);
 
         // Collect first: remove_face invalidates the indices in `fs`.
@@ -263,13 +370,8 @@ impl Mesh {
             }
         }
 
-        let vb = self.verts[b as usize];
-        {
-            let va = &mut self.verts[a as usize];
-            va.pos = mid;
-            va.col = (va.col + vb.col) * 0.5;
-            va.mask = (va.mask + vb.mask) * 0.5;
-        }
+        let merged = Vertex::lerp_attrs(&self.verts[a as usize], &self.verts[b as usize], 0.5);
+        self.verts[a as usize] = merged;
 
         let mut doomed: SmallVec<[u32; 2]> = fs;
         doomed.sort_unstable_by(|x, y| y.cmp(x));
@@ -289,8 +391,22 @@ impl Mesh {
         }
         self.vfaces[b as usize].clear();
         self.remove_vertex(b);
+        // `a` moved to the midpoint and inherited faces: refile everything it
+        // now touches.
+        self.refile(a);
+        if self.accel.is_some() {
+            let faces: FaceList = self.vfaces[a as usize].clone();
+            for f in faces {
+                let (c, r) = self.face_sphere(f);
+                if let Some(g) = &mut self.accel {
+                    g.move_face(f, c, r);
+                }
+            }
+        }
         true
     }
+
+    // ---- derived data -------------------------------------------------------
 
     /// Area-weighted normals over the whole mesh.
     pub fn recompute_normals(&mut self) {
@@ -338,13 +454,20 @@ impl Mesh {
         if self.verts.is_empty() {
             return (Vec3::ZERO, Vec3::ZERO);
         }
-        let mut lo = Vec3::splat(f32::MAX);
-        let mut hi = Vec3::splat(f32::MIN);
-        for v in &self.verts {
-            lo = lo.min(v.pos);
-            hi = hi.max(v.pos);
-        }
+        let (lo, hi) = self
+            .verts
+            .par_iter()
+            .map(|v| (v.pos, v.pos))
+            .reduce(
+                || (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
+                |a, b| (a.0.min(b.0), a.1.max(b.1)),
+            );
         (lo, hi)
+    }
+
+    pub fn center(&self) -> Vec3 {
+        let (lo, hi) = self.bounds();
+        (lo + hi) * 0.5
     }
 
     /// Centres the mesh on the origin and scales it to fit a unit sphere.
@@ -356,9 +479,22 @@ impl Mesh {
             return;
         }
         let s = 1.0 / r;
-        for v in self.verts.iter_mut() {
-            v.pos = (v.pos - c) * s;
+        self.verts.par_iter_mut().for_each(|v| v.pos = (v.pos - c) * s);
+        self.invalidate_accel();
+    }
+
+    /// Applies an arbitrary affine transform, fixing up normals and winding.
+    pub fn apply_transform(&mut self, m: glam::Mat4) {
+        let normal_mat = glam::Mat3::from_mat4(m).inverse().transpose();
+        self.verts.par_iter_mut().for_each(|v| {
+            v.pos = m.transform_point3(v.pos);
+            v.nrm = (normal_mat * v.nrm).normalize_or(Vec3::Y);
+        });
+        if glam::Mat3::from_mat4(m).determinant() < 0.0 {
+            self.faces.par_iter_mut().for_each(|t| t.swap(1, 2));
+            self.rebuild_adjacency();
         }
+        self.invalidate_accel();
     }
 
     /// Mean edge length, used to seed the dyntopo detail size.
@@ -377,5 +513,63 @@ impl Mesh {
             })
             .sum();
         sum / (self.faces.len() as f32 * 3.0)
+    }
+
+    /// Total surface area.
+    pub fn area(&self) -> f32 {
+        self.faces
+            .par_iter()
+            .enumerate()
+            .map(|(i, _)| self.face_normal(i as u32).length() * 0.5)
+            .sum()
+    }
+
+    /// Boundary edges as directed pairs, each appearing once, oriented so the
+    /// hole is on the left. Used by hole filling.
+    pub fn boundary_edges(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for (fi, tri) in self.faces.iter().enumerate() {
+            let _ = fi;
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                if self.faces_around_edge(a, b).len() == 1 {
+                    out.push((a, b));
+                }
+            }
+        }
+        out
+    }
+
+    /// Closed loops of boundary edges, longest first.
+    pub fn boundary_loops(&self) -> Vec<Vec<u32>> {
+        let edges = self.boundary_edges();
+        let mut next: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+        for (a, b) in &edges {
+            next.insert(*a, *b);
+        }
+        let mut loops = Vec::new();
+        let mut seen: rustc_hash::FxHashSet<u32> = rustc_hash::FxHashSet::default();
+        for (start, _) in &edges {
+            if seen.contains(start) {
+                continue;
+            }
+            let mut chain = Vec::new();
+            let mut cur = *start;
+            while seen.insert(cur) {
+                chain.push(cur);
+                match next.get(&cur) {
+                    Some(&n) => cur = n,
+                    None => break,
+                }
+                if cur == *start {
+                    break;
+                }
+            }
+            if chain.len() >= 3 {
+                loops.push(chain);
+            }
+        }
+        loops.sort_by_key(|l| std::cmp::Reverse(l.len()));
+        loops
     }
 }

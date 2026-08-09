@@ -7,6 +7,17 @@ use std::f32::consts::{PI, TAU};
 
 /// Welds vertices that sit within `eps` of each other.
 pub fn weld(positions: &[Vec3], faces: &[[u32; 3]], eps: f32) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+    let (p, f, _) = weld_indexed(positions, faces, eps);
+    (p, f)
+}
+
+/// Same as [`weld`], but also hands back `remap[i]`: where source vertex `i`
+/// ended up. Callers that carry per-vertex attributes need it.
+pub fn weld_indexed(
+    positions: &[Vec3],
+    faces: &[[u32; 3]],
+    eps: f32,
+) -> (Vec<Vec3>, Vec<[u32; 3]>, Vec<u32>) {
     let inv = 1.0 / eps;
     let key = |p: Vec3| {
         (
@@ -33,7 +44,7 @@ pub fn weld(positions: &[Vec3], faces: &[[u32; 3]], eps: f32) -> (Vec<Vec3>, Vec
             out_faces.push(t);
         }
     }
-    (out_pos, out_faces)
+    (out_pos, out_faces, remap)
 }
 
 /// Geodesic sphere. Even triangle distribution, which is what you want as a

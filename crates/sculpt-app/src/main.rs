@@ -178,13 +178,14 @@ impl State {
     }
 
     fn pick_at_cursor(&self) -> Option<sculpt_core::Hit> {
+        // The scene is single-object for now; unwrap the world-space hit.
         let (o, d) = self.camera.ray(
             self.input.mouse.0,
             self.input.mouse.1,
             self.config.width as f32,
             self.config.height as f32,
         );
-        self.sculptor.pick(o, d)
+        self.sculptor.pick(o, d).map(|h| h.world)
     }
 
     /// Intersects the cursor ray with a view-facing plane through `anchor`.
@@ -217,7 +218,7 @@ impl State {
             self.sculptor.stroke(&StrokeInput {
                 point: hit.point,
                 normal: hit.normal,
-                drag: Vec3::ZERO,
+                drag: Vec3::ZERO, ..Default::default()
             });
         }
     }
@@ -235,7 +236,7 @@ impl State {
                 return;
             }
             let normal = self.input.last_hit.map(|h| h.1).unwrap_or(Vec3::Y);
-            self.sculptor.stroke(&StrokeInput { point: anchor, normal, drag });
+            self.sculptor.stroke(&StrokeInput { point: anchor, normal, drag, ..Default::default() });
             self.input.move_anchor = Some(now);
             return;
         }
@@ -254,7 +255,7 @@ impl State {
             self.sculptor.stroke(&StrokeInput {
                 point: from.0.lerp(to.0, t),
                 normal: from.1.lerp(to.1, t).normalize_or(to.1),
-                drag: Vec3::ZERO,
+                drag: Vec3::ZERO, ..Default::default()
             });
         }
         self.input.last_hit = Some(to);
@@ -268,7 +269,7 @@ impl State {
     }
 
     fn frame_view(&mut self) {
-        let (lo, hi) = self.sculptor.mesh.bounds();
+        let (lo, hi) = self.sculptor.mesh().bounds();
         let c = (lo + hi) * 0.5;
         let r = ((hi - lo).length() * 0.5).max(0.05);
         self.camera.frame(c, r);
@@ -316,7 +317,7 @@ impl State {
                         .set_file_name("sculpt.obj")
                         .save_file()
                     {
-                        match io::save(&self.sculptor.mesh, &path) {
+                        match io::save(self.sculptor.mesh(), &path) {
                             Ok(()) => {
                                 self.ui.status = format!(
                                     "saved {}",
@@ -365,7 +366,7 @@ impl State {
         self.mesh_renderer.upload(
             &self.device,
             &self.queue,
-            &self.sculptor.mesh,
+            self.sculptor.mesh(),
             self.sculptor.verts_dirty,
             self.sculptor.topology_dirty,
         );
@@ -594,7 +595,7 @@ impl ApplicationHandler for App {
                     KeyCode::KeyZ if st.input.ctrl && st.input.shift => st.sculptor.redo(),
                     KeyCode::KeyZ if st.input.ctrl => st.sculptor.undo(),
                     KeyCode::KeyY if st.input.ctrl => st.sculptor.redo(),
-                    KeyCode::KeyX => st.sculptor.symmetry_x = !st.sculptor.symmetry_x,
+                    KeyCode::KeyX => st.sculptor.symmetry = !st.sculptor.symmetry,
                     KeyCode::KeyW if st.ui.wireframe_available => {
                         st.ui.wireframe = !st.ui.wireframe
                     }

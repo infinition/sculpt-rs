@@ -107,7 +107,7 @@ pub fn draw(
                     ui.checkbox(&mut s.dyntopo.decimate, "Decimate");
                 });
             });
-            ui.checkbox(&mut s.symmetry_x, "Symmetry X  (X)");
+            ui.checkbox(&mut s.symmetry, "Symmetry X  (X)");
 
             ui.separator();
             ui.label(egui::RichText::new("MASK").small().strong());
@@ -198,8 +198,8 @@ pub fn draw(
             ui.label(
                 egui::RichText::new(format!(
                     "{} verts   {} tris\n{:.0} fps   undo {:.0} MB",
-                    s.mesh.vert_count(),
-                    s.mesh.face_count(),
+                    s.mesh().vert_count(),
+                    s.mesh().face_count(),
                     ui_state.fps,
                     s.history.used_bytes() as f64 / 1.0e6,
                 ))

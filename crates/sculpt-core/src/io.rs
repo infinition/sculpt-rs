@@ -1,8 +1,9 @@
-//! Mesh import/export: OBJ and binary STL.
+//! Mesh import/export: OBJ, PLY, STL and a native scene file.
 
-use crate::mesh::Mesh;
+use crate::mesh::{Mesh, Vertex};
 use crate::primitives::weld;
-use glam::Vec3;
+use crate::scene::{Object, Scene, Transform};
+use glam::{Quat, Vec3};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -12,6 +13,15 @@ pub type IoResult<T> = Result<T, String>;
 fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
+
+/// Extensions accepted by [`load`], for file dialogs.
+pub const IMPORT_EXTENSIONS: &[&str] = &["obj", "ply", "stl", "sculpt"];
+/// Extensions accepted by [`save`].
+pub const EXPORT_EXTENSIONS: &[&str] = &["obj", "ply", "stl", "sculpt"];
+
+// ---------------------------------------------------------------------------
+// OBJ
+// ---------------------------------------------------------------------------
 
 /// Writes an OBJ. Vertex colours ride along on the `v` lines, an extension
 /// MeshLab and Blender both read back.
@@ -108,6 +118,275 @@ pub fn read_obj(path: &Path) -> IoResult<Mesh> {
     Ok(mesh)
 }
 
+// ---------------------------------------------------------------------------
+// PLY
+// ---------------------------------------------------------------------------
+
+/// Writes a binary little-endian PLY with positions, normals and colours.
+pub fn write_ply(mesh: &Mesh, path: &Path) -> IoResult<()> {
+    let f = File::create(path).map_err(err)?;
+    let mut w = BufWriter::new(f);
+    writeln!(w, "ply").map_err(err)?;
+    writeln!(w, "format binary_little_endian 1.0").map_err(err)?;
+    writeln!(w, "comment created by sculpt-rs").map_err(err)?;
+    writeln!(w, "element vertex {}", mesh.verts.len()).map_err(err)?;
+    for p in ["x", "y", "z", "nx", "ny", "nz"] {
+        writeln!(w, "property float {p}").map_err(err)?;
+    }
+    for p in ["red", "green", "blue"] {
+        writeln!(w, "property uchar {p}").map_err(err)?;
+    }
+    writeln!(w, "element face {}", mesh.faces.len()).map_err(err)?;
+    writeln!(w, "property list uchar uint vertex_indices").map_err(err)?;
+    writeln!(w, "end_header").map_err(err)?;
+
+    for v in &mesh.verts {
+        for c in [v.pos.x, v.pos.y, v.pos.z, v.nrm.x, v.nrm.y, v.nrm.z] {
+            w.write_all(&c.to_le_bytes()).map_err(err)?;
+        }
+        for c in [v.col.x, v.col.y, v.col.z] {
+            w.write_all(&[(c.clamp(0.0, 1.0) * 255.0).round() as u8]).map_err(err)?;
+        }
+    }
+    for t in &mesh.faces {
+        w.write_all(&[3u8]).map_err(err)?;
+        for &i in t {
+            w.write_all(&i.to_le_bytes()).map_err(err)?;
+        }
+    }
+    w.flush().map_err(err)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PlyType {
+    F32,
+    F64,
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+    I32,
+}
+
+impl PlyType {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "float" | "float32" => PlyType::F32,
+            "double" | "float64" => PlyType::F64,
+            "uchar" | "uint8" => PlyType::U8,
+            "char" | "int8" => PlyType::I8,
+            "ushort" | "uint16" => PlyType::U16,
+            "short" | "int16" => PlyType::I16,
+            "uint" | "uint32" => PlyType::U32,
+            "int" | "int32" => PlyType::I32,
+            _ => return None,
+        })
+    }
+
+    fn size(self) -> usize {
+        match self {
+            PlyType::U8 | PlyType::I8 => 1,
+            PlyType::U16 | PlyType::I16 => 2,
+            PlyType::F32 | PlyType::U32 | PlyType::I32 => 4,
+            PlyType::F64 => 8,
+        }
+    }
+
+    fn read(self, b: &[u8], o: usize, le: bool) -> f64 {
+        macro_rules! num {
+            ($t:ty, $n:expr) => {{
+                let mut a = [0u8; $n];
+                a.copy_from_slice(&b[o..o + $n]);
+                if le {
+                    <$t>::from_le_bytes(a) as f64
+                } else {
+                    <$t>::from_be_bytes(a) as f64
+                }
+            }};
+        }
+        match self {
+            PlyType::U8 => b[o] as f64,
+            PlyType::I8 => b[o] as i8 as f64,
+            PlyType::U16 => num!(u16, 2),
+            PlyType::I16 => num!(i16, 2),
+            PlyType::U32 => num!(u32, 4),
+            PlyType::I32 => num!(i32, 4),
+            PlyType::F32 => num!(f32, 4),
+            PlyType::F64 => num!(f64, 8),
+        }
+    }
+}
+
+struct PlyProp {
+    name: String,
+    ty: PlyType,
+    /// `Some(count_type)` when the property is a list.
+    list: Option<PlyType>,
+}
+
+/// Reads ASCII or binary PLY, keeping positions and colours.
+pub fn read_ply(path: &Path) -> IoResult<Mesh> {
+    let mut buf = Vec::new();
+    File::open(path).map_err(err)?.read_to_end(&mut buf).map_err(err)?;
+
+    let header_end = find_subslice(&buf, b"end_header")
+        .ok_or_else(|| "PLY header not terminated".to_string())?;
+    let after = header_end + b"end_header".len();
+    let body_start = after + if buf.get(after) == Some(&b'\r') { 2 } else { 1 };
+    let header = String::from_utf8_lossy(&buf[..header_end]).to_string();
+
+    let mut format = "ascii".to_string();
+    let mut elements: Vec<(String, usize, Vec<PlyProp>)> = Vec::new();
+    for line in header.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("format") => format = it.next().unwrap_or("ascii").to_string(),
+            Some("element") => {
+                let name = it.next().unwrap_or("").to_string();
+                let count = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                elements.push((name, count, Vec::new()));
+            }
+            Some("property") => {
+                let Some(last) = elements.last_mut() else { continue };
+                let first = it.next().unwrap_or("");
+                if first == "list" {
+                    let count_ty = PlyType::parse(it.next().unwrap_or("")).unwrap_or(PlyType::U8);
+                    let ty = PlyType::parse(it.next().unwrap_or("")).unwrap_or(PlyType::U32);
+                    let name = it.next().unwrap_or("").to_string();
+                    last.2.push(PlyProp { name, ty, list: Some(count_ty) });
+                } else {
+                    let ty = PlyType::parse(first).unwrap_or(PlyType::F32);
+                    let name = it.next().unwrap_or("").to_string();
+                    last.2.push(PlyProp { name, ty, list: None });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut pos: Vec<Vec3> = Vec::new();
+    let mut cols: Vec<Vec3> = Vec::new();
+    let mut faces: Vec<[u32; 3]> = Vec::new();
+
+    if format == "ascii" {
+        let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
+        let mut tokens = body.split_whitespace();
+        for (name, count, props) in &elements {
+            for _ in 0..*count {
+                let mut vals: Vec<f64> = Vec::new();
+                let mut list_vals: Vec<u32> = Vec::new();
+                for p in props {
+                    if p.list.is_some() {
+                        let n: usize = tokens.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+                        for _ in 0..n {
+                            list_vals.push(tokens.next().and_then(|t| t.parse().ok()).unwrap_or(0));
+                        }
+                    } else {
+                        vals.push(tokens.next().and_then(|t| t.parse().ok()).unwrap_or(0.0));
+                    }
+                }
+                collect(name, props, &vals, &list_vals, &mut pos, &mut cols, &mut faces);
+            }
+        }
+    } else {
+        let le = format.contains("little");
+        let mut o = body_start;
+        for (name, count, props) in &elements {
+            for _ in 0..*count {
+                let mut vals: Vec<f64> = Vec::new();
+                let mut list_vals: Vec<u32> = Vec::new();
+                for p in props {
+                    if let Some(ct) = p.list {
+                        if o + ct.size() > buf.len() {
+                            return Err("PLY truncated".into());
+                        }
+                        let n = ct.read(&buf, o, le) as usize;
+                        o += ct.size();
+                        for _ in 0..n {
+                            if o + p.ty.size() > buf.len() {
+                                return Err("PLY truncated".into());
+                            }
+                            list_vals.push(p.ty.read(&buf, o, le) as u32);
+                            o += p.ty.size();
+                        }
+                    } else {
+                        if o + p.ty.size() > buf.len() {
+                            return Err("PLY truncated".into());
+                        }
+                        vals.push(p.ty.read(&buf, o, le));
+                        o += p.ty.size();
+                    }
+                }
+                collect(name, props, &vals, &list_vals, &mut pos, &mut cols, &mut faces);
+            }
+        }
+    }
+
+    if pos.is_empty() || faces.is_empty() {
+        return Err("no geometry found in PLY".into());
+    }
+    let n = pos.len() as u32;
+    faces.retain(|t| t.iter().all(|&i| i < n));
+    let mut mesh = Mesh::from_soup(&pos, &faces);
+    for (v, c) in mesh.verts.iter_mut().zip(cols) {
+        v.col = c;
+    }
+    Ok(mesh)
+}
+
+/// Turns one decoded PLY element into geometry.
+fn collect(
+    element: &str,
+    props: &[PlyProp],
+    vals: &[f64],
+    list_vals: &[u32],
+    pos: &mut Vec<Vec3>,
+    cols: &mut Vec<Vec3>,
+    faces: &mut Vec<[u32; 3]>,
+) {
+    if element == "vertex" {
+        // `vals` holds the scalar properties in declaration order.
+        let scalars: Vec<&PlyProp> = props.iter().filter(|p| p.list.is_none()).collect();
+        let get = |want: &str| -> Option<f64> {
+            scalars
+                .iter()
+                .position(|p| p.name == want)
+                .and_then(|i| vals.get(i).copied())
+        };
+        pos.push(Vec3::new(
+            get("x").unwrap_or(0.0) as f32,
+            get("y").unwrap_or(0.0) as f32,
+            get("z").unwrap_or(0.0) as f32,
+        ));
+
+        // Colours are bytes in most files but floats in some; normalise both.
+        let channel = |name: &str| -> f32 {
+            let Some(raw) = get(name) else { return 0.85 };
+            let float = scalars
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| matches!(p.ty, PlyType::F32 | PlyType::F64))
+                .unwrap_or(false);
+            if float { raw as f32 } else { raw as f32 / 255.0 }
+        };
+        cols.push(Vec3::new(channel("red"), channel("green"), channel("blue")));
+    } else if element == "face" && list_vals.len() >= 3 {
+        for k in 1..list_vals.len() - 1 {
+            faces.push([list_vals[0], list_vals[k], list_vals[k + 1]]);
+        }
+    }
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+// ---------------------------------------------------------------------------
+// STL
+// ---------------------------------------------------------------------------
+
 pub fn write_stl(mesh: &Mesh, path: &Path) -> IoResult<()> {
     let f = File::create(path).map_err(err)?;
     let mut w = BufWriter::new(f);
@@ -133,22 +412,34 @@ pub fn write_stl(mesh: &Mesh, path: &Path) -> IoResult<()> {
     Ok(())
 }
 
-/// Reads a binary STL and welds the soup back into a connected mesh.
+/// Reads binary or ASCII STL and welds the soup back into a connected mesh.
 pub fn read_stl(path: &Path) -> IoResult<Mesh> {
     let mut buf = Vec::new();
     File::open(path).map_err(err)?.read_to_end(&mut buf).map_err(err)?;
-    if buf.len() < 84 {
+    if buf.len() < 15 {
         return Err("STL too short".into());
     }
-    if buf.starts_with(b"solid") && !buf[..80.min(buf.len())].contains(&0) {
-        return Err("ASCII STL is not supported, re-export as binary".into());
+
+    let looks_ascii = buf.starts_with(b"solid")
+        && find_subslice(&buf[..buf.len().min(512)], b"facet").is_some();
+    let (pos, faces) = if looks_ascii {
+        read_stl_ascii(&buf)?
+    } else {
+        read_stl_binary(&buf)?
+    };
+    let (p, f) = weld(&pos, &faces, 1e-5);
+    Ok(Mesh::from_soup(&p, &f))
+}
+
+fn read_stl_binary(buf: &[u8]) -> IoResult<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    if buf.len() < 84 {
+        return Err("STL too short".into());
     }
     let count = u32::from_le_bytes([buf[80], buf[81], buf[82], buf[83]]) as usize;
     if buf.len() < 84 + count * 50 {
         return Err("STL truncated".into());
     }
     let rd = |o: usize| f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
-
     let mut pos = Vec::with_capacity(count * 3);
     let mut faces = Vec::with_capacity(count);
     for i in 0..count {
@@ -160,23 +451,181 @@ pub fn read_stl(path: &Path) -> IoResult<Mesh> {
         let b = (i * 3) as u32;
         faces.push([b, b + 1, b + 2]);
     }
-    let (p, f) = weld(&pos, &faces, 1e-5);
-    Ok(Mesh::from_soup(&p, &f))
+    Ok((pos, faces))
 }
 
-/// Dispatches on file extension.
+fn read_stl_ascii(buf: &[u8]) -> IoResult<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    let text = String::from_utf8_lossy(buf);
+    let mut pos = Vec::new();
+    let mut faces = Vec::new();
+    let mut pending: Vec<Vec3> = Vec::new();
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        if it.next() != Some("vertex") {
+            continue;
+        }
+        let c: Vec<f32> = it.filter_map(|x| x.parse().ok()).collect();
+        if c.len() < 3 {
+            continue;
+        }
+        pending.push(Vec3::new(c[0], c[1], c[2]));
+        if pending.len() == 3 {
+            let b = pos.len() as u32;
+            pos.extend(pending.drain(..));
+            faces.push([b, b + 1, b + 2]);
+        }
+    }
+    if faces.is_empty() {
+        return Err("no facets found in ASCII STL".into());
+    }
+    Ok((pos, faces))
+}
+
+// ---------------------------------------------------------------------------
+// Native scene format
+// ---------------------------------------------------------------------------
+
+const MAGIC: &[u8; 8] = b"SCULPTRS";
+const VERSION: u32 = 1;
+
+/// Writes the whole scene, transforms and per-vertex attributes included.
+pub fn write_scene(scene: &Scene, path: &Path) -> IoResult<()> {
+    let f = File::create(path).map_err(err)?;
+    let mut w = BufWriter::new(f);
+    w.write_all(MAGIC).map_err(err)?;
+    w.write_all(&VERSION.to_le_bytes()).map_err(err)?;
+    w.write_all(&(scene.objects.len() as u32).to_le_bytes()).map_err(err)?;
+    w.write_all(&(scene.active as u32).to_le_bytes()).map_err(err)?;
+
+    for o in &scene.objects {
+        let name = o.name.as_bytes();
+        w.write_all(&(name.len() as u32).to_le_bytes()).map_err(err)?;
+        w.write_all(name).map_err(err)?;
+        let t = &o.transform;
+        for c in [
+            t.position.x, t.position.y, t.position.z,
+            t.rotation.x, t.rotation.y, t.rotation.z, t.rotation.w,
+            t.scale.x, t.scale.y, t.scale.z,
+        ] {
+            w.write_all(&c.to_le_bytes()).map_err(err)?;
+        }
+        w.write_all(&[o.visible as u8]).map_err(err)?;
+        w.write_all(&(o.mesh.verts.len() as u32).to_le_bytes()).map_err(err)?;
+        w.write_all(&(o.mesh.faces.len() as u32).to_le_bytes()).map_err(err)?;
+        w.write_all(bytemuck::cast_slice(&o.mesh.verts)).map_err(err)?;
+        w.write_all(bytemuck::cast_slice(&o.mesh.faces)).map_err(err)?;
+    }
+    w.flush().map_err(err)?;
+    Ok(())
+}
+
+pub fn read_scene(path: &Path) -> IoResult<Scene> {
+    let mut buf = Vec::new();
+    File::open(path).map_err(err)?.read_to_end(&mut buf).map_err(err)?;
+    if buf.len() < 16 || &buf[..8] != MAGIC {
+        return Err("not a sculpt-rs scene file".into());
+    }
+    let mut o = 8;
+    let u32_at = |o: &mut usize| -> u32 {
+        let v = u32::from_le_bytes([buf[*o], buf[*o + 1], buf[*o + 2], buf[*o + 3]]);
+        *o += 4;
+        v
+    };
+    let version = u32_at(&mut o);
+    if version != VERSION {
+        return Err(format!("unsupported scene version {version}"));
+    }
+    let count = u32_at(&mut o) as usize;
+    let active = u32_at(&mut o) as usize;
+
+    let mut objects = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name_len = u32_at(&mut o) as usize;
+        if o + name_len > buf.len() {
+            return Err("scene file truncated".into());
+        }
+        let name = String::from_utf8_lossy(&buf[o..o + name_len]).to_string();
+        o += name_len;
+
+        let f32_at = |o: &mut usize| -> f32 {
+            let v = f32::from_le_bytes([buf[*o], buf[*o + 1], buf[*o + 2], buf[*o + 3]]);
+            *o += 4;
+            v
+        };
+        let position = Vec3::new(f32_at(&mut o), f32_at(&mut o), f32_at(&mut o));
+        let rotation = Quat::from_xyzw(
+            f32_at(&mut o),
+            f32_at(&mut o),
+            f32_at(&mut o),
+            f32_at(&mut o),
+        );
+        let scale = Vec3::new(f32_at(&mut o), f32_at(&mut o), f32_at(&mut o));
+        let visible = buf[o] != 0;
+        o += 1;
+
+        let nv = u32_at(&mut o) as usize;
+        let nf = u32_at(&mut o) as usize;
+        let vbytes = nv * std::mem::size_of::<Vertex>();
+        let fbytes = nf * std::mem::size_of::<[u32; 3]>();
+        if o + vbytes + fbytes > buf.len() {
+            return Err("scene file truncated".into());
+        }
+        // The payload starts wherever the variable-length name left off, so it
+        // is not necessarily aligned: read it element by element.
+        let verts: Vec<Vertex> = buf[o..o + vbytes]
+            .chunks_exact(std::mem::size_of::<Vertex>())
+            .map(bytemuck::pod_read_unaligned)
+            .collect();
+        o += vbytes;
+        let faces: Vec<[u32; 3]> = buf[o..o + fbytes]
+            .chunks_exact(std::mem::size_of::<[u32; 3]>())
+            .map(bytemuck::pod_read_unaligned)
+            .collect();
+        o += fbytes;
+
+        let mut mesh = Mesh { verts, faces, vfaces: Vec::new(), accel: None };
+        mesh.rebuild_adjacency();
+        let mut obj = Object::new(name, mesh);
+        obj.transform = Transform { position, rotation, scale };
+        obj.visible = visible;
+        objects.push(obj);
+    }
+
+    Ok(Scene { active: active.min(objects.len().saturating_sub(1)), objects })
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+fn ext(path: &Path) -> Option<String> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+}
+
+/// Loads a single mesh. Scene files load their first object.
 pub fn load(path: &Path) -> IoResult<Mesh> {
-    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+    match ext(path).as_deref() {
         Some("obj") => read_obj(path),
+        Some("ply") => read_ply(path),
         Some("stl") => read_stl(path),
+        Some("sculpt") => read_scene(path)?
+            .objects
+            .into_iter()
+            .next()
+            .map(|o| o.mesh)
+            .ok_or_else(|| "scene file has no objects".to_string()),
         other => Err(format!("unsupported format: {}", other.unwrap_or("(none)"))),
     }
 }
 
 pub fn save(mesh: &Mesh, path: &Path) -> IoResult<()> {
-    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+    match ext(path).as_deref() {
         Some("obj") => write_obj(mesh, path, true),
+        Some("ply") => write_ply(mesh, path),
         Some("stl") => write_stl(mesh, path),
+        Some("sculpt") => write_scene(&Scene::with_object(Object::new("mesh", mesh.clone())), path),
         other => Err(format!("unsupported format: {}", other.unwrap_or("(none)"))),
     }
 }
