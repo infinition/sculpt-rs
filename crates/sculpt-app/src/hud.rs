@@ -24,8 +24,10 @@ const PILL_TRAVEL: f32 = 220.0;
 
 #[derive(Clone, Copy, Debug)]
 pub enum HudAction {
-    /// Open the radial menu centred here.
-    OpenWheel(egui::Pos2),
+    /// Open the radial menu. Where it goes is the caller's business: the
+    /// button that raised this sits at the edge of the screen, which is the
+    /// one place a ring should not be centred on.
+    OpenWheel,
     CloseWheel,
     Orbit(Vec2),
     Pan(Vec2),
@@ -224,7 +226,7 @@ impl Hud {
                     let started = *self.pressed_at.get_or_insert(now);
                     if !self.wheel_open && now - started > HOLD_SECONDS {
                         self.wheel_open = true;
-                        actions.push(HudAction::OpenWheel(centre.center()));
+                        actions.push(HudAction::OpenWheel);
                     }
                 } else {
                     if self.wheel_open {

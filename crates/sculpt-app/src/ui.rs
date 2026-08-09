@@ -331,14 +331,12 @@ pub fn draw(
     let cursor = st.viewport_cursor;
     for a in st.hud.show(root.ctx(), viewport, s, &p) {
         match a {
-            HudAction::OpenWheel(at) => {
-                // The button asks for its own centre; the setting may prefer
-                // the cursor or the middle of the viewport.
-                let where_to = match st.anchor {
-                    Anchor::Cursor => at,
-                    Anchor::Center => viewport.center(),
-                };
-                st.wheel.open_at(where_to, s);
+            HudAction::OpenWheel => {
+                // Summoned from a floating button, the menu always opens in the
+                // middle. The button sits at the edge of the screen, and a menu
+                // wrapped around it would put half its ring off the window and
+                // the other half under your hand.
+                st.wheel.open_at(viewport.center(), s);
             }
             HudAction::CloseWheel => st.wheel.close(),
             HudAction::Orbit(d) => cam.orbit(d.x, d.y),
@@ -351,10 +349,14 @@ pub fn draw(
 
     // While size or force is being dragged, show the brush at its new size so
     // the number is not the only thing to go on.
+    //
+    // Always in the middle. The pointer is on the slider while it drags, and
+    // the last place it was over the model is wherever you happened to leave
+    // it, which is no better a place to judge a size from than any other.
     if st.hud.is_adjusting() || st.wheel.is_adjusting() {
-        let at = st.anchor.resolve(cursor, viewport);
-        brush_preview(root.ctx(), at, s, cam, viewport, p);
+        brush_preview(root.ctx(), viewport.center(), s, cam, viewport, p);
     }
+    let _ = cursor;
 
     // Last, so it covers everything else while it is up.
     st.wheel.show(root.ctx(), s, &p);
@@ -1546,9 +1548,11 @@ fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
         .show(ui);
 
     ui.label(
-        egui::RichText::new("Where the menu and the brush preview appear")
-            .small()
-            .color(p.dim),
+        egui::RichText::new(
+            "Where the menu appears when the key summons it. From the floating button it always opens in the middle, and so does the brush preview.",
+        )
+        .small()
+        .color(p.dim),
     );
     let labels: Vec<&str> = Anchor::ALL.iter().map(|a| a.label()).collect();
     let current = Anchor::ALL.iter().position(|a| *a == st.anchor).unwrap_or(0);
