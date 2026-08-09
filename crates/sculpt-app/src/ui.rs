@@ -7,7 +7,9 @@
 
 use crate::camera::{Camera, Projection, ViewPreset};
 use crate::gizmo::{Gizmo, GizmoMode};
+use crate::hud::{Hud, HudAction};
 use crate::icons::Icon;
+use crate::input::{Bindings, Role};
 use crate::matcap;
 use crate::navwidget::{self, NavAction, NavWidget};
 use crate::renderer::{FrameSettings, Shading};
@@ -139,6 +141,8 @@ pub struct UiState {
     pub upload_bytes: u64,
     pub nav: NavWidget,
     pub show_nav: bool,
+    pub hud: Hud,
+    pub bindings: Bindings,
     pub wheel: Wheel,
     /// Key that summons the radial menu while held.
     pub wheel_key: KeyCode,
@@ -178,6 +182,8 @@ impl Default for UiState {
             upload_bytes: 0,
             nav: NavWidget::default(),
             show_nav: true,
+            hud: Hud::default(),
+            bindings: Bindings::default(),
             wheel: Wheel::default(),
             wheel_key: KeyCode::Space,
             rebinding_wheel: false,
@@ -263,6 +269,18 @@ pub fn draw(
             }
         }
     }
+    // Floating controls sit over the viewport, under the radial menu.
+    let viewport = root.available_rect_before_wrap();
+    for a in st.hud.show(root.ctx(), viewport, s, &p) {
+        match a {
+            HudAction::OpenWheel(at) => st.wheel.open_at(at, s),
+            HudAction::CloseWheel => st.wheel.close(),
+            HudAction::Orbit(d) => cam.orbit(d.x, d.y),
+            HudAction::Pan(d) => cam.pan(d.x, d.y, viewport.height().max(1.0)),
+            HudAction::Zoom(amount) => cam.zoom(amount),
+        }
+    }
+
     viewport_overlay(root, s, st, overlay, p);
     // Last, so it covers everything else while it is up.
     st.wheel.show(root.ctx(), s, &p);
@@ -516,7 +534,13 @@ fn brush_rail(root: &mut egui::Ui, s: &mut Sculptor, st: &UiState, cx: &Ctx) {
             } else {
                 egui::ScrollArea::vertical()
             };
-            scroll.auto_shrink([false, false]).show(ui, |ui| {
+            // No bar on the rail: it is a strip of tools, and a scroll bar down
+            // the side of it is just clutter. Dragging and the wheel still
+            // scroll it when the tools do not all fit.
+            scroll
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
                 let build = |ui: &mut egui::Ui, s: &mut Sculptor| {
                     ui.spacing_mut().item_spacing = Vec2::splat(4.0);
                     for (i, kind) in BrushKind::ALL.iter().enumerate() {
@@ -1344,6 +1368,54 @@ fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
         .decimals(0)
         .height(m.row)
         .show(ui);
+
+    widgets::section_title(ui, "FLOATING CONTROLS");
+    widgets::toggle(ui, &mut st.hud.show_brush, "Size and force pills", m.row);
+    widgets::toggle(ui, &mut st.hud.show_nav, "Orbit, pan and zoom buttons", m.row);
+    widgets::toggle(ui, &mut st.show_nav, "Orientation ball", m.row);
+    BigSlider::new(&mut st.hud.size, 34.0..=90.0, "Button size")
+        .decimals(0)
+        .height(m.row)
+        .show(ui);
+    widgets::toggle(ui, &mut st.hud.arrange, "Arrange: drag them anywhere", m.row);
+    if st.hud.arrange {
+        ui.label(
+            egui::RichText::new("Drag either cluster to move it. Turn this off to use them again.")
+                .small()
+                .color(p.accent),
+        );
+    }
+    if widgets::wide_button(ui, Icon::Reset, "Put them back", m.row, false).clicked() {
+        st.hud.reset_positions();
+    }
+
+    widgets::section_title(ui, "INPUT");
+    ui.label(
+        egui::RichText::new("What each device does when you drag with it.")
+            .small()
+            .color(p.dim),
+    );
+    let labels: Vec<&str> = Role::ALL.iter().map(|r| r.label()).collect();
+    for (name, role) in [
+        ("Left button", &mut st.bindings.left),
+        ("Middle button", &mut st.bindings.middle),
+        ("Right button", &mut st.bindings.right),
+        ("One finger", &mut st.bindings.touch),
+        ("Pen", &mut st.bindings.pen),
+    ] {
+        ui.label(egui::RichText::new(name).small().color(p.dim));
+        let current = Role::ALL.iter().position(|r| r == role).unwrap_or(0);
+        if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+            *role = Role::ALL[i];
+        }
+    }
+    ui.label(
+        egui::RichText::new(
+            "Alt with the left button always orbits, whatever the buttons are set to, and shift turns an orbit into a pan.",
+        )
+        .small()
+        .color(p.dim),
+    );
 
     widgets::section_title(ui, "RADIAL MENU");
     ui.label(

@@ -21,6 +21,70 @@ pub enum Gesture {
     Wheel(f32),
 }
 
+/// What a device does when it is dragged.
+///
+/// Everyone holds a tablet differently and every application trains a different
+/// reflex, so rather than pick one, each device gets a job you can change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Sculpt,
+    Orbit,
+    Pan,
+    Zoom,
+    Nothing,
+}
+
+impl Role {
+    pub const ALL: [Role; 5] = [Role::Sculpt, Role::Orbit, Role::Pan, Role::Zoom, Role::Nothing];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Sculpt => "Sculpt",
+            Role::Orbit => "Orbit",
+            Role::Pan => "Pan",
+            Role::Zoom => "Zoom",
+            Role::Nothing => "Nothing",
+        }
+    }
+
+    /// Turns a drag into a camera move, or `None` when this role sculpts.
+    fn gesture(self, delta: Vec2) -> Option<Gesture> {
+        match self {
+            Role::Orbit => Some(Gesture::Orbit(delta)),
+            Role::Pan => Some(Gesture::Pan(delta)),
+            // Vertical travel reads as zoom, as it does everywhere else here.
+            Role::Zoom => Some(Gesture::Wheel(-delta.y * 0.04)),
+            Role::Sculpt | Role::Nothing => None,
+        }
+    }
+}
+
+/// What each device does. Pen and touch are separate because a stylus usually
+/// wants to draw while a finger usually wants to move the model.
+#[derive(Clone, Copy, Debug)]
+pub struct Bindings {
+    pub left: Role,
+    pub middle: Role,
+    pub right: Role,
+    /// A single finger.
+    pub touch: Role,
+    /// A stylus. Reported by the same events as touch, told apart by the
+    /// pressure the digitiser sends, which a finger does not have.
+    pub pen: Role,
+}
+
+impl Default for Bindings {
+    fn default() -> Self {
+        Self {
+            left: Role::Sculpt,
+            middle: Role::Orbit,
+            right: Role::Orbit,
+            touch: Role::Sculpt,
+            pen: Role::Sculpt,
+        }
+    }
+}
+
 /// What a touch event turned into.
 pub enum TouchOutcome {
     StrokeStart { at: Vec2, pressure: f32 },
@@ -69,18 +133,39 @@ impl Input {
         delta
     }
 
-    /// Mouse navigation: middle or right drag orbits, shift makes it pan, and
-    /// alt turns the left button into an orbit so a pen can navigate too.
-    pub fn mouse_navigation(&self, delta: Vec2) -> Option<Gesture> {
-        let navigating = self.mmb || self.rmb || (self.lmb && self.alt);
-        if !navigating {
-            return None;
-        }
-        if self.shift {
-            Some(Gesture::Pan(delta))
+    /// Turns the held buttons into a camera move, if any of them asks for one.
+    ///
+    /// Alt always navigates whatever the left button is bound to, which is the
+    /// escape hatch when every button has been given to sculpting. Shift turns
+    /// an orbit into a pan, the way it does in most viewers.
+    pub fn mouse_navigation(&self, delta: Vec2, b: &Bindings) -> Option<Gesture> {
+        let role = if self.lmb && self.alt {
+            Role::Orbit
+        } else if self.lmb {
+            b.left
+        } else if self.mmb {
+            b.middle
+        } else if self.rmb {
+            b.right
         } else {
-            Some(Gesture::Orbit(delta))
-        }
+            return None;
+        };
+        let role = match (role, self.shift) {
+            (Role::Orbit, true) => Role::Pan,
+            (r, _) => r,
+        };
+        role.gesture(delta)
+    }
+
+    /// Whether a press of this button should start a stroke.
+    pub fn sculpts(&self, button: winit::event::MouseButton, b: &Bindings) -> bool {
+        let role = match button {
+            winit::event::MouseButton::Left => b.left,
+            winit::event::MouseButton::Middle => b.middle,
+            winit::event::MouseButton::Right => b.right,
+            _ => Role::Nothing,
+        };
+        role == Role::Sculpt && !self.alt
     }
 
     pub fn touch_active(&self) -> bool {
@@ -88,8 +173,12 @@ impl Input {
     }
 
     /// Feeds one touch event through the gesture recogniser.
-    pub fn on_touch(&mut self, touch: &Touch, over_ui: bool) -> Option<TouchOutcome> {
+    pub fn on_touch(&mut self, touch: &Touch, over_ui: bool, b: &Bindings) -> Option<TouchOutcome> {
         let pos = Vec2::new(touch.location.x as f32, touch.location.y as f32);
+        // A digitiser reports pressure; a fingertip does not. That is the only
+        // signal we get to tell a stylus from a finger, and it is good enough
+        // to let the two have different jobs.
+        let is_pen = touch.force.is_some();
         let pressure = touch
             .force
             .map(|f| match f {
@@ -100,6 +189,7 @@ impl Input {
             })
             .unwrap_or(1.0)
             .clamp(0.05, 1.0);
+        let role = if is_pen { b.pen } else { b.touch };
 
         match touch.phase {
             TouchPhase::Started => {
@@ -107,6 +197,12 @@ impl Input {
                 if self.fingers.len() == 1 {
                     if over_ui {
                         // Let egui own this one.
+                        return None;
+                    }
+                    if role != Role::Sculpt {
+                        // This device navigates; nothing to do until it moves.
+                        self.finger_stroke = false;
+                        self.gesture_lock = true;
                         return None;
                     }
                     self.finger_stroke = true;
@@ -127,6 +223,10 @@ impl Input {
                     1 if self.finger_stroke => {
                         Some(TouchOutcome::StrokeMove { at: pos, pressure })
                     }
+                    // A single device bound to navigation drives the camera.
+                    1 => role
+                        .gesture(pos - previous)
+                        .map(|g| TouchOutcome::Navigate(vec![g])),
                     2 => Some(TouchOutcome::Navigate(self.two_finger(touch.id, previous))),
                     n if n >= 3 => {
                         let delta = pos - previous;

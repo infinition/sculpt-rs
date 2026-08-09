@@ -2,6 +2,7 @@
 
 mod camera;
 mod gizmo;
+mod hud;
 mod icons;
 mod input;
 mod matcap;
@@ -15,6 +16,7 @@ mod widgets;
 use camera::{Camera, Projection, ViewPreset};
 use gizmo::Gizmo;
 use glam::{Vec2, Vec3};
+
 use input::{Gesture, Input, TouchOutcome};
 use renderer::Renderer;
 use sculpt_core::{io, primitives, BrushKind, Mesh, Object, Sculptor, StrokeInput};
@@ -1170,7 +1172,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let delta = st.input.move_cursor(position.x as f32, position.y as f32);
-                if let Some(g) = st.input.mouse_navigation(delta) {
+                if let Some(g) = st.input.mouse_navigation(delta, &st.ui.bindings) {
                     st.apply_gesture(g);
                 } else if st.gizmo.is_dragging() {
                     st.gizmo_drag();
@@ -1190,30 +1192,25 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 match button {
-                    MouseButton::Left => {
-                        st.input.lmb = down;
-                        if down {
-                            // The radial menu owns the pointer while it is up,
-                            // then the gizmo gets first refusal, then the brush.
-                            if !st.ui.wheel.open
-                                && !egui_captured
-                                && !st.input.alt
-                                && !st.gizmo_press()
-                            {
-                                st.begin_stroke(1.0);
-                            }
-                        } else {
-                            st.gizmo.release();
-                            st.end_stroke();
-                        }
-                    }
+                    MouseButton::Left => st.input.lmb = down,
                     MouseButton::Middle => st.input.mmb = down,
                     MouseButton::Right => st.input.rmb = down,
                     _ => {}
                 }
+                let sculpts = st.input.sculpts(button, &st.ui.bindings);
+                if down {
+                    // The radial menu owns the pointer while it is up, then the
+                    // gizmo gets first refusal, then the brush.
+                    if sculpts && !st.ui.wheel.open && !egui_captured && !st.gizmo_press() {
+                        st.begin_stroke(1.0);
+                    }
+                } else if sculpts {
+                    st.gizmo.release();
+                    st.end_stroke();
+                }
             }
             WindowEvent::Touch(touch) => {
-                if let Some(outcome) = st.input.on_touch(&touch, egui_captured) {
+                if let Some(outcome) = st.input.on_touch(&touch, egui_captured, &st.ui.bindings) {
                     match outcome {
                         TouchOutcome::StrokeStart { at, pressure } => {
                             st.input.cursor = at;
