@@ -433,7 +433,10 @@ impl Mesh {
     }
 
     /// Recomputes normals for `verts` and their ring-1 neighbours only.
-    pub fn update_normals(&mut self, touched: &[u32]) {
+    ///
+    /// Returns that wider set, which is exactly the set of vertices whose data
+    /// changed and therefore what a renderer has to re-upload.
+    pub fn update_normals(&mut self, touched: &[u32]) -> Vec<u32> {
         let mut set: Vec<u32> = Vec::with_capacity(touched.len() * 7);
         set.extend_from_slice(touched);
         for &v in touched {
@@ -448,6 +451,7 @@ impl Mesh {
             }
             self.verts[v as usize].nrm = n.normalize_or(Vec3::Y);
         }
+        set
     }
 
     pub fn bounds(&self) -> (Vec3, Vec3) {

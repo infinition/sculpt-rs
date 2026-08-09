@@ -127,6 +127,8 @@ pub struct UiState {
     pub wireframe_available: bool,
     pub picking_color: bool,
     pub add_primitive: Primitive,
+    /// Bytes the last frame sent to the GPU, shown in the statistics.
+    pub upload_bytes: u64,
     /// Interface scale being dragged, applied when the drag ends. Zooming
     /// rescales the coordinate space the slider itself lives in, so committing
     /// mid-gesture would move the rail out from under the finger.
@@ -156,6 +158,7 @@ impl Default for UiState {
             wireframe_available: true,
             picking_color: false,
             add_primitive: Primitive::Sphere,
+            upload_bytes: 0,
             ui_scale_draft: UiTheme::default().ui_scale,
         }
     }
@@ -380,6 +383,16 @@ fn top_bar(
                 });
             });
         });
+}
+
+/// Human-readable byte count for the statistics readout.
+fn format_bytes(n: u64) -> String {
+    match n {
+        0 => "none".into(),
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.0} kB", n as f64 / 1024.0),
+        n => format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)),
+    }
 }
 
 /// Off, move, rotate, scale, and back to off.
@@ -1119,6 +1132,22 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
         cx.actions.push(Action::FrameView);
     }
 
+    widgets::section_title(ui, "PERFORMANCE");
+    widgets::toggle(ui, &mut st.settings.gpu_scatter, "GPU vertex upload", m.row);
+    ui.label(
+        egui::RichText::new(
+            "A stroke touches a scattered handful of vertices. With this on, only those are sent and a compute pass puts them in place; with it off, the whole mesh goes across every frame.",
+        )
+        .small()
+        .color(p.dim),
+    );
+    ui.label(
+        egui::RichText::new(format!("Last frame sent {}", format_bytes(st.upload_bytes)))
+            .small()
+            .monospace()
+            .color(p.faint),
+    );
+
     widgets::section_title(ui, "ANTI-ALIASING");
     let msaa_ok = st.msaa_available;
     let picked = ui
@@ -1272,11 +1301,12 @@ fn viewport_overlay(
 
     if st.show_stats {
         let text = format!(
-            "{} verts   {} tris\nundo {:.0} MB   {} objects",
+            "{} verts   {} tris\nundo {:.0} MB   {} objects\nupload {}",
             s.mesh().vert_count(),
             s.mesh().face_count(),
             s.history.used_bytes() as f64 / 1.0e6,
             s.scene.objects.len(),
+            format_bytes(st.upload_bytes),
         );
         painter.text(
             egui::pos2(rect.left() + 12.0, rect.bottom() - 12.0),

@@ -378,13 +378,16 @@ pub fn segmented(ui: &mut Ui, labels: &[&str], current: usize, height: f32) -> O
     let per_row = ((width / widest.max(24.0)).floor() as usize).clamp(1, n);
     let rows = n.div_ceil(per_row);
 
-    let (rect, _) = ui.allocate_exact_size(
+    let (rect, base) = ui.allocate_exact_size(
         Vec2::new(width, height * rows as f32 + 2.0 * (rows - 1) as f32),
         Sense::hover(),
     );
     let radius = CornerRadius::same(ui.visuals().widgets.inactive.corner_radius.nw);
     ui.painter().rect_filled(rect, radius, p.bg);
 
+    // Cell ids hang off the id egui just handed this widget. Deriving them from
+    // the label instead would collide whenever two controls in the same panel
+    // share a word, and the clicks would land on the wrong control.
     let mut clicked = None;
     for (i, label) in labels.iter().enumerate() {
         let row = i / per_row;
@@ -398,7 +401,7 @@ pub fn segmented(ui: &mut Ui, labels: &[&str], current: usize, height: f32) -> O
             ),
             Vec2::new(seg, height),
         );
-        let r = ui.interact(cell, ui.id().with(("segmented", i, *label)), Sense::click());
+        let r = ui.interact(cell, base.id.with(i), Sense::click());
         if r.clicked() {
             clicked = Some(i);
         }

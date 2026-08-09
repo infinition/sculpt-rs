@@ -822,12 +822,37 @@ impl State {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Upload whatever the sculptor touched.
-        let dirty = if self.full_resync { None } else { self.dirty_object };
-        if self.full_resync || self.sculptor.verts_dirty || self.sculptor.topology_dirty {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+
+        // Upload whatever the sculptor touched. A stroke that only moved
+        // vertices can go through the sparse path; anything structural, and
+        // anything that changed the index buffer, needs the whole thing.
+        let structural = self.full_resync || self.sculptor.topology_dirty;
+        let sparse_ok = self.ui.settings.gpu_scatter
+            && !structural
+            && self.sculptor.verts_dirty
+            && self.dirty_object == Some(self.sculptor.scene.active);
+
+        if sparse_ok {
+            let object = self.sculptor.scene.active;
+            let mut dirty = self.sculptor.take_dirty_verts();
+            self.renderer.sync_sparse(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &self.sculptor.scene,
+                object,
+                &mut dirty,
+            );
+        } else if structural || self.sculptor.verts_dirty {
+            let dirty = if structural { None } else { self.dirty_object };
             self.renderer
                 .sync(&self.device, &self.queue, &self.sculptor.scene, dirty);
+            self.sculptor.dirty_verts.clear();
         }
+        self.ui.upload_bytes = self.renderer.last_upload_bytes;
         self.sculptor.verts_dirty = false;
         self.sculptor.topology_dirty = false;
         self.full_resync = false;
@@ -880,10 +905,6 @@ impl State {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: full_output.pixels_per_point,
         };
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
         for (id, deltas) in &full_output.textures_delta.set {
             for delta in deltas {

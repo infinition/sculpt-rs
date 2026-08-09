@@ -52,6 +52,9 @@ pub struct Sculptor {
     pub verts_dirty: bool,
     /// Set when the index buffer needs a re-upload.
     pub topology_dirty: bool,
+    /// Vertices written since the last upload, so a renderer can send just
+    /// those instead of the whole buffer. May contain duplicates.
+    pub dirty_verts: Vec<u32>,
     stroking: bool,
     stroke_state: brush::StrokeState,
 }
@@ -73,6 +76,7 @@ impl Sculptor {
             history: History::default(),
             verts_dirty: true,
             topology_dirty: true,
+            dirty_verts: Vec::new(),
             stroking: false,
             stroke_state: brush::StrokeState::default(),
             scene,
@@ -220,11 +224,20 @@ impl Sculptor {
         let touched = brush::apply(mesh, &brush, input, &mut state);
         if !touched.is_empty() {
             if deforms {
-                mesh.update_normals(&touched);
+                // Normals change one ring further out than the positions did.
+                let ring = mesh.update_normals(&touched);
+                self.dirty_verts.extend_from_slice(&ring);
+            } else {
+                self.dirty_verts.extend_from_slice(&touched);
             }
             self.verts_dirty = true;
         }
         self.stroke_state = state;
+    }
+
+    /// Hands over the vertices written since the last call and clears the list.
+    pub fn take_dirty_verts(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.dirty_verts)
     }
 
     /// Floods colour from a picked face. Fill is a click tool, so it records

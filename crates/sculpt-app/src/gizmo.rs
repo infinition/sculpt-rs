@@ -471,15 +471,22 @@ fn basis(n: Vec3) -> (Vec3, Vec3) {
 }
 
 /// Point on the line `origin + axis * s` closest to the ray.
+///
+/// The classic closest-approach solution for two lines, with `w0` running from
+/// the ray's origin to the axis's. Building it the other way round negates the
+/// solved parameter, and the handle then travels opposite the cursor.
 fn closest_point_on_axis(ro: Vec3, rd: Vec3, origin: Vec3, axis: Vec3) -> Option<Vec3> {
-    let a = axis.normalize_or(Vec3::X);
-    let w = ro - origin;
-    let (b, d, e) = (a.dot(rd), a.dot(w), rd.dot(w));
+    let u = axis.normalize_or(Vec3::X);
+    let v = rd.normalize_or(-Vec3::Z);
+    let w0 = origin - ro;
+    let b = u.dot(v);
     let denom = 1.0 - b * b;
     if denom.abs() < 1e-5 {
         return None; // the axis points straight at the camera
     }
-    Some(origin + a * ((b * e - d) / denom))
+    let d = u.dot(w0);
+    let e = v.dot(w0);
+    Some(origin + u * ((b * e - d) / denom))
 }
 
 /// Ray against the plane through `p` with normal `n`.
@@ -520,4 +527,38 @@ fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     }
     let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
     (p - (a + ab * t)).length()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_axis_drag_follows_the_cursor() {
+        // Looking down -Z at the origin. A ray two units to the right has to
+        // land two units along +X, not minus two: getting this backwards makes
+        // every move handle travel opposite the pointer.
+        let hit = closest_point_on_axis(
+            Vec3::new(2.0, 0.0, 5.0),
+            -Vec3::Z,
+            Vec3::ZERO,
+            Vec3::X,
+        )
+        .expect("the axis is not parallel to the ray");
+        assert!((hit.x - 2.0).abs() < 1e-4, "landed at {hit:?}");
+
+        let up = closest_point_on_axis(
+            Vec3::new(0.0, 1.5, 5.0),
+            -Vec3::Z,
+            Vec3::ZERO,
+            Vec3::Y,
+        )
+        .expect("the axis is not parallel to the ray");
+        assert!((up.y - 1.5).abs() < 1e-4, "landed at {up:?}");
+    }
+
+    #[test]
+    fn an_axis_pointing_at_the_camera_has_no_solution() {
+        assert!(closest_point_on_axis(Vec3::Z * 5.0, -Vec3::Z, Vec3::ZERO, Vec3::Z).is_none());
+    }
 }
