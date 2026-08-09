@@ -78,16 +78,18 @@ fn fs_main(in: VsOut) -> FsOut {
         discard;
     }
 
-    var color = vec3<f32>(0.42, 0.45, 0.52);
+    // Linear values: the target is sRGB, so these land much brighter on screen
+    // than the numbers suggest.
+    var color = vec3<f32>(0.10, 0.11, 0.14);
     let px = fwidth(hit.x) * 1.5;
     let pz = fwidth(hit.z) * 1.5;
     if (abs(hit.z) < pz) {
-        color = vec3<f32>(0.90, 0.36, 0.38); // the X axis runs along z = 0
-        a = max(a, 0.55);
+        color = vec3<f32>(0.34, 0.05, 0.06); // the X axis runs along z = 0
+        a = max(a, 0.7);
     }
     if (abs(hit.x) < px) {
-        color = vec3<f32>(0.36, 0.55, 0.95); // the Z axis runs along x = 0
-        a = max(a, 0.55);
+        color = vec3<f32>(0.04, 0.16, 0.40); // the Z axis runs along x = 0
+        a = max(a, 0.7);
     }
 
     let clip = g.view_proj * vec4<f32>(hit, 1.0);

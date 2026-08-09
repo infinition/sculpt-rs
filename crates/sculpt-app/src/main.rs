@@ -566,6 +566,10 @@ impl State {
                     self.sculptor.reset_brush_presets();
                     self.ui.say("brushes reset");
                 }
+                Action::ResetTheme => {
+                    self.ui.theme = theme::UiTheme::default();
+                    self.ui.say("theme reset");
+                }
             }
         }
     }
@@ -735,7 +739,8 @@ impl State {
         self.ui.status_age += dt;
         self.camera.update(dt);
 
-        theme::apply(&self.egui_ctx, self.ui.touch, self.ui.ui_scale);
+        theme::apply(&self.egui_ctx, &self.ui.theme);
+        widgets::set_icon_scale(&self.egui_ctx, self.ui.theme.icon_scale);
 
         use wgpu::CurrentSurfaceTexture as Cst;
         let frame = match self.surface.get_current_texture() {

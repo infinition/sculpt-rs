@@ -83,10 +83,26 @@ impl Default for FrameSettings {
             grid: true,
             grid_spacing: 0.25,
             cavity_strength: 6.0,
-            background_top: [0.105, 0.112, 0.128],
-            background_bottom: [0.043, 0.046, 0.055],
+            // Held as sRGB so the colour pickers show what the viewport shows.
+            background_top: [0.16, 0.17, 0.19],
+            background_bottom: [0.075, 0.08, 0.09],
         }
     }
+}
+
+/// The render target is sRGB, so a colour picked in the interface has to be
+/// linearised before the shader writes it, otherwise every background reads
+/// two stops brighter than the swatch beside it.
+fn to_linear(c: [f32; 3]) -> [f32; 4] {
+    let f = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    [f(c[0]), f(c[1]), f(c[2]), 1.0]
 }
 
 #[repr(C)]
@@ -535,13 +551,8 @@ impl Renderer {
                 // Fade the grid out well before the far plane.
                 (self.grid_fade(eye)).max(1.0),
             ],
-            bg_top: [s.background_top[0], s.background_top[1], s.background_top[2], 1.0],
-            bg_bottom: [
-                s.background_bottom[0],
-                s.background_bottom[1],
-                s.background_bottom[2],
-                1.0,
-            ],
+            bg_top: to_linear(s.background_top),
+            bg_bottom: to_linear(s.background_bottom),
         };
         queue.write_buffer(&self.global_buf, 0, bytemuck::bytes_of(&g));
 

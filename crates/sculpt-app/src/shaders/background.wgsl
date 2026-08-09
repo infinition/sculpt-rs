@@ -35,6 +35,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var c = mix(g.bg_bottom.rgb, g.bg_top.rgb, t);
     // A soft pool of light behind the model keeps the silhouette readable.
     let d = length((in.uv - vec2<f32>(0.5, 0.55)) * vec2<f32>(1.35, 1.0));
-    c += vec3<f32>(0.05, 0.052, 0.06) * clamp(1.0 - d * 1.6, 0.0, 1.0);
+    c += vec3<f32>(0.010, 0.011, 0.013) * clamp(1.0 - d * 1.6, 0.0, 1.0);
     return vec4<f32>(c, 1.0);
 }

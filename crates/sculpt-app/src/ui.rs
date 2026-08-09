@@ -1,15 +1,15 @@
-//! The interface: top bar, brush rail, contextual panel, viewport overlays.
+//! The interface: top bar, brush rail, settings dock, viewport overlays.
 //!
-//! Layout is built around one idea: the tool you are holding is always visible
-//! on the left, its settings are always in the same place on the right, and
-//! everything you can touch is at least a fingertip wide. Nothing is buried in
-//! a menu that a stylus has to hunt for.
+//! Layout is built around one idea: the tool you are holding is always one
+//! glance away, its settings are always in the same dock, and everything you
+//! can touch is at least a fingertip wide. Where those docks sit, how big they
+//! are and what colour everything is are all yours to change from the UI tab.
 
 use crate::camera::{Camera, Projection, ViewPreset};
 use crate::icons::Icon;
 use crate::matcap;
 use crate::renderer::{FrameSettings, Shading};
-use crate::theme::{Metrics, Palette};
+use crate::theme::{ColorPreset, Metrics, Palette, Side, UiTheme};
 use crate::widgets::{self, BigSlider};
 use egui::{Align2, Color32, CornerRadius, Frame, Margin, Sense, Stroke, Vec2};
 use sculpt_core::{Axis, BrushKind, Falloff, RemeshOptions, Sculptor};
@@ -79,6 +79,7 @@ pub enum Action {
     SetView(ViewPreset),
     PickColorMode,
     ResetBrushes,
+    ResetTheme,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,10 +88,11 @@ pub enum Tab {
     Model,
     Scene,
     View,
+    Interface,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Brush, Tab::Model, Tab::Scene, Tab::View];
+    const ALL: [Tab; 5] = [Tab::Brush, Tab::Model, Tab::Scene, Tab::View, Tab::Interface];
 
     fn label(self) -> &'static str {
         match self {
@@ -98,15 +100,15 @@ impl Tab {
             Tab::Model => "Model",
             Tab::Scene => "Scene",
             Tab::View => "View",
+            Tab::Interface => "UI",
         }
     }
 }
 
 pub struct UiState {
+    pub theme: UiTheme,
     pub matcap: matcap::Preset,
     pub settings: FrameSettings,
-    pub touch: bool,
-    pub ui_scale: f32,
     pub tab: Tab,
     pub show_panel: bool,
     pub show_rail: bool,
@@ -129,10 +131,9 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
+            theme: UiTheme::default(),
             matcap: matcap::Preset::Clay,
             settings: FrameSettings::default(),
-            touch: false,
-            ui_scale: 1.0,
             tab: Tab::Brush,
             show_panel: true,
             show_rail: true,
@@ -170,6 +171,13 @@ pub struct Overlay {
     pub stroking: bool,
 }
 
+/// Everything one panel body needs.
+struct Ctx<'a> {
+    p: Palette,
+    m: Metrics,
+    actions: &'a mut Vec<Action>,
+}
+
 /// Builds the whole interface for one frame and returns the actions it raised.
 pub fn draw(
     root: &mut egui::Ui,
@@ -179,18 +187,32 @@ pub fn draw(
     overlay: &Overlay,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
-    let m = Metrics::for_touch(st.touch);
+    let p = Palette::ui(root);
+    let m = Metrics::derive(&st.theme);
 
-    top_bar(root, s, st, cam, &m, &mut actions);
-    if st.show_rail {
-        brush_rail(root, s, &m);
+    {
+        let mut cx = Ctx { p, m, actions: &mut actions };
+        top_bar(root, s, st, cam, &mut cx);
+        if st.show_rail {
+            brush_rail(root, s, st, &cx);
+        }
+        if st.show_panel {
+            settings_dock(root, s, st, cam, &mut cx);
+        }
     }
-    if st.show_panel {
-        side_panel(root, s, st, cam, &m, &mut actions);
-    }
-    viewport_overlay(root, s, st, overlay, &mut actions);
+    viewport_overlay(root, s, st, overlay, p);
 
     actions
+}
+
+/// Builds a panel on the requested side.
+fn dock(id: &'static str, side: Side) -> egui::Panel {
+    match side {
+        Side::Left => egui::Panel::left(id),
+        Side::Right => egui::Panel::right(id),
+        Side::Top => egui::Panel::top(id),
+        Side::Bottom => egui::Panel::bottom(id),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -202,15 +224,15 @@ fn top_bar(
     s: &mut Sculptor,
     st: &mut UiState,
     cam: &mut Camera,
-    m: &Metrics,
-    actions: &mut Vec<Action>,
+    cx: &mut Ctx,
 ) {
+    let (p, m) = (cx.p, cx.m);
     let height = m.button + 14.0;
     egui::Panel::top("topbar")
         .exact_size(height)
         .frame(
             Frame::new()
-                .fill(Palette::PANEL)
+                .fill(p.panel)
                 .inner_margin(Margin::symmetric(m.pad as i8, 6)),
         )
         .show(root, |ui| {
@@ -218,58 +240,58 @@ fn top_bar(
                 ui.label(
                     egui::RichText::new("sculpt")
                         .strong()
-                        .color(Palette::ACCENT)
-                        .size(if st.touch { 18.0 } else { 15.0 }),
+                        .color(p.accent)
+                        .size(m.row * 0.52),
                 );
                 ui.add_space(m.gap);
-                separator(ui, height);
+                separator(ui, height, p);
 
                 let b = m.button;
                 if widgets::icon_button(ui, Icon::New, b, false, "New sphere").clicked() {
-                    actions.push(Action::New(Primitive::Sphere));
+                    cx.actions.push(Action::New(Primitive::Sphere));
                 }
                 if widgets::icon_button(ui, Icon::Open, b, false, "Open a mesh or scene").clicked() {
-                    actions.push(Action::Import);
+                    cx.actions.push(Action::Import);
                 }
                 if widgets::icon_button(ui, Icon::Save, b, false, "Export the active mesh").clicked()
                 {
-                    actions.push(Action::Export);
+                    cx.actions.push(Action::Export);
                 }
-                separator(ui, height);
+                separator(ui, height, p);
 
                 let can_undo = s.history.can_undo();
                 let can_redo = s.history.can_redo();
                 ui.add_enabled_ui(can_undo, |ui| {
                     if widgets::icon_button(ui, Icon::Undo, b, false, "Undo   Ctrl+Z").clicked() {
-                        actions.push(Action::Undo);
+                        cx.actions.push(Action::Undo);
                     }
                 });
                 ui.add_enabled_ui(can_redo, |ui| {
                     if widgets::icon_button(ui, Icon::Redo, b, false, "Redo   Ctrl+Shift+Z")
                         .clicked()
                     {
-                        actions.push(Action::Redo);
+                        cx.actions.push(Action::Redo);
                     }
                 });
-                separator(ui, height);
+                separator(ui, height, p);
 
                 // Symmetry: one toggle plus the plane it works on.
                 if widgets::icon_button(ui, Icon::Symmetry, b, s.symmetry, "Symmetry   X").clicked()
                 {
                     s.symmetry = !s.symmetry;
                 }
-                let axis_labels = ["X", "Y", "Z"];
                 let current = s.symmetry_axis.index();
                 ui.scope(|ui| {
-                    ui.set_width(if st.touch { 130.0 } else { 96.0 });
-                    if let Some(i) = widgets::segmented(ui, &axis_labels, current, b * 0.72) {
+                    ui.set_width(b * 2.4);
+                    if let Some(i) = widgets::segmented(ui, &["X", "Y", "Z"], current, b * 0.72) {
                         s.symmetry_axis = Axis::ALL[i];
                         s.symmetry = true;
                     }
                 });
-                separator(ui, height);
+                separator(ui, height, p);
 
-                if widgets::icon_button(ui, Icon::Grid, b, st.settings.grid, "Ground grid").clicked()
+                if widgets::icon_button(ui, Icon::Grid, b, st.settings.grid, "Ground grid   G")
+                    .clicked()
                 {
                     st.settings.grid = !st.settings.grid;
                 }
@@ -289,14 +311,14 @@ fn top_bar(
                 if widgets::icon_button(ui, Icon::FrameView, b, false, "Frame the model   F")
                     .clicked()
                 {
-                    actions.push(Action::FrameView);
+                    cx.actions.push(Action::FrameView);
                 }
                 if widgets::icon_button(
                     ui,
                     Icon::Camera,
                     b,
                     cam.projection == Projection::Orthographic,
-                    "Orthographic view",
+                    "Orthographic view   Numpad 5",
                 )
                 .clicked()
                 {
@@ -313,18 +335,19 @@ fn top_bar(
                         Icon::Menu,
                         b,
                         st.show_panel,
-                        "Show or hide the panel   Tab",
+                        "Show or hide the dock   Tab",
                     )
                     .clicked()
                     {
                         st.show_panel = !st.show_panel;
                     }
-                    if widgets::icon_button(ui, Icon::Settings, b, st.touch, "Touch layout")
+                    if widgets::icon_button(ui, Icon::Settings, b, st.theme.touch, "Touch layout")
                         .clicked()
                     {
-                        st.touch = !st.touch;
+                        st.theme.touch = !st.theme.touch;
                     }
-                    if widgets::icon_button(ui, Icon::Pin, b, st.show_help, "Shortcuts   H").clicked()
+                    if widgets::icon_button(ui, Icon::Pin, b, st.show_help, "Shortcuts   H")
+                        .clicked()
                     {
                         st.show_help = !st.show_help;
                     }
@@ -332,21 +355,21 @@ fn top_bar(
                         egui::RichText::new(format!("{:>3.0} fps", st.fps))
                             .small()
                             .monospace()
-                            .color(if st.fps < 25.0 { Palette::WARN } else { Palette::FAINT }),
+                            .color(if st.fps < 25.0 { p.warn } else { p.faint }),
                     );
                 });
             });
         });
 }
 
-fn separator(ui: &mut egui::Ui, height: f32) {
+fn separator(ui: &mut egui::Ui, height: f32, p: Palette) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(9.0, height * 0.45), Sense::hover());
     ui.painter().line_segment(
         [
             egui::pos2(rect.center().x, rect.top()),
             egui::pos2(rect.center().x, rect.bottom()),
         ],
-        Stroke::new(1.0, Palette::LINE),
+        Stroke::new(1.0, p.line),
     );
 }
 
@@ -354,20 +377,34 @@ fn separator(ui: &mut egui::Ui, height: f32) {
 // brush rail
 // ---------------------------------------------------------------------------
 
-fn brush_rail(root: &mut egui::Ui, s: &mut Sculptor, m: &Metrics) {
-    let width = m.tool + m.pad * 2.0;
-    egui::Panel::left("rail")
-        .exact_size(width)
+fn brush_rail(root: &mut egui::Ui, s: &mut Sculptor, st: &UiState, cx: &Ctx) {
+    let (p, m) = (cx.p, cx.m);
+    let side = st.theme.rail_side;
+    let horizontal = side.is_horizontal();
+    // A horizontal rail has no room for labels, so it uses square chips.
+    let chip = m.tool * 0.82;
+    let thickness = if horizontal {
+        chip + m.pad * 2.0
+    } else {
+        m.tool + m.pad * 2.0
+    };
+
+    dock("rail", side)
+        .exact_size(thickness)
         .frame(
             Frame::new()
-                .fill(Palette::PANEL)
+                .fill(p.panel)
                 .inner_margin(Margin::same(m.pad as i8)),
         )
         .show(root, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 4.0;
+            let scroll = if horizontal {
+                egui::ScrollArea::horizontal()
+            } else {
+                egui::ScrollArea::vertical()
+            };
+            scroll.auto_shrink([false, false]).show(ui, |ui| {
+                let build = |ui: &mut egui::Ui, s: &mut Sculptor| {
+                    ui.spacing_mut().item_spacing = Vec2::splat(4.0);
                     for (i, kind) in BrushKind::ALL.iter().enumerate() {
                         let selected = s.brush.kind == *kind;
                         let tip = format!(
@@ -376,20 +413,31 @@ fn brush_rail(root: &mut egui::Ui, s: &mut Sculptor, m: &Metrics) {
                             kind.hint(),
                             shortcut_for(i)
                         );
-                        if widgets::tool_tile(
-                            ui,
-                            Icon::of_brush(*kind),
-                            kind.label(),
-                            m.tool,
-                            selected,
-                            &tip,
-                        )
-                        .clicked()
-                        {
+                        let clicked = if horizontal {
+                            widgets::tool_chip(ui, Icon::of_brush(*kind), chip, selected, &tip)
+                                .clicked()
+                        } else {
+                            widgets::tool_tile(
+                                ui,
+                                Icon::of_brush(*kind),
+                                kind.label(),
+                                m.tool,
+                                selected,
+                                &tip,
+                            )
+                            .clicked()
+                        };
+                        if clicked {
                             s.set_brush_kind(*kind);
                         }
                     }
-                });
+                };
+                if horizontal {
+                    ui.horizontal_centered(|ui| build(ui, s));
+                } else {
+                    build(ui, s);
+                }
+            });
         });
 }
 
@@ -406,25 +454,24 @@ pub fn shortcut_for(index: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// side panel
+// settings dock
 // ---------------------------------------------------------------------------
 
-fn side_panel(
+fn settings_dock(
     root: &mut egui::Ui,
     s: &mut Sculptor,
     st: &mut UiState,
     cam: &mut Camera,
-    m: &Metrics,
-    actions: &mut Vec<Action>,
+    cx: &mut Ctx,
 ) {
-    let default = if st.touch { 344.0 } else { 300.0 };
-    egui::Panel::right("panel")
-        .default_size(default)
-        .size_range(250.0..=480.0)
+    let (p, m) = (cx.p, cx.m);
+    dock("panel", st.theme.panel_side)
+        .default_size(m.panel_width)
+        .size_range(200.0..=680.0)
         .resizable(true)
         .frame(
             Frame::new()
-                .fill(Palette::PANEL)
+                .fill(p.panel)
                 .inner_margin(Margin::same(m.pad as i8)),
         )
         .show(root, |ui| {
@@ -438,29 +485,25 @@ fn side_panel(
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match st.tab {
-                    Tab::Brush => brush_tab(ui, s, st, m, actions),
-                    Tab::Model => model_tab(ui, s, st, m, actions),
-                    Tab::Scene => scene_tab(ui, s, st, m, actions),
-                    Tab::View => view_tab(ui, st, cam, m, actions),
+                    Tab::Brush => brush_tab(ui, s, st, cx),
+                    Tab::Model => model_tab(ui, s, st, cx),
+                    Tab::Scene => scene_tab(ui, s, st, cx),
+                    Tab::View => view_tab(ui, st, cam, cx),
+                    Tab::Interface => interface_tab(ui, st, cx),
                 });
         });
 }
 
-fn brush_tab(
-    ui: &mut egui::Ui,
-    s: &mut Sculptor,
-    st: &mut UiState,
-    m: &Metrics,
-    actions: &mut Vec<Action>,
-) {
+fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
     let kind = s.brush.kind;
     ui.label(
         egui::RichText::new(kind.label())
             .strong()
-            .size(if st.touch { 17.0 } else { 15.0 })
-            .color(Palette::TEXT),
+            .size(m.row * 0.5)
+            .color(p.text),
     );
-    ui.label(egui::RichText::new(kind.hint()).small().color(Palette::DIM));
+    ui.label(egui::RichText::new(kind.hint()).small().color(p.dim));
     ui.add_space(6.0);
 
     BigSlider::new(&mut s.brush.radius, 0.005..=1.5, "Radius")
@@ -485,7 +528,7 @@ fn brush_tab(
     if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
         s.brush.falloff = Falloff::ALL[i];
     }
-    falloff_preview(ui, s.brush.falloff, m);
+    falloff_preview(ui, s.brush.falloff, &m, p);
 
     widgets::section_title(ui, "BEHAVIOUR");
     widgets::toggle(ui, &mut s.brush.culling, "Front faces only", m.row);
@@ -510,7 +553,7 @@ fn brush_tab(
             s.brush.paint_color.y,
             s.brush.paint_color.z,
         ];
-        if widgets::color_row(ui, &mut rgb, m.row).changed() {
+        if widgets::color_row(ui, "Colour", &mut rgb, m.row).changed() {
             s.brush.paint_color = glam::Vec3::from_array(rgb);
         }
         widgets::toggle(ui, &mut s.brush.paint_albedo, "Paint colour", m.row);
@@ -533,27 +576,27 @@ fn brush_tab(
         )
         .clicked()
         {
-            actions.push(Action::PickColorMode);
+            cx.actions.push(Action::PickColorMode);
         }
     }
 
     if kind == BrushKind::Mask {
         widgets::section_title(ui, "MASK");
-        mask_controls(ui, st, m, actions);
+        mask_controls(ui, st, cx);
     }
 
     ui.add_space(8.0);
     if widgets::wide_button(ui, Icon::Reset, "Reset every tool", m.row, false).clicked() {
-        actions.push(Action::ResetBrushes);
+        cx.actions.push(Action::ResetBrushes);
     }
 }
 
 /// Little curve showing what the selected falloff does.
-fn falloff_preview(ui: &mut egui::Ui, falloff: Falloff, m: &Metrics) {
+fn falloff_preview(ui: &mut egui::Ui, falloff: Falloff, m: &Metrics, p: Palette) {
     let h = m.row * 1.3;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(9), Palette::BG);
+    painter.rect_filled(rect, CornerRadius::same(m.radius), p.bg);
     let pts: Vec<egui::Pos2> = (0..=48)
         .map(|i| {
             let t = i as f32 / 48.0;
@@ -564,33 +607,34 @@ fn falloff_preview(ui: &mut egui::Ui, falloff: Falloff, m: &Metrics) {
             )
         })
         .collect();
-    painter.add(egui::Shape::line(pts, Stroke::new(1.8, Palette::ACCENT)));
+    painter.add(egui::Shape::line(pts, Stroke::new(1.8, p.accent)));
 }
 
-fn mask_controls(ui: &mut egui::Ui, st: &mut UiState, m: &Metrics, actions: &mut Vec<Action>) {
+fn mask_controls(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
+    let m = cx.m;
     let (clear, invert) = two_up(
         ui,
-        m,
-        |ui| button(ui, Icon::Close, "Clear", m),
-        |ui| button(ui, Icon::Mirror, "Invert", m),
+        &m,
+        |ui| button(ui, Icon::Close, "Clear", &m),
+        |ui| button(ui, Icon::Mirror, "Invert", &m),
     );
     if clear {
-        actions.push(Action::ClearMask);
+        cx.actions.push(Action::ClearMask);
     }
     if invert {
-        actions.push(Action::InvertMask);
+        cx.actions.push(Action::InvertMask);
     }
     let (blur, sharpen) = two_up(
         ui,
-        m,
-        |ui| button(ui, Icon::Smooth, "Blur", m),
-        |ui| button(ui, Icon::Crease, "Sharpen", m),
+        &m,
+        |ui| button(ui, Icon::Smooth, "Blur", &m),
+        |ui| button(ui, Icon::Crease, "Sharpen", &m),
     );
     if blur {
-        actions.push(Action::FilterMask(0.5));
+        cx.actions.push(Action::FilterMask(0.5));
     }
     if sharpen {
-        actions.push(Action::FilterMask(-0.5));
+        cx.actions.push(Action::FilterMask(-0.5));
     }
     widgets::toggle(ui, &mut st.settings.show_mask, "Show the mask", m.row);
     BigSlider::new(&mut st.extract_thickness, 0.005..=0.4, "Extract thickness")
@@ -599,7 +643,7 @@ fn mask_controls(ui: &mut egui::Ui, st: &mut UiState, m: &Metrics, actions: &mut
         .height(m.row)
         .show(ui);
     if widgets::wide_button(ui, Icon::Duplicate, "Extract to a new object", m.row, false).clicked() {
-        actions.push(Action::ExtractMask);
+        cx.actions.push(Action::ExtractMask);
     }
 }
 
@@ -611,7 +655,7 @@ fn two_up<A, B>(
     right: impl FnOnce(&mut egui::Ui) -> B,
 ) -> (A, B) {
     ui.horizontal(|ui| {
-        let w = ((ui.available_width() - m.gap) * 0.5).max(40.0);
+        let w = ((ui.available_width() - m.gap) * 0.5).max(36.0);
         let a = ui.scope(|ui| {
             ui.set_width(w);
             left(ui)
@@ -630,13 +674,8 @@ fn button(ui: &mut egui::Ui, icon: Icon, text: &str, m: &Metrics) -> bool {
     widgets::wide_button(ui, icon, text, m.row, false).clicked()
 }
 
-fn model_tab(
-    ui: &mut egui::Ui,
-    s: &mut Sculptor,
-    st: &mut UiState,
-    m: &Metrics,
-    actions: &mut Vec<Action>,
-) {
+fn model_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
     widgets::section_title(ui, "DYNAMIC TOPOLOGY");
     widgets::toggle(ui, &mut s.dyntopo_enabled, "Dynamic topology", m.row);
     let enabled = s.dyntopo_enabled;
@@ -664,90 +703,72 @@ fn model_tab(
     widgets::toggle(ui, &mut st.subdivide_smooth, "Smooth subdivision (Loop)", m.row);
     if widgets::wide_button(ui, Icon::Subdivide, "Subdivide the whole mesh", m.row, false).clicked()
     {
-        actions.push(Action::Subdivide(st.subdivide_smooth));
+        cx.actions.push(Action::Subdivide(st.subdivide_smooth));
     }
     BigSlider::new(&mut st.decimate_ratio, 0.05..=0.95, "Keep")
         .decimals(2)
         .height(m.row)
         .show(ui);
     if widgets::wide_button(ui, Icon::Decimate, "Decimate", m.row, false).clicked() {
-        actions.push(Action::Decimate);
+        cx.actions.push(Action::Decimate);
     }
 
     widgets::section_title(ui, "VOXEL REMESH");
-    let mut res = st.remesh.resolution as f32;
-    if BigSlider::new(&mut res, 24.0..=350.0, "Resolution")
-        .decimals(0)
-        .height(m.row)
-        .show(ui)
-        .changed()
-    {
-        st.remesh.resolution = res as u32;
-    }
-    let mut smooth = st.remesh.smoothing as f32;
-    if BigSlider::new(&mut smooth, 0.0..=6.0, "Smoothing passes")
-        .decimals(0)
-        .height(m.row)
-        .show(ui)
-        .changed()
-    {
-        st.remesh.smoothing = smooth as u32;
-    }
+    widgets::int_slider(ui, "Resolution", &mut st.remesh.resolution, 24..=350, &m);
+    widgets::int_slider(ui, "Smoothing passes", &mut st.remesh.smoothing, 0..=6, &m);
     widgets::toggle(ui, &mut st.remesh.transfer_colors, "Keep colours", m.row);
     if widgets::wide_button(ui, Icon::Remesh, "Remesh", m.row, false).clicked() {
-        actions.push(Action::Remesh);
+        cx.actions.push(Action::Remesh);
     }
 
     widgets::section_title(ui, "REPAIR");
     if widgets::wide_button(ui, Icon::CloseHoles, "Close holes", m.row, false).clicked() {
-        actions.push(Action::CloseHoles);
+        cx.actions.push(Action::CloseHoles);
     }
     if widgets::wide_button(ui, Icon::Smooth, "Relax the whole mesh", m.row, false).clicked() {
-        actions.push(Action::SmoothAll);
+        cx.actions.push(Action::SmoothAll);
     }
 
     widgets::section_title(ui, "SYMMETRY TOOLS");
     ui.horizontal(|ui| {
-        let w = (ui.available_width() - m.gap * 2.0) / 3.0;
+        let w = ((ui.available_width() - m.gap * 2.0) / 3.0).max(36.0);
         for axis in Axis::ALL {
-            ui.scope(|ui| {
-                ui.set_width(w.max(40.0));
-                if widgets::wide_button(ui, Icon::Mirror, axis.label(), m.row, false).clicked() {
-                    actions.push(Action::Mirror(axis));
-                }
-            });
+            let hit = ui
+                .scope(|ui| {
+                    ui.set_width(w);
+                    widgets::wide_button(ui, Icon::Mirror, axis.label(), m.row, false).clicked()
+                })
+                .inner;
+            if hit {
+                cx.actions.push(Action::Mirror(axis));
+            }
         }
     });
     ui.label(
         egui::RichText::new("Symmetrize replaces one half with the mirror of the other.")
             .small()
-            .color(Palette::DIM),
+            .color(p.dim),
     );
     let axis = s.symmetry_axis;
     let (keep_plus, keep_minus) = two_up(
         ui,
-        m,
-        |ui| button(ui, Icon::Symmetry, "Keep +", m),
-        |ui| button(ui, Icon::Symmetry, "Keep -", m),
+        &m,
+        |ui| button(ui, Icon::Symmetry, "Keep +", &m),
+        |ui| button(ui, Icon::Symmetry, "Keep -", &m),
     );
     if keep_plus {
-        actions.push(Action::Symmetrize(axis, true));
+        cx.actions.push(Action::Symmetrize(axis, true));
     }
     if keep_minus {
-        actions.push(Action::Symmetrize(axis, false));
+        cx.actions.push(Action::Symmetrize(axis, false));
     }
 
     widgets::section_title(ui, "MASK");
-    mask_controls(ui, st, m, actions);
+    mask_controls(ui, st, cx);
 }
 
-fn scene_tab(
-    ui: &mut egui::Ui,
-    s: &mut Sculptor,
-    st: &mut UiState,
-    m: &Metrics,
-    actions: &mut Vec<Action>,
-) {
+fn scene_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
     widgets::section_title(ui, "OBJECTS");
     let active = s.scene.active;
     let count = s.scene.objects.len();
@@ -760,80 +781,78 @@ fn scene_tab(
         ui.horizontal(|ui| {
             let icon = if visible { Icon::Eye } else { Icon::EyeOff };
             if widgets::icon_button(ui, icon, m.row, false, "Visibility").clicked() {
-                actions.push(Action::ToggleVisible(i));
+                cx.actions.push(Action::ToggleVisible(i));
             }
             let remaining = ui.available_width() - (m.row + m.gap) * 2.0;
-            ui.scope(|ui| {
-                ui.set_width(remaining.max(60.0));
-                if widgets::wide_button(ui, Icon::Remesh, &name, m.row, selected).clicked() {
-                    actions.push(Action::SelectObject(i));
-                }
-            });
+            let hit = ui
+                .scope(|ui| {
+                    ui.set_width(remaining.max(50.0));
+                    widgets::wide_button(ui, Icon::Remesh, &name, m.row, selected).clicked()
+                })
+                .inner;
+            if hit {
+                cx.actions.push(Action::SelectObject(i));
+            }
             if widgets::icon_button(ui, Icon::Duplicate, m.row, false, "Duplicate").clicked() {
-                actions.push(Action::DuplicateObject(i));
+                cx.actions.push(Action::DuplicateObject(i));
             }
             ui.add_enabled_ui(count > 1, |ui| {
                 if widgets::icon_button(ui, Icon::Trash, m.row, false, "Delete").clicked() {
-                    actions.push(Action::DeleteObject(i));
+                    cx.actions.push(Action::DeleteObject(i));
                 }
             });
         });
     }
 
     ui.add_space(4.0);
-    ui.add_enabled_ui(count > 1, |ui| {
-        if widgets::wide_button(ui, Icon::Remesh, "Merge everything visible", m.row, false).clicked()
-        {
-            actions.push(Action::MergeVisible);
-        }
-    });
+    let merge = ui
+        .add_enabled_ui(count > 1, |ui| {
+            widgets::wide_button(ui, Icon::Remesh, "Merge everything visible", m.row, false)
+                .clicked()
+        })
+        .inner;
+    if merge {
+        cx.actions.push(Action::MergeVisible);
+    }
 
     widgets::section_title(ui, "ADD");
     let current = Primitive::ALL
         .iter()
-        .position(|p| *p == st.add_primitive)
+        .position(|x| *x == st.add_primitive)
         .unwrap_or(0);
     egui::ComboBox::from_id_salt("prim")
         .selected_text(Primitive::ALL[current].label())
         .width(ui.available_width())
         .show_ui(ui, |ui| {
-            for p in Primitive::ALL {
-                ui.selectable_value(&mut st.add_primitive, p, p.label());
+            for x in Primitive::ALL {
+                ui.selectable_value(&mut st.add_primitive, x, x.label());
             }
         });
     let prim = st.add_primitive;
     let (add, replace) = two_up(
         ui,
-        m,
-        |ui| button(ui, Icon::Plus, "Add", m),
-        |ui| button(ui, Icon::New, "Replace", m),
+        &m,
+        |ui| button(ui, Icon::Plus, "Add", &m),
+        |ui| button(ui, Icon::New, "Replace", &m),
     );
     if add {
-        actions.push(Action::AddObject(prim));
+        cx.actions.push(Action::AddObject(prim));
     }
     if replace {
-        actions.push(Action::New(prim));
+        cx.actions.push(Action::New(prim));
     }
 
     widgets::section_title(ui, "PLACEMENT");
     if let Some(o) = s.scene.active_mut() {
-        let mut p = o.transform.position;
+        let mut pos = o.transform.position;
         let mut moved = false;
-        moved |= BigSlider::new(&mut p.x, -3.0..=3.0, "X")
-            .decimals(3)
-            .height(m.row)
-            .show(ui)
-            .changed();
-        moved |= BigSlider::new(&mut p.y, -3.0..=3.0, "Y")
-            .decimals(3)
-            .height(m.row)
-            .show(ui)
-            .changed();
-        moved |= BigSlider::new(&mut p.z, -3.0..=3.0, "Z")
-            .decimals(3)
-            .height(m.row)
-            .show(ui)
-            .changed();
+        for (label, value) in [("X", &mut pos.x), ("Y", &mut pos.y), ("Z", &mut pos.z)] {
+            moved |= BigSlider::new(value, -3.0..=3.0, label)
+                .decimals(3)
+                .height(m.row)
+                .show(ui)
+                .changed();
+        }
         let mut scale = o.transform.scale.x;
         let scaled = BigSlider::new(&mut scale, 0.05..=6.0, "Scale")
             .logarithmic(true)
@@ -842,48 +861,43 @@ fn scene_tab(
             .show(ui)
             .changed();
         if moved {
-            o.transform.position = p;
+            o.transform.position = pos;
         }
         if scaled {
             o.transform.scale = glam::Vec3::splat(scale);
         }
     }
     if widgets::wide_button(ui, Icon::Pin, "Bake the placement in", m.row, false).clicked() {
-        actions.push(Action::ApplyTransform);
+        cx.actions.push(Action::ApplyTransform);
     }
 
     widgets::section_title(ui, "FILES");
     if widgets::wide_button(ui, Icon::Open, "Import a mesh", m.row, false).clicked() {
-        actions.push(Action::Import);
+        cx.actions.push(Action::Import);
     }
     if widgets::wide_button(ui, Icon::Save, "Export the active mesh", m.row, false).clicked() {
-        actions.push(Action::Export);
+        cx.actions.push(Action::Export);
     }
     if widgets::wide_button(ui, Icon::Open, "Open a scene", m.row, false).clicked() {
-        actions.push(Action::OpenScene);
+        cx.actions.push(Action::OpenScene);
     }
     if widgets::wide_button(ui, Icon::Save, "Save the scene", m.row, false).clicked() {
-        actions.push(Action::SaveScene);
+        cx.actions.push(Action::SaveScene);
     }
     ui.label(
         egui::RichText::new("OBJ, PLY and STL for meshes; .sculpt keeps the whole scene.")
             .small()
-            .color(Palette::DIM),
+            .color(p.dim),
     );
 }
 
-fn view_tab(
-    ui: &mut egui::Ui,
-    st: &mut UiState,
-    cam: &mut Camera,
-    m: &Metrics,
-    actions: &mut Vec<Action>,
-) {
+fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
     widgets::section_title(ui, "SHADING");
-    let labels: Vec<&str> = Shading::ALL.iter().map(|s| s.label()).collect();
+    let labels: Vec<&str> = Shading::ALL.iter().map(|x| x.label()).collect();
     let current = Shading::ALL
         .iter()
-        .position(|s| *s == st.settings.shading)
+        .position(|x| *x == st.settings.shading)
         .unwrap_or(0);
     if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
         st.settings.shading = Shading::ALL[i];
@@ -894,9 +908,9 @@ fn view_tab(
             .selected_text(st.matcap.label())
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                for p in matcap::Preset::ALL {
-                    if ui.selectable_value(&mut st.matcap, p, p.label()).clicked() {
-                        actions.push(Action::MatcapChanged);
+                for preset in matcap::Preset::ALL {
+                    if ui.selectable_value(&mut st.matcap, preset, preset.label()).clicked() {
+                        cx.actions.push(Action::MatcapChanged);
                     }
                 }
             });
@@ -918,7 +932,7 @@ fn view_tab(
         ui.label(
             egui::RichText::new("This GPU has no line polygon mode.")
                 .small()
-                .color(Palette::DIM),
+                .color(p.dim),
         );
     }
     BigSlider::new(&mut st.settings.opacity, 0.15..=1.0, "Opacity")
@@ -927,7 +941,7 @@ fn view_tab(
         .show(ui);
 
     widgets::section_title(ui, "SCENE");
-    widgets::toggle(ui, &mut st.settings.grid, "Ground grid", m.row);
+    widgets::toggle(ui, &mut st.settings.grid, "Ground grid   G", m.row);
     let grid = st.settings.grid;
     ui.add_enabled_ui(grid, |ui| {
         BigSlider::new(&mut st.settings.grid_spacing, 0.02..=2.0, "Grid spacing")
@@ -936,16 +950,17 @@ fn view_tab(
             .height(m.row)
             .show(ui);
     });
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Background").small().color(Palette::DIM));
-        ui.color_edit_button_rgb(&mut st.settings.background_top);
-        ui.color_edit_button_rgb(&mut st.settings.background_bottom);
-    });
+    widgets::color_row(ui, "Background top", &mut st.settings.background_top, m.row);
+    widgets::color_row(
+        ui,
+        "Background bottom",
+        &mut st.settings.background_bottom,
+        m.row,
+    );
 
     widgets::section_title(ui, "CAMERA");
-    let proj_labels = ["Perspective", "Ortho"];
     let proj_current = if cam.projection == Projection::Perspective { 0 } else { 1 };
-    if let Some(i) = widgets::segmented(ui, &proj_labels, proj_current, m.row) {
+    if let Some(i) = widgets::segmented(ui, &["Perspective", "Ortho"], proj_current, m.row) {
         cam.projection = if i == 0 {
             Projection::Perspective
         } else {
@@ -977,40 +992,111 @@ fn view_tab(
     widgets::toggle(ui, &mut cam.invert_orbit_y, "Invert vertical orbit", m.row);
 
     ui.add_space(4.0);
-    ui.horizontal_wrapped(|ui| {
-        for preset in ViewPreset::ALL {
-            ui.scope(|ui| {
-                ui.set_width(if st.touch { 100.0 } else { 84.0 });
-                if widgets::wide_button(ui, Icon::Camera, preset.label(), m.row, false).clicked() {
-                    actions.push(Action::SetView(preset));
-                }
-            });
-        }
-    });
+    let preset_labels: Vec<&str> = ViewPreset::ALL.iter().map(|x| x.label()).collect();
+    if let Some(i) = widgets::segmented(ui, &preset_labels, usize::MAX, m.row) {
+        cx.actions.push(Action::SetView(ViewPreset::ALL[i]));
+    }
     if widgets::wide_button(ui, Icon::FrameView, "Frame the model   F", m.row, false).clicked() {
-        actions.push(Action::FrameView);
+        cx.actions.push(Action::FrameView);
     }
 
-    widgets::section_title(ui, "INTERFACE");
-    widgets::toggle(ui, &mut st.touch, "Touch layout", m.row);
-    widgets::toggle(ui, &mut st.show_rail, "Show the tool rail", m.row);
-    widgets::toggle(ui, &mut st.show_stats, "Show statistics", m.row);
-    BigSlider::new(&mut st.ui_scale, 0.7..=2.0, "Interface scale")
+    widgets::section_title(ui, "ANTI-ALIASING");
+    let msaa_ok = st.msaa_available;
+    let picked = ui
+        .add_enabled_ui(msaa_ok, |ui| {
+            let counts = [1u32, 2, 4, 8];
+            let current = counts.iter().position(|c| *c == st.sample_count).unwrap_or(2);
+            widgets::segmented(ui, &["Off", "2x", "4x", "8x"], current, m.row)
+                .map(|i| counts[i])
+        })
+        .inner;
+    if let Some(n) = picked {
+        st.sample_count = n;
+        cx.actions.push(Action::SampleCountChanged(n));
+    }
+}
+
+fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
+    let t = &mut st.theme;
+
+    widgets::section_title(ui, "COLOUR");
+    let preset_labels: Vec<&str> = ColorPreset::ALL.iter().map(|x| x.label()).collect();
+    let current = ColorPreset::ALL
+        .iter()
+        .position(|x| x.accent() == t.accent)
+        .unwrap_or(usize::MAX);
+    if let Some(i) = widgets::segmented(ui, &preset_labels, current, m.row) {
+        t.accent = ColorPreset::ALL[i].accent();
+    }
+    widgets::color_row(ui, "Accent", &mut t.accent, m.row);
+    widgets::color_row(ui, "Background", &mut t.base, m.row);
+    widgets::color_row(ui, "Text", &mut t.text, m.row);
+    BigSlider::new(&mut t.contrast, 0.0..=1.0, "Contrast")
         .decimals(2)
         .height(m.row)
         .show(ui);
 
-    widgets::section_title(ui, "ANTI-ALIASING");
-    let msaa_ok = st.msaa_available;
-    ui.add_enabled_ui(msaa_ok, |ui| {
-        let labels = ["Off", "2x", "4x", "8x"];
-        let counts = [1u32, 2, 4, 8];
-        let current = counts.iter().position(|c| *c == st.sample_count).unwrap_or(2);
-        if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
-            st.sample_count = counts[i];
-            actions.push(Action::SampleCountChanged(counts[i]));
-        }
-    });
+    widgets::section_title(ui, "SIZE");
+    widgets::toggle(ui, &mut t.touch, "Touch layout", m.row);
+    BigSlider::new(&mut t.ui_scale, 0.6..=2.2, "Interface scale")
+        .decimals(2)
+        .height(m.row)
+        .show(ui);
+    BigSlider::new(&mut t.text_scale, 0.7..=1.8, "Text size")
+        .decimals(2)
+        .height(m.row)
+        .show(ui);
+    BigSlider::new(&mut t.icon_scale, 0.6..=1.6, "Icon size")
+        .decimals(2)
+        .height(m.row)
+        .show(ui);
+    BigSlider::new(&mut t.tool_size, 32.0..=96.0, "Tool tile")
+        .decimals(0)
+        .height(m.row)
+        .show(ui);
+    BigSlider::new(&mut t.row_height, 22.0..=64.0, "Row height")
+        .decimals(0)
+        .height(m.row)
+        .show(ui);
+    BigSlider::new(&mut t.panel_width, 220.0..=560.0, "Dock width")
+        .decimals(0)
+        .height(m.row)
+        .show(ui);
+    let mut radius = t.corner_radius as f32;
+    if BigSlider::new(&mut radius, 0.0..=20.0, "Corner radius")
+        .decimals(0)
+        .height(m.row)
+        .show(ui)
+        .changed()
+    {
+        t.corner_radius = radius as u8;
+    }
+    BigSlider::new(&mut t.scrollbar, 6.0..=22.0, "Scroll bar")
+        .decimals(0)
+        .height(m.row)
+        .show(ui);
+
+    widgets::section_title(ui, "LAYOUT");
+    ui.label(egui::RichText::new("Tool rail").small().color(p.dim));
+    let side_labels: Vec<&str> = Side::ALL.iter().map(|x| x.label()).collect();
+    let current = Side::ALL.iter().position(|x| *x == t.rail_side).unwrap_or(0);
+    if let Some(i) = widgets::segmented(ui, &side_labels, current, m.row) {
+        t.rail_side = Side::ALL[i];
+    }
+    ui.label(egui::RichText::new("Settings dock").small().color(p.dim));
+    let dock_labels: Vec<&str> = Side::SIDES.iter().map(|x| x.label()).collect();
+    let current = Side::SIDES.iter().position(|x| *x == t.panel_side).unwrap_or(1);
+    if let Some(i) = widgets::segmented(ui, &dock_labels, current, m.row) {
+        t.panel_side = Side::SIDES[i];
+    }
+    widgets::toggle(ui, &mut st.show_rail, "Show the tool rail", m.row);
+    widgets::toggle(ui, &mut st.show_stats, "Show statistics", m.row);
+
+    ui.add_space(8.0);
+    if widgets::wide_button(ui, Icon::Reset, "Reset the theme", m.row, false).clicked() {
+        cx.actions.push(Action::ResetTheme);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,7 +1108,7 @@ fn viewport_overlay(
     s: &Sculptor,
     st: &mut UiState,
     overlay: &Overlay,
-    actions: &mut Vec<Action>,
+    p: Palette,
 ) {
     let ctx = root.ctx().clone();
     let painter = ctx.layer_painter(egui::LayerId::new(
@@ -1033,7 +1119,7 @@ fn viewport_overlay(
     // Brush cursor: outer ring is the radius, inner ring the strength.
     if let Some((pos, radius)) = overlay.cursor {
         let accent = if overlay.stroking {
-            Palette::ACCENT
+            p.accent
         } else {
             Color32::from_white_alpha(200)
         };
@@ -1063,25 +1149,21 @@ fn viewport_overlay(
             Align2::LEFT_BOTTOM,
             text,
             egui::FontId::monospace(11.0),
-            Palette::FAINT,
+            p.faint,
         );
     }
 
     // Transient status message, bottom centre.
     if !st.status.is_empty() && st.status_age < 4.0 {
         let alpha = (4.0 - st.status_age).clamp(0.0, 1.0);
-        let color = Palette::TEXT.gamma_multiply(alpha);
+        let color = p.text.gamma_multiply(alpha);
         let galley =
             painter.layout_no_wrap(st.status.clone(), egui::FontId::proportional(13.0), color);
         let bg = egui::Rect::from_center_size(
             egui::pos2(rect.center().x, rect.bottom() - 26.0),
             galley.size() + Vec2::new(22.0, 12.0),
         );
-        painter.rect_filled(
-            bg,
-            CornerRadius::same(10),
-            Palette::RAISED.gamma_multiply(alpha * 0.95),
-        );
+        painter.rect_filled(bg, CornerRadius::same(10), p.raised.gamma_multiply(alpha * 0.95));
         painter.galley(
             egui::pos2(
                 bg.center().x - galley.size().x * 0.5,
@@ -1093,12 +1175,11 @@ fn viewport_overlay(
     }
 
     if st.show_help {
-        help_window(&ctx, st);
+        help_window(&ctx, st, p);
     }
-    let _ = actions;
 }
 
-fn help_window(ctx: &egui::Context, st: &mut UiState) {
+fn help_window(ctx: &egui::Context, st: &mut UiState, p: Palette) {
     let mut open = st.show_help;
     egui::Window::new("Shortcuts")
         .open(&mut open)
@@ -1107,14 +1188,15 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
         .frame(
             Frame::window(&ctx.style_of(egui::Theme::Dark))
-                .fill(Palette::PANEL)
-                .stroke(Stroke::new(1.0, Palette::LINE)),
+                .fill(p.panel)
+                .stroke(Stroke::new(1.0, p.line)),
         )
         .show(ctx, |ui| {
             let rows: [(&str, &str); 15] = [
-                ("Left mouse / one finger", "Sculpt"),
+                ("Left mouse, one finger", "Sculpt"),
                 ("Middle or right mouse", "Orbit"),
-                ("Two fingers", "Orbit, pan and pinch to zoom"),
+                ("Two fingers", "Orbit, pinch to zoom, drag together to pan"),
+                ("Three fingers", "Pan"),
                 ("Shift + middle mouse", "Pan"),
                 ("Wheel", "Zoom"),
                 ("Alt + left mouse", "Orbit without sculpting"),
@@ -1123,23 +1205,17 @@ fn help_window(ctx: &egui::Context, st: &mut UiState) {
                 ("[ and ]", "Brush radius"),
                 ("- and =", "Brush strength"),
                 ("1 to 0, Shift+1..3", "Pick a tool"),
-                ("X / W / F", "Symmetry, wireframe, frame the model"),
-                ("Tab", "Show or hide the panel"),
-                ("Ctrl+Z / Ctrl+Shift+Z", "Undo and redo"),
-                ("Numpad 1 / 3 / 7", "Front, right and top views"),
+                ("X / W / G / F", "Symmetry, wireframe, grid, frame"),
+                ("Tab / H", "Dock, shortcuts"),
+                ("Numpad 1 / 3 / 7 / 5", "Front, right, top, orthographic"),
             ];
             for (key, what) in rows {
                 ui.horizontal(|ui| {
                     ui.scope(|ui| {
-                        ui.set_width(200.0);
-                        ui.label(
-                            egui::RichText::new(key)
-                                .monospace()
-                                .small()
-                                .color(Palette::ACCENT),
-                        );
+                        ui.set_width(210.0);
+                        ui.label(egui::RichText::new(key).monospace().small().color(p.accent));
                     });
-                    ui.label(egui::RichText::new(what).small().color(Palette::TEXT));
+                    ui.label(egui::RichText::new(what).small().color(p.text));
                 });
             }
         });
