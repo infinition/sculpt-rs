@@ -26,7 +26,17 @@ pub enum NavAction {
     Frame,
     ToggleProjection,
     ToggleLock,
+    /// Drag on the ball, in points, to be spun into an orbit.
+    Orbit(Vec2),
 }
+
+/// How far the pointer may wander before a press counts as a drag rather than
+/// a click. Small enough that a deliberate spin registers at once, large enough
+/// that a tap on an axis is not stolen by a shaking hand.
+const DRAG_SLOP: f32 = 3.0;
+/// Dragging the ball turns the model a little faster than dragging the
+/// viewport: the ball is small, and the wrist travel available is short.
+const BALL_ORBIT_GAIN: f32 = 1.6;
 
 pub struct NavWidget {
     /// Diameter of the ball, in points.
@@ -36,6 +46,9 @@ pub struct NavWidget {
     pressed_at: Option<f64>,
     /// Ball the press started on, if any.
     pressed_axis: Option<usize>,
+    /// Set once the press has travelled far enough to be a spin, which rules
+    /// out both the tap and the hold.
+    spinning: bool,
 }
 
 impl Default for NavWidget {
@@ -45,6 +58,7 @@ impl Default for NavWidget {
             show_buttons: true,
             pressed_at: None,
             pressed_axis: None,
+            spinning: false,
         }
     }
 }
@@ -232,33 +246,57 @@ impl NavWidget {
             );
         }
 
-        // Press, hold and release: a hold toggles the lock, a tap on a ball
-        // swings the view round to it.
+        // One press, three possible meanings, resolved by what happens next:
+        // move and it spins the model, wait and it locks the view, do neither
+        // and let go on an axis to swing round to it.
         let now = ui.input(|i| i.time);
-        if response.drag_started() || response.is_pointer_button_down_on() && self.pressed_at.is_none()
-        {
+        if response.is_pointer_button_down_on() && self.pressed_at.is_none() {
             self.pressed_at = Some(now);
             self.pressed_axis = hot;
+            self.spinning = false;
         }
+
         let mut action = None;
         if let Some(started) = self.pressed_at {
-            let held = now - started;
-            if held > HOLD_SECONDS {
-                // Show the lock arming as a ring closing around the ball.
-                painter.circle_stroke(center, radius - 2.0, Stroke::new(2.0, p.accent));
+            let travel = response.drag_delta();
+            if !self.spinning && travel.length() > DRAG_SLOP {
+                self.spinning = true;
             }
-            if !response.is_pointer_button_down_on() {
+            if self.spinning {
+                if travel != Vec2::ZERO {
+                    action = Some(NavAction::Orbit(travel * BALL_ORBIT_GAIN));
+                }
+                painter.circle_stroke(
+                    center,
+                    radius - 2.0,
+                    Stroke::new(1.5, p.accent.gamma_multiply(0.6)),
+                );
+            } else {
+                let held = now - started;
                 if held > HOLD_SECONDS {
-                    action = Some(NavAction::ToggleLock);
-                } else if let Some(i) = self.pressed_axis {
-                    action = Some(NavAction::View(balls[i].5));
+                    // Show the lock arming as a ring closing around the ball.
+                    painter.circle_stroke(center, radius - 2.0, Stroke::new(2.0, p.accent));
+                }
+            }
+
+            if !response.is_pointer_button_down_on() {
+                if !self.spinning {
+                    let held = now - started;
+                    if held > HOLD_SECONDS {
+                        action = Some(NavAction::ToggleLock);
+                    } else if let Some(i) = self.pressed_axis {
+                        action = Some(NavAction::View(balls[i].5));
+                    }
                 }
                 self.pressed_at = None;
                 self.pressed_axis = None;
+                self.spinning = false;
             }
         }
         if response.hovered() && action.is_none() {
-            response.on_hover_text("Click an axis to swing round to it.\nHold to lock the view.");
+            response.on_hover_text(
+                "Drag to spin the view.\nClick an axis to swing round to it.\nHold to lock.",
+            );
         }
         action
     }

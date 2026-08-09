@@ -9,6 +9,7 @@ mod navwidget;
 mod renderer;
 mod theme;
 mod ui;
+mod wheel;
 mod widgets;
 
 use camera::{Camera, Projection, ViewPreset};
@@ -1171,8 +1172,13 @@ impl ApplicationHandler for App {
                     MouseButton::Left => {
                         st.input.lmb = down;
                         if down {
-                            // The gizmo gets first refusal, then the brush.
-                            if !egui_captured && !st.input.alt && !st.gizmo_press() {
+                            // The radial menu owns the pointer while it is up,
+                            // then the gizmo gets first refusal, then the brush.
+                            if !st.ui.wheel.open
+                                && !egui_captured
+                                && !st.input.alt
+                                && !st.gizmo_press()
+                            {
                                 st.begin_stroke(1.0);
                             }
                         } else {
@@ -1208,13 +1214,40 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || st.egui_ctx.egui_wants_keyboard_input() {
+                if st.egui_ctx.egui_wants_keyboard_input() {
                     return;
                 }
                 let PhysicalKey::Code(code) = event.physical_key else {
                     return;
                 };
-                st.on_key(code);
+                let pressed = event.state == ElementState::Pressed;
+
+                // Rebinding swallows the next key, whatever it is.
+                if st.ui.rebinding_wheel && pressed {
+                    st.ui.wheel_key = code;
+                    st.ui.rebinding_wheel = false;
+                    st.ui.say(format!("radial menu on {}", ui::key_name(code)));
+                    return;
+                }
+
+                // The radial menu lives for exactly as long as its key is held.
+                if code == st.ui.wheel_key {
+                    if pressed {
+                        if !st.ui.wheel.open && !event.repeat {
+                            let at = st.cursor_points();
+                            st.ui.wheel.open_at(at, &st.sculptor);
+                            // A stroke and a menu at the same time helps nobody.
+                            st.end_stroke();
+                        }
+                    } else {
+                        st.ui.wheel.close();
+                    }
+                    return;
+                }
+
+                if pressed && !st.ui.wheel.open {
+                    st.on_key(code);
+                }
             }
             _ => {}
         }

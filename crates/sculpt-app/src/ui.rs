@@ -12,9 +12,11 @@ use crate::matcap;
 use crate::navwidget::{self, NavAction, NavWidget};
 use crate::renderer::{FrameSettings, Shading};
 use crate::theme::{ColorPreset, Metrics, Palette, Side, UiTheme};
+use crate::wheel::Wheel;
 use crate::widgets::{self, BigSlider};
 use egui::{Align2, Color32, CornerRadius, Frame, Margin, Sense, Stroke, Vec2};
 use sculpt_core::{Axis, BlendMode, BrushKind, Falloff, FillScope, RemeshOptions, Sculptor};
+use winit::keyboard::KeyCode;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Primitive {
@@ -134,6 +136,11 @@ pub struct UiState {
     pub upload_bytes: u64,
     pub nav: NavWidget,
     pub show_nav: bool,
+    pub wheel: Wheel,
+    /// Key that summons the radial menu while held.
+    pub wheel_key: KeyCode,
+    /// True while waiting for the user to press the key they want.
+    pub rebinding_wheel: bool,
     /// Interface scale being dragged, applied when the drag ends. Zooming
     /// rescales the coordinate space the slider itself lives in, so committing
     /// mid-gesture would move the rail out from under the finger.
@@ -167,6 +174,9 @@ impl Default for UiState {
             upload_bytes: 0,
             nav: NavWidget::default(),
             show_nav: true,
+            wheel: Wheel::default(),
+            wheel_key: KeyCode::Space,
+            rebinding_wheel: false,
             ui_scale_draft: UiTheme::default().ui_scale,
         }
     }
@@ -245,12 +255,31 @@ pub fn draw(
                     cam.locked = !cam.locked;
                     st.say(if cam.locked { "view locked" } else { "view unlocked" });
                 }
+                NavAction::Orbit(d) => cam.orbit(d.x, d.y),
             }
         }
     }
     viewport_overlay(root, s, st, overlay, p);
+    // Last, so it covers everything else while it is up.
+    st.wheel.show(root.ctx(), s, &p);
 
     actions
+}
+
+/// A readable name for a key, for the shortcut display.
+pub fn key_name(code: KeyCode) -> String {
+    let raw = format!("{code:?}");
+    // winit spells them `KeyA`, `Digit1`, `ShiftLeft`; trim the category.
+    for prefix in ["Key", "Digit", "Numpad"] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            return if prefix == "Numpad" {
+                format!("Numpad {rest}")
+            } else {
+                rest.to_string()
+            };
+        }
+    }
+    raw
 }
 
 /// Builds a panel on the requested side.
@@ -1296,6 +1325,29 @@ fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
         t.corner_radius = radius as u8;
     }
     BigSlider::new(&mut t.scrollbar, 6.0..=22.0, "Scroll bar")
+        .decimals(0)
+        .height(m.row)
+        .show(ui);
+
+    widgets::section_title(ui, "RADIAL MENU");
+    ui.label(
+        egui::RichText::new(
+            "Hold the key and the tools, the size and force pad, and the colour wheel come to the cursor. Let go and it is gone.",
+        )
+        .small()
+        .color(p.dim),
+    );
+    let rebinding = st.rebinding_wheel;
+    let label = if rebinding {
+        "press any key...".to_string()
+    } else {
+        format!("Key: {}", key_name(st.wheel_key))
+    };
+    if widgets::wide_button(ui, Icon::Settings, &label, m.row, rebinding).clicked() {
+        st.rebinding_wheel = !st.rebinding_wheel;
+    }
+    widgets::toggle(ui, &mut st.wheel.show_colors, "Include the colour wheel", m.row);
+    BigSlider::new(&mut st.wheel.size, 110.0..=260.0, "Menu size")
         .decimals(0)
         .height(m.row)
         .show(ui);

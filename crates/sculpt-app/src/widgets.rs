@@ -458,45 +458,49 @@ pub fn section_title(ui: &mut Ui, text: &str) {
 /// top of it.
 pub fn color_row(ui: &mut Ui, label: &str, rgb: &mut [f32; 3], height: f32) -> Response {
     let p = Palette::ui(ui);
-    let color = Color32::from_rgb(
-        (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
-        (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
-        (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
-    );
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-    let radius = CornerRadius::same(ui.visuals().widgets.inactive.corner_radius.nw);
-    ui.painter().rect_filled(rect, radius, p.raised);
-    // Swatch on the left, label in the middle, picker button on the right.
-    let swatch = Rect::from_min_size(
-        rect.left_top() + Vec2::splat(4.0),
-        Vec2::new(height * 1.4, height - 8.0),
-    );
-    ui.painter().rect(
-        swatch,
-        CornerRadius::same(6),
-        color,
-        Stroke::new(1.0, p.line),
-        egui::StrokeKind::Inside,
-    );
-    let text_rect = Rect::from_min_max(
-        egui::pos2(swatch.right() + 8.0, rect.top()),
-        egui::pos2(rect.right() - height, rect.bottom()),
-    );
-    ui.painter()
-        .with_clip_rect(text_rect.intersect(ui.clip_rect()))
-        .text(
-            egui::pos2(text_rect.left(), rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::proportional(ui.style().text_styles[&egui::TextStyle::Small].size),
-            p.text,
+    // Everything sits in one honest horizontal row.
+    //
+    // The tempting shortcut is to allocate the full width and drop egui's
+    // colour button into a hand-made rect on the right. Do that and the button
+    // still asks for its own size, overflows the row, and the resizable dock
+    // grows to fit it. Since the dock's width is what set the row's width, that
+    // is a loop, and the panel walks out to its maximum on its own.
+    ui.horizontal(|ui| {
+        let button_width = ui.spacing().interact_size.x.max(24.0) + 4.0;
+        let bar = (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(48.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(bar, height), Sense::hover());
+        let radius = CornerRadius::same(ui.visuals().widgets.inactive.corner_radius.nw);
+        ui.painter().rect_filled(rect, radius, p.raised);
+
+        let color = Color32::from_rgb(
+            (rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
         );
-    let button = Rect::from_center_size(
-        egui::pos2(rect.right() - height * 0.5 - 4.0, rect.center().y),
-        Vec2::splat(height - 10.0),
-    );
-    ui.scope_builder(egui::UiBuilder::new().max_rect(button), |ui| {
+        let swatch = Rect::from_min_size(
+            rect.left_top() + Vec2::splat(4.0),
+            Vec2::new(height * 1.2, height - 8.0),
+        );
+        ui.painter().rect(
+            swatch,
+            CornerRadius::same(6),
+            color,
+            Stroke::new(1.0, p.line),
+            egui::StrokeKind::Inside,
+        );
+
+        let text_rect =
+            Rect::from_min_max(egui::pos2(swatch.right() + 8.0, rect.top()), rect.right_bottom());
+        ui.painter()
+            .with_clip_rect(text_rect.intersect(ui.clip_rect()))
+            .text(
+                egui::pos2(text_rect.left(), rect.center().y),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(ui.style().text_styles[&egui::TextStyle::Small].size),
+                p.text,
+            );
+
         ui.color_edit_button_rgb(rgb)
     })
     .inner
