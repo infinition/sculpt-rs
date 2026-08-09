@@ -178,6 +178,11 @@ pub struct UiState {
     /// The viewport as it was last frame, so code outside the interface can
     /// place things in it.
     pub viewport: egui::Rect,
+    /// Last pointer position that was over the model rather than over the
+    /// interface. While a slider is being dragged the pointer is on the
+    /// slider, and drawing the brush preview there would be useless, so this
+    /// remembers where the brush actually was.
+    pub viewport_cursor: egui::Pos2,
     /// Key that summons the radial menu while held.
     pub wheel_key: KeyCode,
     /// True while waiting for the user to press the key they want.
@@ -221,6 +226,7 @@ impl Default for UiState {
             wheel: Wheel::default(),
             anchor: Anchor::Cursor,
             viewport: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0)),
+            viewport_cursor: egui::pos2(640.0, 360.0),
             wheel_key: KeyCode::Space,
             rebinding_wheel: false,
             ui_scale_draft: UiTheme::default().ui_scale,
@@ -308,7 +314,21 @@ pub fn draw(
     // Floating controls sit over the viewport, under the radial menu.
     let viewport = root.available_rect_before_wrap();
     st.viewport = viewport;
-    let cursor = root.ctx().pointer_latest_pos().unwrap_or(viewport.center());
+
+    // Remember the last pointer position that belonged to the model. Once a
+    // slider takes the pointer, egui owns it and this stops updating, which is
+    // exactly what keeps the brush preview where the brush is.
+    if !root.ctx().egui_wants_pointer_input() {
+        if let Some(at) = root.ctx().pointer_latest_pos() {
+            if viewport.contains(at) {
+                st.viewport_cursor = at;
+            }
+        }
+    }
+    if !viewport.contains(st.viewport_cursor) {
+        st.viewport_cursor = viewport.center();
+    }
+    let cursor = st.viewport_cursor;
     for a in st.hud.show(root.ctx(), viewport, s, &p) {
         match a {
             HudAction::OpenWheel(at) => {

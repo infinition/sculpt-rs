@@ -1255,7 +1255,7 @@ impl ApplicationHandler for App {
                             let at = st
                                 .ui
                                 .anchor
-                                .resolve(st.cursor_points(), st.ui.viewport);
+                                .resolve(st.ui.viewport_cursor, st.ui.viewport);
                             st.ui.wheel.open_at(at, &st.sculptor);
                             // A stroke and a menu at the same time helps nobody.
                             st.end_stroke();
