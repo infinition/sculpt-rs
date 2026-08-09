@@ -28,7 +28,6 @@ pub enum HudAction {
     /// button that raised this sits at the edge of the screen, which is the
     /// one place a ring should not be centred on.
     OpenWheel,
-    CloseWheel,
     Orbit(Vec2),
     Pan(Vec2),
     Zoom(f32),
@@ -92,9 +91,11 @@ impl Hud {
         viewport: Rect,
         s: &mut Sculptor,
         p: &Palette,
+        wheel_open: bool,
     ) -> Vec<HudAction> {
         let mut actions = Vec::new();
         self.adjusting = false;
+        self.wheel_open = wheel_open;
         if self.show_brush {
             self.brush_cluster(ctx, viewport, s, p, &mut actions);
         }
@@ -222,17 +223,19 @@ impl Hud {
                 let centre = centre_rect(rect, round);
                 let response = ui.interact(centre, ui.id().with("menu"), Sense::click_and_drag());
                 let now = ui.input(|i| i.time);
-                if response.is_pointer_button_down_on() {
+
+                // This button only ever opens the menu. Closing it belongs to
+                // the menu, which is the thing that knows whether the finger
+                // that opened it has lifted; splitting that decision across two
+                // places is what had it flickering shut.
+                if self.wheel_open {
+                    self.pressed_at = None;
+                } else if response.is_pointer_button_down_on() {
                     let started = *self.pressed_at.get_or_insert(now);
-                    if !self.wheel_open && now - started > HOLD_SECONDS {
-                        self.wheel_open = true;
+                    if now - started > HOLD_SECONDS {
                         actions.push(HudAction::OpenWheel);
                     }
                 } else {
-                    if self.wheel_open {
-                        actions.push(HudAction::CloseWheel);
-                    }
-                    self.wheel_open = false;
                     self.pressed_at = None;
                 }
                 self.draw_round(ui, centre, s, p, response.hovered());
@@ -240,14 +243,17 @@ impl Hud {
     }
 
     /// A vertical drag on a pill, returned as a fraction of its full travel.
+    ///
+    /// Reports zero rather than nothing while the finger rests, so the caller
+    /// can tell "holding still" from "not holding at all": the preview has to
+    /// stay up through a pause, not blink out the moment the hand stops.
     fn pill_drag(&self, ui: &egui::Ui, rect: Rect, salt: &str) -> Option<f32> {
         let response = ui.interact(rect, ui.id().with(salt), Sense::click_and_drag());
-        if !response.dragged() {
+        if !response.dragged() && !response.is_pointer_button_down_on() {
             return None;
         }
         // Up increases, which is the way every physical fader works.
-        let d = -response.drag_delta().y / PILL_TRAVEL;
-        (d != 0.0).then_some(d)
+        Some(-response.drag_delta().y / PILL_TRAVEL)
     }
 
     #[allow(clippy::too_many_arguments)]

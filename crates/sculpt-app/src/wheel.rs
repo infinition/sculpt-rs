@@ -73,6 +73,14 @@ pub struct Wheel {
     grab: Grab,
     /// Sculpting tool to come back to when leaving the painting menu.
     last_sculpt: BrushKind,
+    /// Whether the pointer was already down when the menu opened, resolved on
+    /// the first frame it is up.
+    ///
+    /// It decides what counts as choosing. Summoned by a key, the pointer is
+    /// free and a press picks. Summoned by holding a button, the finger is
+    /// already down and will not press again without letting go, so the choice
+    /// has to land on release, which is how a radial menu has always worked.
+    opened_held: Option<bool>,
 }
 
 impl Default for Wheel {
@@ -84,6 +92,7 @@ impl Default for Wheel {
             center: Pos2::ZERO,
             grab: Grab::None,
             last_sculpt: BrushKind::Clay,
+            opened_held: None,
         }
     }
 }
@@ -93,6 +102,7 @@ impl Wheel {
         self.open = true;
         self.center = at;
         self.grab = Grab::None;
+        self.opened_held = None;
         if !s.brush.kind.paints() {
             self.last_sculpt = s.brush.kind;
         }
@@ -153,9 +163,19 @@ impl Wheel {
                 painter.rect_filled(screen, 0.0, Color32::from_black_alpha(120));
 
                 let pointer = ui.ctx().pointer_latest_pos().unwrap_or(center);
-                let (pressed, down) = ui
-                    .ctx()
-                    .input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down()));
+                let (pressed, released, down) = ui.ctx().input(|i| {
+                    (
+                        i.pointer.primary_pressed(),
+                        i.pointer.primary_released(),
+                        i.pointer.primary_down(),
+                    )
+                });
+                // First frame decides how this menu was summoned.
+                let held_open = *self.opened_held.get_or_insert(down);
+                // A press picks when the pointer is free; a release picks when
+                // the finger that opened the menu is still on the glass.
+                let choose = if held_open { released } else { pressed };
+
                 if !down {
                     self.grab = Grab::None;
                 }
@@ -165,37 +185,46 @@ impl Wheel {
                     Pos2::new(center.x + dx, center.y)
                 });
 
-                // Decide what a fresh press took hold of, once.
-                if pressed {
+                // Take hold of the pad or the colour wheel as soon as the
+                // pointer is down over either of them, whether that press
+                // happened here or was the one that opened the menu.
+                if down && matches!(self.grab, Grab::None) {
                     let pad = self.size * PAD_FRACTION;
                     let on_colour = colour_center
                         .is_some_and(|c| (pointer - c).length() <= self.size * 0.95);
-                    self.grab = if (pointer - center).length() <= pad {
-                        Grab::Pad {
+                    if (pointer - center).length() <= pad {
+                        self.grab = Grab::Pad {
                             origin: pointer,
                             radius: s.brush.radius,
                             strength: s.brush.strength,
-                        }
+                        };
                     } else if on_colour {
-                        Grab::Colour
-                    } else {
-                        Grab::None
-                    };
+                        self.grab = Grab::Colour;
+                    }
                 }
 
                 painter.circle_filled(center, self.size, p.panel.gamma_multiply(0.96));
                 painter.circle_stroke(center, self.size, Stroke::new(1.0, p.line));
 
                 if painting {
-                    self.draw_paint_page(painter, center, pointer, pressed, s, p);
+                    self.draw_paint_page(painter, center, pointer, choose, s, p);
                 } else {
-                    self.draw_sculpt_page(painter, center, pointer, pressed, s, p);
+                    self.draw_sculpt_page(painter, center, pointer, choose, s, p);
                 }
                 self.draw_pad(painter, center, pointer, s, p);
                 self.draw_gauges(painter, center, s, p);
 
                 if let Some(c) = colour_center {
                     self.draw_colors(painter, c, pointer, s, p);
+                }
+
+                // Opened by holding a button, the menu belongs to that finger:
+                // it lives until the finger lifts, and the lift is also the
+                // choice. The key-summoned menu ignores this and waits for the
+                // key instead.
+                if held_open && released {
+                    self.open = false;
+                    self.grab = Grab::None;
                 }
             });
     }

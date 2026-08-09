@@ -90,7 +90,34 @@ pub enum TouchOutcome {
     StrokeStart { at: Vec2, pressure: f32 },
     StrokeMove { at: Vec2, pressure: f32 },
     StrokeEnd,
+    /// A second finger arrived on the heels of the first: the stroke it began
+    /// was not meant, and should be rolled back rather than merely stopped.
+    CancelStroke,
     Navigate(Vec<Gesture>),
+    Undo,
+    Redo,
+}
+
+/// A tap is short, still, and ends with every finger off the glass.
+const TAP_MAX_SECONDS: f64 = 0.3;
+const TAP_MAX_TRAVEL: f32 = 26.0;
+/// How long the second tap of a double tap may take to arrive.
+const DOUBLE_TAP_SECONDS: f64 = 0.45;
+/// A second finger landing this soon means the first one was never meant to
+/// draw.
+const STROKE_GRACE_SECONDS: f64 = 0.25;
+
+/// Recognises taps across a whole touch sequence.
+#[derive(Default)]
+struct TapTracker {
+    /// When the first finger of the current sequence landed.
+    began: Option<std::time::Instant>,
+    /// Most fingers down at once during it.
+    fingers: usize,
+    /// Furthest any finger strayed from where it landed.
+    travel: f32,
+    /// Finger count and time of the last completed tap.
+    last: Option<(usize, std::time::Instant)>,
 }
 
 #[derive(Clone, Copy)]
@@ -122,6 +149,7 @@ pub struct Input {
     /// Set when a multi-finger gesture starts, so lifting back to one finger
     /// does not resume sculpting mid-air.
     gesture_lock: bool,
+    taps: TapTracker,
 }
 
 impl Input {
@@ -193,7 +221,13 @@ impl Input {
 
         match touch.phase {
             TouchPhase::Started => {
+                let now = std::time::Instant::now();
+                if self.fingers.is_empty() {
+                    self.taps = TapTracker { last: self.taps.last, began: Some(now), ..Default::default() };
+                }
                 self.fingers.push(Finger { id: touch.id, pos, start: pos, pressure });
+                self.taps.fingers = self.taps.fingers.max(self.fingers.len());
+
                 if self.fingers.len() == 1 {
                     if over_ui {
                         // Let egui own this one.
@@ -209,16 +243,29 @@ impl Input {
                     self.gesture_lock = false;
                     return Some(TouchOutcome::StrokeStart { at: pos, pressure });
                 }
-                // A second finger means the user wants to navigate.
+                // A second finger means the user wants to navigate, or to tap.
                 self.gesture_lock = true;
                 if self.finger_stroke {
                     self.finger_stroke = false;
-                    return Some(TouchOutcome::StrokeEnd);
+                    // Landing this fast means the first finger was part of the
+                    // same gesture, not a stroke someone wanted to keep.
+                    let quick = self
+                        .taps
+                        .began
+                        .is_some_and(|t| now.duration_since(t).as_secs_f64() < STROKE_GRACE_SECONDS);
+                    return Some(if quick {
+                        TouchOutcome::CancelStroke
+                    } else {
+                        TouchOutcome::StrokeEnd
+                    });
                 }
                 None
             }
             TouchPhase::Moved => {
                 let previous = self.update_finger(touch.id, pos, pressure)?;
+                if let Some(f) = self.fingers.iter().find(|f| f.id == touch.id) {
+                    self.taps.travel = self.taps.travel.max((pos - f.start).length());
+                }
                 match self.fingers.len() {
                     1 if self.finger_stroke => {
                         Some(TouchOutcome::StrokeMove { at: pos, pressure })
@@ -239,15 +286,53 @@ impl Input {
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
                 self.fingers.retain(|f| f.id != touch.id);
-                if self.fingers.is_empty() {
-                    let was_stroking = self.finger_stroke;
-                    self.finger_stroke = false;
-                    self.gesture_lock = false;
-                    return was_stroking.then_some(TouchOutcome::StrokeEnd);
+                if !self.fingers.is_empty() {
+                    return None;
                 }
-                None
+                let was_stroking = self.finger_stroke;
+                self.finger_stroke = false;
+                self.gesture_lock = false;
+
+                // Every finger is off: the sequence is over, so decide whether
+                // it was a tap, and whether it was the second of a pair.
+                if let Some(action) = self.finish_tap() {
+                    return Some(action);
+                }
+                was_stroking.then_some(TouchOutcome::StrokeEnd)
             }
         }
+    }
+
+    /// Closes off a touch sequence and reports the double tap it completed.
+    ///
+    /// Two fingers undo, three redo. A double tap rather than a single one
+    /// because two fingers resting briefly on the way to an orbit is far too
+    /// easy to do by accident, and undoing work nobody asked to undo is the
+    /// worst thing an input gesture can do.
+    fn finish_tap(&mut self) -> Option<TouchOutcome> {
+        let began = self.taps.began.take()?;
+        let now = std::time::Instant::now();
+        let quick = now.duration_since(began).as_secs_f64() < TAP_MAX_SECONDS;
+        let still = self.taps.travel < TAP_MAX_TRAVEL;
+        let fingers = self.taps.fingers;
+        self.taps.travel = 0.0;
+        self.taps.fingers = 0;
+
+        if !quick || !still || !(2..=3).contains(&fingers) {
+            self.taps.last = None;
+            return None;
+        }
+
+        let paired = self
+            .taps
+            .last
+            .is_some_and(|(n, at)| n == fingers && now.duration_since(at).as_secs_f64() < DOUBLE_TAP_SECONDS);
+        if !paired {
+            self.taps.last = Some((fingers, now));
+            return None;
+        }
+        self.taps.last = None;
+        Some(if fingers == 2 { TouchOutcome::Undo } else { TouchOutcome::Redo })
     }
 
     /// Moves one finger and hands back where it was.

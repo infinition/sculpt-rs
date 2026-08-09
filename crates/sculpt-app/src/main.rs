@@ -1221,6 +1221,24 @@ impl ApplicationHandler for App {
                             st.continue_stroke(pressure);
                         }
                         TouchOutcome::StrokeEnd => st.end_stroke(),
+                        TouchOutcome::CancelStroke => {
+                            // The dab the first finger left was part of a
+                            // two-finger gesture, so take it back rather than
+                            // leaving a mark nobody asked for.
+                            st.end_stroke();
+                            st.sculptor.undo();
+                            st.full_resync = true;
+                        }
+                        TouchOutcome::Undo => {
+                            st.sculptor.undo();
+                            st.full_resync = true;
+                            st.ui.say("undo");
+                        }
+                        TouchOutcome::Redo => {
+                            st.sculptor.redo();
+                            st.full_resync = true;
+                            st.ui.say("redo");
+                        }
                         TouchOutcome::Navigate(gestures) => {
                             // A second finger cancels the stroke it interrupted.
                             st.end_stroke();

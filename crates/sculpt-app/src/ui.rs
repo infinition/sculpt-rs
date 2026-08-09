@@ -329,7 +329,8 @@ pub fn draw(
         st.viewport_cursor = viewport.center();
     }
     let cursor = st.viewport_cursor;
-    for a in st.hud.show(root.ctx(), viewport, s, &p) {
+    let wheel_open = st.wheel.open;
+    for a in st.hud.show(root.ctx(), viewport, s, &p, wheel_open) {
         match a {
             HudAction::OpenWheel => {
                 // Summoned from a floating button, the menu always opens in the
@@ -338,7 +339,6 @@ pub fn draw(
                 // the other half under your hand.
                 st.wheel.open_at(viewport.center(), s);
             }
-            HudAction::CloseWheel => st.wheel.close(),
             HudAction::Orbit(d) => cam.orbit(d.x, d.y),
             HudAction::Pan(d) => cam.pan(d.x, d.y, viewport.height().max(1.0)),
             HudAction::Zoom(amount) => cam.zoom(amount),
