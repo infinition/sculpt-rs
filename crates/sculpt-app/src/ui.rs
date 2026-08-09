@@ -359,7 +359,7 @@ pub fn draw(
     let _ = cursor;
 
     // Last, so it covers everything else while it is up.
-    st.wheel.show(root.ctx(), s, &p);
+    st.wheel.show(root.ctx(), viewport, s, &p);
 
     actions
 }

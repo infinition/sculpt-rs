@@ -120,16 +120,26 @@ impl Wheel {
     }
 
     /// Draws the menu and applies what the pointer presses or drags.
-    pub fn show(&mut self, ctx: &egui::Context, s: &mut Sculptor, p: &Palette) {
+    ///
+    /// `viewport` is the area left over by the docks: the menu is kept inside
+    /// it, because a ring hanging over the settings panel is both ugly and
+    /// harder to aim at.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        viewport: egui::Rect,
+        s: &mut Sculptor,
+        p: &Palette,
+    ) {
         if !self.open {
             return;
         }
         let painting = s.brush.kind.paints();
         let with_colors = painting && self.show_colors;
 
-        // The whole window, not just the viewport: the menu floats over the
-        // docks and dims them with everything else.
-        let screen = ctx.viewport_rect();
+        // Dim the whole window, but keep the menu itself in the viewport.
+        let window = ctx.viewport_rect();
+        let screen = viewport;
         // The two discs must not touch: this menu is this radius, the colour
         // wheel is 0.92 of it, and they need air between them.
         let colour_gap = self.size * 2.1;
@@ -154,79 +164,83 @@ impl Wheel {
             ),
         );
 
-        egui::Area::new(egui::Id::new("radial_menu"))
-            .fixed_pos(screen.min)
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                let painter = ui.painter();
-                painter.rect_filled(screen, 0.0, Color32::from_black_alpha(120));
+        // A plain layer painter, not an `Area`.
+        //
+        // An area sizes itself to the widgets put inside it, and this menu puts
+        // none there: it paints at absolute coordinates and reads input from the
+        // context. With nothing to measure the area collapsed and clipped the
+        // whole menu away. It survived while the pointer moved, since that kept
+        // nudging the area's remembered size, and vanished the moment the hand
+        // held still, which is precisely how it is meant to be used.
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("radial_menu"),
+        ));
+        painter.rect_filled(window, 0.0, Color32::from_black_alpha(120));
 
-                let pointer = ui.ctx().pointer_latest_pos().unwrap_or(center);
-                let (pressed, released, down) = ui.ctx().input(|i| {
-                    (
-                        i.pointer.primary_pressed(),
-                        i.pointer.primary_released(),
-                        i.pointer.primary_down(),
-                    )
-                });
-                // First frame decides how this menu was summoned.
-                let held_open = *self.opened_held.get_or_insert(down);
-                // A press picks when the pointer is free; a release picks when
-                // the finger that opened the menu is still on the glass.
-                let choose = if held_open { released } else { pressed };
+        let pointer = ctx.pointer_latest_pos().unwrap_or(center);
+        let (pressed, released, down) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_released(),
+                i.pointer.primary_down(),
+            )
+        });
+        // First frame decides how this menu was summoned.
+        let held_open = *self.opened_held.get_or_insert(down);
+        // A press picks when the pointer is free; a release picks when the
+        // finger that opened the menu is still on the glass.
+        let choose = if held_open { released } else { pressed };
 
-                if !down {
-                    self.grab = Grab::None;
-                }
+        if !down {
+            self.grab = Grab::None;
+        }
 
-                let colour_center = with_colors.then(|| {
-                    let dx = if colours_right { colour_gap } else { -colour_gap };
-                    Pos2::new(center.x + dx, center.y)
-                });
+        let colour_center = with_colors.then(|| {
+            let dx = if colours_right { colour_gap } else { -colour_gap };
+            Pos2::new(center.x + dx, center.y)
+        });
 
-                // Take hold of the pad or the colour wheel as soon as the
-                // pointer is down over either of them, whether that press
-                // happened here or was the one that opened the menu.
-                if down && matches!(self.grab, Grab::None) {
-                    let pad = self.size * PAD_FRACTION;
-                    let on_colour = colour_center
-                        .is_some_and(|c| (pointer - c).length() <= self.size * 0.95);
-                    if (pointer - center).length() <= pad {
-                        self.grab = Grab::Pad {
-                            origin: pointer,
-                            radius: s.brush.radius,
-                            strength: s.brush.strength,
-                        };
-                    } else if on_colour {
-                        self.grab = Grab::Colour;
-                    }
-                }
+        // Take hold of the pad or the colour wheel as soon as the pointer is
+        // down over either of them, whether that press happened here or was the
+        // one that opened the menu.
+        if down && matches!(self.grab, Grab::None) {
+            let pad = self.size * PAD_FRACTION;
+            let on_colour =
+                colour_center.is_some_and(|c| (pointer - c).length() <= self.size * 0.95);
+            if (pointer - center).length() <= pad {
+                self.grab = Grab::Pad {
+                    origin: pointer,
+                    radius: s.brush.radius,
+                    strength: s.brush.strength,
+                };
+            } else if on_colour {
+                self.grab = Grab::Colour;
+            }
+        }
 
-                painter.circle_filled(center, self.size, p.panel.gamma_multiply(0.96));
-                painter.circle_stroke(center, self.size, Stroke::new(1.0, p.line));
+        painter.circle_filled(center, self.size, p.panel.gamma_multiply(0.96));
+        painter.circle_stroke(center, self.size, Stroke::new(1.0, p.line));
 
-                if painting {
-                    self.draw_paint_page(painter, center, pointer, choose, s, p);
-                } else {
-                    self.draw_sculpt_page(painter, center, pointer, choose, s, p);
-                }
-                self.draw_pad(painter, center, pointer, s, p);
-                self.draw_gauges(painter, center, s, p);
+        if painting {
+            self.draw_paint_page(&painter, center, pointer, choose, s, p);
+        } else {
+            self.draw_sculpt_page(&painter, center, pointer, choose, s, p);
+        }
+        self.draw_pad(&painter, center, pointer, s, p);
+        self.draw_gauges(&painter, center, s, p);
 
-                if let Some(c) = colour_center {
-                    self.draw_colors(painter, c, pointer, s, p);
-                }
+        if let Some(c) = colour_center {
+            self.draw_colors(&painter, c, pointer, s, p);
+        }
 
-                // Opened by holding a button, the menu belongs to that finger:
-                // it lives until the finger lifts, and the lift is also the
-                // choice. The key-summoned menu ignores this and waits for the
-                // key instead.
-                if held_open && released {
-                    self.open = false;
-                    self.grab = Grab::None;
-                }
-            });
+        // Opened by holding a button, the menu belongs to that finger: it lives
+        // until the finger lifts, and the lift is also the choice. The
+        // key-summoned menu ignores this and waits for the key instead.
+        if held_open && released {
+            self.open = false;
+            self.grab = Grab::None;
+        }
     }
 
     // ---- pages ---------------------------------------------------------------
