@@ -10,9 +10,11 @@ use crate::query;
 use glam::{Quat, Vec2, Vec3};
 use rayon::prelude::*;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub enum BrushKind {
     Draw,
+    /// The tool a fresh session opens with.
+    #[default]
     Clay,
     Flatten,
     Smooth,
