@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/sculpt-core", "crates/sculpt-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
