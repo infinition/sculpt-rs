@@ -14,11 +14,20 @@ built for a pen and a touch screen as much as for a mouse.
   splitting and collapsing edges, so you sculpt without worrying about the
   starting resolution. Subdivision and decimation can be toggled separately,
   and a vertex ceiling keeps a runaway stroke from eating the machine.
-- **Thirteen brushes.** Draw, Clay, Flatten, Smooth, Pinch, Crease, Inflate,
-  Move, Drag, Twist, Scale, Paint and Mask. Each one remembers its own radius,
-  strength and options, so switching tools never loses your settings.
+- **Sixteen brushes.** Draw, Clay, Flatten, Smooth, Pinch, Crease, Inflate,
+  Move, Drag, Twist, Scale, Paint, Smudge, Blur, Fill and Mask. Each one
+  remembers its own radius, strength and options, so switching tools never
+  loses your settings.
 - **Five falloff curves** per brush, previewed as a live graph: Smooth,
   Linear, Sharp, Sphere and Constant.
+- **Alphas.** A falloff can only make a circle. An alpha multiplies it by an
+  image stamped across the dab, which is what turns one brush into cracks,
+  scales, a hatch or a photographed grain. Six are generated in code so the
+  brush is useful with no files at all, and any image can be loaded on top.
+  The stamp holds the angle it has on screen, or turns to follow the stroke.
+- **Named brushes.** Keep a tool at a particular size, falloff, alpha and
+  colour under a name, and save the set to a plain-text file that carries
+  between sessions.
 - **Brush behaviour**: front-face culling, a locked stroke plane for carving
   straight ridges, auto smoothing folded into the stroke, and pen pressure
   mapped to radius, strength or both.
@@ -26,6 +35,17 @@ built for a pen and a touch screen as much as for a mouse.
   pass as the original.
 - **Masking** with blur, sharpen, invert and clear, plus extraction of the
   masked region into a separate solid object.
+
+**Painting**
+
+- Paint colour, roughness and metalness per vertex, through nine blend modes:
+  Normal, Multiply, Screen, Add, Subtract, Overlay, Darken, Lighten and Hue.
+- Smudge, blur and sharpen colour, and flood-fill a face, a whole flat region
+  or an entire object.
+- A colour panel with a saturation and value square, a hue strip, an
+  eyedropper, a greys-only mode for value studies, a palette, and the schemes
+  worth having on screen while you work: opposite, near, triad, split and
+  shades of the same hue.
 
 **Topology and repair**
 
@@ -48,10 +68,13 @@ built for a pen and a touch screen as much as for a mouse.
 
 **Display**
 
-- Five shading modes: matcap, a lit PBR view that reads the painted roughness
-  and metalness, world normals, cavity, and untextured clay for judging form.
-- Five procedurally generated matcaps, flat shading, wireframe, adjustable
-  opacity, vertex colours.
+- Six shading modes: matcap, a lit PBR view that reads the painted roughness
+  and metalness, world normals, cavity, unlit for hand-painting, and
+  untextured clay for judging form.
+- Matcaps three ways: five generated presets, an editable lightcap where the
+  material and all three lights can be taken apart and aimed by dragging, or
+  an image loaded off disk.
+- Flat shading, wireframe, adjustable opacity, vertex colours.
 - An infinite ground grid with tinted world axes, a gradient background you
   can recolour, and multisampling up to 8x.
 - Perspective or orthographic camera with named views, adjustable field of
@@ -63,6 +86,8 @@ built for a pen and a touch screen as much as for a mouse.
   (binary and ASCII).
 - A native `.sculpt` scene file that keeps every object, its placement and
   every per-vertex attribute.
+- A plain-text `.brushes` file for a set of named brushes.
+- PNG, JPEG, BMP and TGA in, as brush alphas and as matcaps.
 
 ## Architecture
 
@@ -100,7 +125,17 @@ infinite grid with correct depth and nothing to tessellate.
 The interface is built around three fixed places: the tool you are holding is
 always on the left rail, its settings are always in the same panel on the right,
 and the actions you reach for constantly sit in the top bar. Nothing is buried
-in a menu.
+in a menu. Any panel can be torn out of the dock into a window that floats over
+the model, and closing that window puts it back.
+
+Holding a key summons a radial menu at the cursor: the tools around the outside,
+a pad in the middle you drag up and down for size and across for force. On a
+painting tool it becomes a painting menu, with the blend modes around the tools
+and the hue wrapped right around the outside of the disc.
+
+Three floating buttons sit over the viewport for size, the menu and force, two
+more for pan and zoom, and an orientation ball you can click to snap to a named
+view or drag to spin the model. All of them can be moved, resized or hidden.
 
 Every control is drawn for a fingertip. The icons are vector shapes painted in
 code rather than an icon font, so they stay crisp at any size and the binary
@@ -121,7 +156,7 @@ cargo run --release -p sculpt-app
 
 | Input | Action |
 |-------|--------|
-| Left mouse, one finger | Sculpt |
+| Left mouse, one finger, pen | Sculpt on the model, spin the view off it |
 | Middle or right mouse | Orbit |
 | Two fingers | Orbit, pinch to zoom, drag together to pan |
 | Three fingers | Pan |
@@ -140,9 +175,17 @@ cargo run --release -p sculpt-app
 | Numpad `1` / `3` / `7` | Front, right and top views |
 | Numpad `5` | Perspective or orthographic |
 | Ctrl+Z / Ctrl+Shift+Z | Undo and redo |
+| Double tap, two or three fingers | Undo and redo |
+| Space (hold) | Radial menu |
 
 A second finger landing mid-stroke cancels the stroke rather than smearing the
 model while the view swings around.
+
+Every device can be bound to something else in the Interface tab. The default
+for the pointer, the finger and the pen is the automatic one: a press that lands
+on the model draws, a press that lands off it spins the view, and the answer is
+settled at the moment of contact so a stroke that wanders off the silhouette
+keeps drawing.
 
 ## Tests
 
@@ -157,7 +200,8 @@ mesh or the spatial index, the grid returns exactly what a brute-force scan
 returns, undo restores the previous state, a symmetric stroke moves both sides
 by the same amount, subdivision quadruples the face count, decimation reduces
 it while staying valid, a voxel remesh comes back watertight, hole filling
-seals an open plane, and OBJ, PLY and scene round trips preserve the geometry.
+seals an open plane, an alpha shapes the dab it is stamped through, and OBJ,
+PLY, scene and brush round trips preserve what went into them.
 
 ## Notes on origin
 
