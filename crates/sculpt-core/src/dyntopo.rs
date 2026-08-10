@@ -7,7 +7,6 @@
 use crate::mesh::Mesh;
 use crate::query;
 use glam::Vec3;
-use rustc_hash::FxHashSet;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Dyntopo {
@@ -49,21 +48,62 @@ impl Plan {
     pub fn is_empty(&self) -> bool {
         self.long.is_empty() && self.short.is_empty()
     }
+
+    /// Combien d'arêtes le plan touche, pour les mesures.
+    pub fn len(&self) -> usize {
+        self.long.len() + self.short.len()
+    }
 }
 
 /// Works out what a dab here would change, without changing it.
+///
+/// One pass over the neighbourhood, classifying each edge as too long or too
+/// short as it goes. It used to be two passes, each building a hash set of
+/// sixty thousand edges to remove duplicates, which cost six milliseconds of
+/// every dab on a dense mesh: more than the rest of the dab put together.
+///
+/// Duplicates are left in instead of being hashed away. Taking an edge from its
+/// lower-numbered vertex only cuts them from six to two, and the two are
+/// harmless: a split revalidates through `faces_around_edge`, which is empty
+/// the second time round, and a collapse revalidates its candidates anyway.
+/// Two length comparisons are far cheaper than a hash table.
 pub fn plan(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> Plan {
-    let r = radius * 1.15;
-    let long = if p.subdivide && mesh.vert_count() < p.max_verts {
-        collect_edges(mesh, center, r, |len| len > p.detail * SPLIT_FACTOR)
-    } else {
-        Vec::new()
-    };
-    let short = if p.decimate {
-        collect_edges(mesh, center, r, |len| len < p.detail * COLLAPSE_FACTOR)
-    } else {
-        Vec::new()
-    };
+    let can_split = p.subdivide && mesh.vert_count() < p.max_verts;
+    if !can_split && !p.decimate {
+        return Plan::default();
+    }
+    // Work slightly wider than the brush so the detail gradient is not sliced
+    // off exactly at the falloff boundary.
+    let max_len = p.detail * SPLIT_FACTOR;
+    let min_len = p.detail * COLLAPSE_FACTOR;
+    let mut long = Vec::new();
+    let mut short = Vec::new();
+
+    for v in query::verts_in_sphere(mesh, center, radius * 1.15) {
+        for &f in &mesh.vfaces[v as usize] {
+            let tri = mesh.faces[f as usize];
+            for k in 0..3 {
+                let (a, b) = (tri[k], tri[(k + 1) % 3]);
+                // Each edge belongs to its lower-numbered end, and is only
+                // looked at while walking that end.
+                if a != v || a > b {
+                    continue;
+                }
+                let len = mesh.edge_len(a, b);
+                if can_split && len > max_len {
+                    long.push((a, b));
+                } else if p.decimate && len < min_len {
+                    short.push((a, b));
+                }
+            }
+        }
+    }
+    // Longest first keeps refinement even instead of chasing one region.
+    long.sort_unstable_by(|x, y| {
+        mesh.edge_len(y.0, y.1)
+            .partial_cmp(&mesh.edge_len(x.0, x.1))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Plan { long, short }
 }
 
@@ -75,12 +115,9 @@ pub fn refine(mesh: &mut Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
 
 /// Carries out a plan. The first pass reuses what the plan already found; the
 /// later ones have to look again, since splitting makes new edges.
-pub fn apply(mesh: &mut Mesh, plan: Plan, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
+pub fn apply(mesh: &mut Mesh, todo: Plan, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
     let mut changed = false;
-    // Work slightly wider than the brush so the detail gradient is not sliced
-    // off exactly at the falloff boundary.
-    let r = radius * 1.15;
-    let mut first_long = Some(plan.long);
+    let mut first_long = Some(todo.long);
 
     if p.subdivide {
         let max_len = p.detail * SPLIT_FACTOR;
@@ -90,7 +127,12 @@ pub fn apply(mesh: &mut Mesh, plan: Plan, center: Vec3, radius: f32, p: &Dyntopo
             }
             let long = match first_long.take() {
                 Some(found) => found,
-                None => collect_edges(mesh, center, r, |len| len > max_len),
+                None => {
+                    // Splitting makes new edges, so the later passes have to
+                    // look again. Only the splitting half is wanted here.
+                    let again = Dyntopo { decimate: false, ..*p };
+                    plan(mesh, center, radius, &again).long
+                }
             };
             if long.is_empty() {
                 break;
@@ -113,7 +155,7 @@ pub fn apply(mesh: &mut Mesh, plan: Plan, center: Vec3, radius: f32, p: &Dyntopo
         let min_len = p.detail * COLLAPSE_FACTOR;
         // Collapses use swap_remove, so queued indices can go stale. Revalidate
         // each candidate instead of rebuilding the list.
-        for (a, b) in plan.short {
+        for (a, b) in todo.short {
             let n = mesh.vert_count() as u32;
             if a >= n || b >= n || a == b {
                 continue;
@@ -133,32 +175,3 @@ pub fn apply(mesh: &mut Mesh, plan: Plan, center: Vec3, radius: f32, p: &Dyntopo
     changed
 }
 
-/// Unique edges of the faces inside the sphere that satisfy `pred(length)`.
-fn collect_edges<F>(mesh: &Mesh, center: Vec3, radius: f32, pred: F) -> Vec<(u32, u32)>
-where
-    F: Fn(f32) -> bool,
-{
-    let faces = query::faces_in_sphere(mesh, center, radius);
-    let mut seen: FxHashSet<(u32, u32)> = FxHashSet::default();
-    let mut out = Vec::new();
-    for f in faces {
-        let tri = mesh.faces[f as usize];
-        for k in 0..3 {
-            let (a, b) = (tri[k], tri[(k + 1) % 3]);
-            let key = if a < b { (a, b) } else { (b, a) };
-            if !seen.insert(key) {
-                continue;
-            }
-            if pred(mesh.edge_len(a, b)) {
-                out.push(key);
-            }
-        }
-    }
-    // Longest first keeps refinement even instead of chasing one region.
-    out.sort_unstable_by(|x, y| {
-        mesh.edge_len(y.0, y.1)
-            .partial_cmp(&mesh.edge_len(x.0, x.1))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    out
-}
