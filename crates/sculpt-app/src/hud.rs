@@ -110,6 +110,9 @@ pub struct Hud {
     wheel_open: bool,
     /// True while size or force is being dragged.
     adjusting: bool,
+    /// Colour under the cursor while the eyedropper is armed, so the button
+    /// shows what a click would take before it takes it.
+    picking: Option<glam::Vec3>,
 }
 
 impl Default for Hud {
@@ -120,6 +123,7 @@ impl Default for Hud {
             pressed_at: None,
             wheel_open: false,
             adjusting: false,
+            picking: None,
         }
     }
 }
@@ -142,10 +146,12 @@ impl Hud {
         s: &mut Sculptor,
         p: &Palette,
         wheel_open: bool,
+        picking: Option<glam::Vec3>,
     ) -> Vec<HudAction> {
         let mut actions = Vec::new();
         self.adjusting = false;
         self.wheel_open = wheel_open;
+        self.picking = picking;
 
         for index in 0..self.pods.len() {
             let pod = self.pods[index];
@@ -360,19 +366,22 @@ impl Hud {
     }
 
     /// The round button: the tool in hand, or the colour when that tool paints.
+    ///
+    /// While the eyedropper is armed it shows the colour under the cursor
+    /// instead, with its hex underneath. Picking a colour you cannot see until
+    /// after you have taken it is guesswork.
     fn paint_menu_button(&self, ui: &egui::Ui, rect: Rect, s: &Sculptor, p: &Palette, hot: bool) {
         let painter = ui.painter();
         let r = rect.width() * 0.5;
         let painting = s.brush.kind.paints();
-        let fill = if painting {
-            let c = s.brush.paint_color;
-            Color32::from_rgb(
+        let shown = self.picking.or(painting.then_some(s.brush.paint_color));
+        let fill = match shown {
+            Some(c) => Color32::from_rgb(
                 (c.x.clamp(0.0, 1.0) * 255.0) as u8,
                 (c.y.clamp(0.0, 1.0) * 255.0) as u8,
                 (c.z.clamp(0.0, 1.0) * 255.0) as u8,
-            )
-        } else {
-            p.raised
+            ),
+            None => p.raised,
         };
         painter.circle(
             rect.center(),
@@ -401,19 +410,48 @@ impl Hud {
         }
 
         // On a colour, the glyph has to survive whatever the colour is.
-        let glyph = if painting {
-            let c = s.brush.paint_color;
-            let luma = 0.299 * c.x + 0.587 * c.y + 0.114 * c.z;
-            if luma > 0.55 { Color32::from_rgb(20, 20, 20) } else { Color32::WHITE }
-        } else {
-            p.text
+        let glyph = match shown {
+            Some(c) => {
+                let luma = 0.299 * c.x + 0.587 * c.y + 0.114 * c.z;
+                if luma > 0.55 { Color32::from_rgb(20, 20, 20) } else { Color32::WHITE }
+            }
+            None => p.text,
         };
         icons::paint(
             painter,
             icons::centered_rect(rect, r * 1.05),
-            Icon::of_brush(s.brush.kind),
+            if self.picking.is_some() { Icon::Palette } else { Icon::of_brush(s.brush.kind) },
             glyph,
         );
+
+        // The hex, on a plate under the button, so the number and the patch are
+        // read in one look.
+        if let Some(c) = shown {
+            let text = format!(
+                "#{:02X}{:02X}{:02X}",
+                (c.x.clamp(0.0, 1.0) * 255.0) as u8,
+                (c.y.clamp(0.0, 1.0) * 255.0) as u8,
+                (c.z.clamp(0.0, 1.0) * 255.0) as u8
+            );
+            let font = FontId::monospace((rect.width() * 0.2).clamp(8.0, 11.0));
+            let galley = painter.layout_no_wrap(text, font, p.text);
+            let plate = Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.bottom() + 10.0),
+                galley.size() + Vec2::new(10.0, 4.0),
+            );
+            painter.rect(
+                plate,
+                CornerRadius::same((plate.height() * 0.5) as u8),
+                p.panel.gamma_multiply(0.92),
+                Stroke::new(1.0, p.line),
+                egui::StrokeKind::Inside,
+            );
+            painter.galley(
+                egui::pos2(plate.center().x - galley.size().x * 0.5, plate.center().y - galley.size().y * 0.5),
+                galley,
+                p.text,
+            );
+        }
     }
 }
 

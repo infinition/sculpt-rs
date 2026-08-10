@@ -292,6 +292,22 @@ impl State {
         }
     }
 
+    /// Keeps the colour under the cursor up to date while the eyedropper is
+    /// armed, and forgets it the rest of the time.
+    ///
+    /// One ray per pointer move, and only while picking, which is the one
+    /// moment where the cost buys something: the colour is on screen before it
+    /// is taken rather than after.
+    fn update_hover_color(&mut self) {
+        if !self.ui.picking_color {
+            self.ui.hover_color = None;
+            return;
+        }
+        self.ui.hover_color = self
+            .pick_for_brush(self.input.cursor)
+            .and_then(|hit| self.sculptor.sample_color(&hit));
+    }
+
     fn cursor_points(&self) -> egui::Pos2 {
         let ppp = self.egui_ctx.pixels_per_point().max(1e-3);
         egui::pos2(self.input.cursor.x / ppp, self.input.cursor.y / ppp)
@@ -347,7 +363,13 @@ impl State {
             if let Some(c) = self.sculptor.sample_color(&hit) {
                 self.sculptor.brush.paint_color = c;
                 self.ui.picking_color = false;
-                self.ui.say("colour picked");
+                self.ui.hover_color = None;
+                self.ui.say(format!(
+                    "picked #{:02X}{:02X}{:02X}",
+                    (c.x.clamp(0.0, 1.0) * 255.0) as u8,
+                    (c.y.clamp(0.0, 1.0) * 255.0) as u8,
+                    (c.z.clamp(0.0, 1.0) * 255.0) as u8
+                ));
             }
             return;
         }
@@ -1319,6 +1341,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let delta = st.input.move_cursor(position.x as f32, position.y as f32);
+                st.update_hover_color();
                 if let Some(g) = st.input.mouse_navigation(delta, &st.ui.bindings) {
                     st.apply_gesture(g);
                 } else if st.gizmo.is_dragging() {
@@ -1346,7 +1369,11 @@ impl ApplicationHandler for App {
                 }
                 // Only ask the mesh where it is when a binding is waiting on the
                 // answer, and only on the way down.
-                let target = if egui_captured || st.ui.wheel.open {
+                let at = st.cursor_points();
+                let target = if egui_captured
+                    || st.ui.wheel.open
+                    || ui::interface_owns(&st.egui_ctx, st.ui.viewport, at)
+                {
                     PressTarget::Ui
                 } else if down
                     && Input::needs_pick(&st.ui.bindings)
@@ -1369,16 +1396,23 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Touch(touch) => {
+                let where_ = Vec2::new(touch.location.x as f32, touch.location.y as f32);
+                let ppp = st.egui_ctx.pixels_per_point().max(1e-3);
+                // A pen and a finger have no hover, so egui has never seen the
+                // pointer where it lands and cannot say whether the interface
+                // wants it. The geometry can.
+                let over_ui = egui_captured
+                    || ui::interface_owns(
+                        &st.egui_ctx,
+                        st.ui.viewport,
+                        egui::pos2(where_.x / ppp, where_.y / ppp),
+                    );
                 let on_model = touch.phase == winit::event::TouchPhase::Started
+                    && !over_ui
                     && Input::needs_pick(&st.ui.bindings)
-                    && st
-                        .pick_for_brush(Vec2::new(
-                            touch.location.x as f32,
-                            touch.location.y as f32,
-                        ))
-                        .is_some();
+                    && st.pick_for_brush(where_).is_some();
                 if let Some(outcome) =
-                    st.input.on_touch(&touch, egui_captured, &st.ui.bindings, on_model)
+                    st.input.on_touch(&touch, over_ui, &st.ui.bindings, on_model)
                 {
                     match outcome {
                         TouchOutcome::StrokeStart { at, pressure } => {
@@ -1387,6 +1421,7 @@ impl ApplicationHandler for App {
                         }
                         TouchOutcome::StrokeMove { at, pressure } => {
                             st.input.cursor = at;
+                            st.update_hover_color();
                             st.continue_stroke(pressure);
                         }
                         TouchOutcome::StrokeEnd => st.end_stroke(),

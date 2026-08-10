@@ -175,6 +175,10 @@ pub struct UiState {
     pub max_samples: u32,
     pub wireframe_available: bool,
     pub picking_color: bool,
+    /// Colour under the cursor while the eyedropper is armed. Sampled off the
+    /// model as the pointer moves, so what a click would take is on screen
+    /// before the click.
+    pub hover_color: Option<glam::Vec3>,
     pub add_primitive: Primitive,
     /// How far past the silhouette a stroke may reach for the surface, in
     /// interface points. Zero means the cursor must be on the model.
@@ -222,6 +226,26 @@ pub struct UiState {
     pub brushes: Vec<io::NamedBrush>,
     /// Name being typed for the next one kept.
     pub brush_name: String,
+}
+
+/// Whether a press at this point belongs to the interface rather than the model.
+///
+/// Asking egui whether it wants the pointer is not enough at the moment of
+/// contact. That answer is built from the previous frame, and it is built from
+/// hovering: a mouse has to travel over a button before it can press it, so by
+/// the time the press lands egui already knows. A pen and a finger have no
+/// hover at all. Their first report is the press itself, egui has never seen
+/// the pointer there, and the press reads as landing on the model, which is how
+/// dragging the zoom button also spun the view.
+///
+/// So the question is asked of the geometry instead: outside the viewport is a
+/// dock, and anything egui has put in a layer above the background inside it is
+/// a floating control or a window.
+pub fn interface_owns(ctx: &egui::Context, viewport: egui::Rect, at: egui::Pos2) -> bool {
+    if !viewport.contains(at) {
+        return true;
+    }
+    matches!(ctx.layer_id_at(at), Some(layer) if layer.order > egui::Order::Background)
 }
 
 /// Colour schemes built off the hue in hand.
@@ -342,6 +366,7 @@ impl Default for UiState {
             max_samples: 4,
             wireframe_available: true,
             picking_color: false,
+            hover_color: None,
             add_primitive: Primitive::Sphere,
             brush_reach: 10.0,
             upload_bytes: 0,
@@ -500,7 +525,8 @@ pub fn draw(
     }
     let cursor = st.viewport_cursor;
     let wheel_open = st.wheel.open;
-    for a in st.hud.show(root.ctx(), viewport, s, &p, wheel_open) {
+    let picking = st.picking_color.then_some(st.hover_color).flatten();
+    for a in st.hud.show(root.ctx(), viewport, s, &p, wheel_open, picking) {
         match a {
             HudAction::OpenWheel => {
                 // Summoned from a floating button, the menu always opens in the
@@ -1411,6 +1437,34 @@ fn colour_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ct
         .clicked()
     {
         cx.actions.push(Action::PickColorMode);
+    }
+    // While the eyedropper is armed, what it is pointing at is worth more than
+    // what it took last time.
+    if st.picking_color {
+        ui.horizontal(|ui| {
+            match st.hover_color {
+                Some(c) => {
+                    colour_chip(ui, c, m.row, p);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "#{:02X}{:02X}{:02X}",
+                            (c.x.clamp(0.0, 1.0) * 255.0) as u8,
+                            (c.y.clamp(0.0, 1.0) * 255.0) as u8,
+                            (c.z.clamp(0.0, 1.0) * 255.0) as u8
+                        ))
+                        .monospace()
+                        .color(p.accent),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new("Move over the model.")
+                            .small()
+                            .color(p.dim),
+                    );
+                }
+            }
+        });
     }
 
     // Harmonies.
@@ -2607,6 +2661,43 @@ mod tests {
         let back = Harmony::Complement.mates(h2, s2, v2)[0];
         let (r, g, b) = wheel::hsv_to_rgb(h, s, v);
         assert!((back - glam::Vec3::new(r, g, b)).length() < 1e-3);
+    }
+
+    /// A press on a floating control belongs to the interface even though it is
+    /// inside the viewport, and a press on bare viewport does not.
+    ///
+    /// This is what a pen gets wrong when the question is put to egui instead:
+    /// it has no hover, so at the moment of contact egui has never seen the
+    /// pointer there and says the interface does not want it.
+    #[test]
+    fn a_floating_control_owns_the_press_under_it() {
+        let ctx = egui::Context::default();
+        let viewport = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let button = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(60.0, 60.0));
+
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(viewport);
+        // Two frames: the first registers the area, the second can be asked
+        // about it, which is exactly how it goes in the application.
+        for _ in 0..2 {
+            ctx.begin_pass(input.clone());
+            egui::Area::new(egui::Id::new("pod"))
+                .fixed_pos(button.min)
+                .order(egui::Order::Middle)
+                .show(&ctx, |ui| {
+                    ui.allocate_exact_size(button.size(), egui::Sense::click_and_drag());
+                });
+            // The font atlas comes out as a texture delta, and epaint refuses
+            // to be dropped with one unhandled. There is no renderer here to
+            // hand it to.
+            let mut out = ctx.end_pass();
+            out.textures_delta.clear();
+        }
+
+        assert!(interface_owns(&ctx, viewport, button.center()));
+        assert!(!interface_owns(&ctx, viewport, egui::pos2(600.0, 400.0)));
+        // Outside the viewport is a dock, whatever egui thinks.
+        assert!(interface_owns(&ctx, viewport, egui::pos2(900.0, 300.0)));
     }
 
     /// A tab that is floating must not also be listed in the dock, and closing
