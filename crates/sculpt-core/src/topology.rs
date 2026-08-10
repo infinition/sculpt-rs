@@ -11,6 +11,7 @@ use crate::mesh::{Mesh, Vertex};
 use glam::Vec3;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
 // Subdivision
@@ -223,96 +224,129 @@ pub fn voxel_remesh(mesh: &Mesh, opts: &RemeshOptions) -> Mesh {
     }
 
     let band = h * 2.5;
-    let mut field = vec![band; total];
     let idx = |i: usize, j: usize, k: usize| (k * ny + j) * nx + i;
 
     // Unsigned distance inside a narrow band around every triangle.
-    for tri in &mesh.faces {
-        let a = mesh.verts[tri[0] as usize].pos;
-        let b = mesh.verts[tri[1] as usize].pos;
-        let c = mesh.verts[tri[2] as usize].pos;
-        let tlo = a.min(b).min(c) - Vec3::splat(band);
-        let thi = a.max(b).max(c) + Vec3::splat(band);
-        let i0 = (((tlo.x - origin.x) / h).floor().max(0.0) as usize).min(nx - 1);
-        let j0 = (((tlo.y - origin.y) / h).floor().max(0.0) as usize).min(ny - 1);
-        let k0 = (((tlo.z - origin.z) / h).floor().max(0.0) as usize).min(nz - 1);
-        let i1 = (((thi.x - origin.x) / h).ceil().max(0.0) as usize).min(nx - 1);
-        let j1 = (((thi.y - origin.y) / h).ceil().max(0.0) as usize).min(ny - 1);
-        let k1 = (((thi.z - origin.z) / h).ceil().max(0.0) as usize).min(nz - 1);
-        for k in k0..=k1 {
-            for j in j0..=j1 {
-                for i in i0..=i1 {
-                    let p = origin + Vec3::new(i as f32, j as f32, k as f32) * h;
-                    let d = point_triangle_distance(p, a, b, c);
-                    let slot = &mut field[idx(i, j, k)];
-                    if d < *slot {
-                        *slot = d;
+    //
+    // Triangles overlap in the band, so this is many threads writing whichever
+    // distance is smallest into cells they share. Distances here are never
+    // negative, and a non-negative float compares exactly as its bits do when
+    // read as an integer, so the pass is one atomic minimum per cell touched:
+    // no lock, and no per-thread copy of a grid that can reach a gigabyte.
+    let mut field: Vec<f32> = {
+        let cells: Vec<AtomicU32> = (0..total)
+            .map(|_| AtomicU32::new(band.to_bits()))
+            .collect();
+        mesh.faces.par_iter().for_each(|tri| {
+            let a = mesh.verts[tri[0] as usize].pos;
+            let b = mesh.verts[tri[1] as usize].pos;
+            let c = mesh.verts[tri[2] as usize].pos;
+            let tlo = a.min(b).min(c) - Vec3::splat(band);
+            let thi = a.max(b).max(c) + Vec3::splat(band);
+            let i0 = (((tlo.x - origin.x) / h).floor().max(0.0) as usize).min(nx - 1);
+            let j0 = (((tlo.y - origin.y) / h).floor().max(0.0) as usize).min(ny - 1);
+            let k0 = (((tlo.z - origin.z) / h).floor().max(0.0) as usize).min(nz - 1);
+            let i1 = (((thi.x - origin.x) / h).ceil().max(0.0) as usize).min(nx - 1);
+            let j1 = (((thi.y - origin.y) / h).ceil().max(0.0) as usize).min(ny - 1);
+            let k1 = (((thi.z - origin.z) / h).ceil().max(0.0) as usize).min(nz - 1);
+            for k in k0..=k1 {
+                for j in j0..=j1 {
+                    for i in i0..=i1 {
+                        let p = origin + Vec3::new(i as f32, j as f32, k as f32) * h;
+                        let d = point_triangle_distance(p, a, b, c);
+                        cells[idx(i, j, k)].fetch_min(d.to_bits(), Ordering::Relaxed);
                     }
                 }
             }
-        }
-    }
+        });
+        cells
+            .into_par_iter()
+            .map(|c| f32::from_bits(c.into_inner()))
+            .collect()
+    };
 
     // Sign by parity: rasterise every triangle onto the grid lines running
     // along X and record where it crosses them.
+    //
+    // Split by grid line rather than by triangle: a line belongs to one thread,
+    // which reads every triangle and keeps only what crosses a line of its own.
     let mut crossings: Vec<Vec<f32>> = vec![Vec::new(); ny * nz];
-    for tri in &mesh.faces {
-        let a = mesh.verts[tri[0] as usize].pos;
-        let b = mesh.verts[tri[1] as usize].pos;
-        let c = mesh.verts[tri[2] as usize].pos;
-        let ylo = a.y.min(b.y).min(c.y);
-        let yhi = a.y.max(b.y).max(c.y);
-        let zlo = a.z.min(b.z).min(c.z);
-        let zhi = a.z.max(b.z).max(c.z);
-        let j0 = (((ylo - origin.y) / h).ceil().max(0.0) as usize).min(ny);
-        let j1 = (((yhi - origin.y) / h).floor().max(0.0) as usize).min(ny - 1);
-        let k0 = (((zlo - origin.z) / h).ceil().max(0.0) as usize).min(nz);
-        let k1 = (((zhi - origin.z) / h).floor().max(0.0) as usize).min(nz - 1);
-        if j0 > j1 || k0 > k1 {
-            continue;
-        }
-        // Barycentric setup in the YZ plane.
-        let d = (b.y - a.y) * (c.z - a.z) - (c.y - a.y) * (b.z - a.z);
-        if d.abs() < 1e-20 {
-            continue;
-        }
-        let inv_d = 1.0 / d;
-        for k in k0..=k1 {
-            let pz = origin.z + k as f32 * h;
-            for j in j0..=j1 {
-                let py = origin.y + j as f32 * h;
-                let u = ((py - a.y) * (c.z - a.z) - (c.y - a.y) * (pz - a.z)) * inv_d;
-                let v = ((b.y - a.y) * (pz - a.z) - (py - a.y) * (b.z - a.z)) * inv_d;
-                if u < 0.0 || v < 0.0 || u + v > 1.0 {
+    let per_part = (ny * nz).div_ceil(rayon::current_num_threads().max(1)).max(1);
+    crossings
+        .par_chunks_mut(per_part)
+        .enumerate()
+        .for_each(|(part, mine)| {
+            let first = part * per_part;
+            let last = first + mine.len();
+            for tri in &mesh.faces {
+                let a = mesh.verts[tri[0] as usize].pos;
+                let b = mesh.verts[tri[1] as usize].pos;
+                let c = mesh.verts[tri[2] as usize].pos;
+                let ylo = a.y.min(b.y).min(c.y);
+                let yhi = a.y.max(b.y).max(c.y);
+                let zlo = a.z.min(b.z).min(c.z);
+                let zhi = a.z.max(b.z).max(c.z);
+                let j0 = (((ylo - origin.y) / h).ceil().max(0.0) as usize).min(ny);
+                let j1 = (((yhi - origin.y) / h).floor().max(0.0) as usize).min(ny - 1);
+                let k0 = (((zlo - origin.z) / h).ceil().max(0.0) as usize).min(nz);
+                let k1 = (((zhi - origin.z) / h).floor().max(0.0) as usize).min(nz - 1);
+                if j0 > j1 || k0 > k1 {
                     continue;
                 }
-                let x = a.x + u * (b.x - a.x) + v * (c.x - a.x);
-                crossings[k * ny + j].push(x);
+                // The triangle can only reach lines k0*ny+j0 through k1*ny+j1,
+                // so most triangles are dismissed before any arithmetic.
+                if k1 * ny + j1 < first || k0 * ny + j0 >= last {
+                    continue;
+                }
+                // Barycentric setup in the YZ plane.
+                let d = (b.y - a.y) * (c.z - a.z) - (c.y - a.y) * (b.z - a.z);
+                if d.abs() < 1e-20 {
+                    continue;
+                }
+                let inv_d = 1.0 / d;
+                for k in k0..=k1 {
+                    let pz = origin.z + k as f32 * h;
+                    for j in j0..=j1 {
+                        let line = k * ny + j;
+                        if line < first || line >= last {
+                            continue;
+                        }
+                        let py = origin.y + j as f32 * h;
+                        let u = ((py - a.y) * (c.z - a.z) - (c.y - a.y) * (pz - a.z)) * inv_d;
+                        let v = ((b.y - a.y) * (pz - a.z) - (py - a.y) * (b.z - a.z)) * inv_d;
+                        if u < 0.0 || v < 0.0 || u + v > 1.0 {
+                            continue;
+                        }
+                        let x = a.x + u * (b.x - a.x) + v * (c.x - a.x);
+                        mine[line - first].push(x);
+                    }
+                }
             }
-        }
-    }
+        });
 
-    for (line, xs) in crossings.iter_mut().enumerate() {
-        if xs.is_empty() {
-            continue;
-        }
-        xs.sort_unstable_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
-        let k = line / ny;
-        let j = line % ny;
-        let mut cursor = 0usize;
-        let mut inside = false;
-        for i in 0..nx {
-            let x = origin.x + i as f32 * h;
-            while cursor < xs.len() && xs[cursor] <= x {
-                inside = !inside;
-                cursor += 1;
+    // A line owns a run of nx cells that no other line touches, so the sweep
+    // splits with nothing shared between threads at all.
+    field
+        .par_chunks_mut(nx)
+        .zip(crossings.par_iter_mut())
+        .for_each(|(row, xs)| {
+            if xs.is_empty() {
+                return;
             }
-            if inside {
-                let slot = &mut field[idx(i, j, k)];
-                *slot = -*slot;
+            xs.sort_unstable_by(|p, q| p.partial_cmp(q).unwrap_or(std::cmp::Ordering::Equal));
+            let mut cursor = 0usize;
+            let mut inside = false;
+            for (i, slot) in row.iter_mut().enumerate() {
+                let x = origin.x + i as f32 * h;
+                while cursor < xs.len() && xs[cursor] <= x {
+                    inside = !inside;
+                    cursor += 1;
+                }
+                if inside {
+                    *slot = -*slot;
+                }
             }
-        }
-    }
+        });
 
     // Surface nets: one vertex per cell that straddles the surface.
     let cell_dims = (nx - 1, ny - 1, nz - 1);
@@ -330,55 +364,70 @@ pub fn voxel_remesh(mesh: &Mesh, opts: &RemeshOptions) -> Mesh {
         [0, 4], [1, 5], [2, 6], [3, 7],
     ];
 
-    for k in 0..cell_dims.2 {
-        for j in 0..cell_dims.1 {
-            for i in 0..cell_dims.0 {
-                let mut val = [0f32; 8];
-                let mut neg = 0;
-                for (c, off) in CORNER.iter().enumerate() {
-                    let v = field[idx(i + off[0], j + off[1], k + off[2])];
-                    val[c] = v;
-                    if v < 0.0 {
-                        neg += 1;
+    // A slice of the grid at a time, in parallel, then numbered in order.
+    //
+    // Only the numbering has to be sequential, and it runs over the cells that
+    // straddle the surface rather than over the grid, which is a thousandth of
+    // the work. Slices are gathered in order, so the mesh comes out identical
+    // whatever the machine.
+    let slices: Vec<Vec<(u32, Vec3)>> = (0..cell_dims.2)
+        .into_par_iter()
+        .map(|k| {
+            let mut found = Vec::new();
+            for j in 0..cell_dims.1 {
+                for i in 0..cell_dims.0 {
+                    let mut val = [0f32; 8];
+                    let mut neg = 0;
+                    for (c, off) in CORNER.iter().enumerate() {
+                        let v = field[idx(i + off[0], j + off[1], k + off[2])];
+                        val[c] = v;
+                        if v < 0.0 {
+                            neg += 1;
+                        }
                     }
-                }
-                if neg == 0 || neg == 8 {
-                    continue;
-                }
-                let mut acc = Vec3::ZERO;
-                let mut count = 0.0;
-                for e in EDGE {
-                    let (va, vb) = (val[e[0]], val[e[1]]);
-                    if (va < 0.0) == (vb < 0.0) {
+                    if neg == 0 || neg == 8 {
                         continue;
                     }
-                    let t = (va / (va - vb)).clamp(0.0, 1.0);
-                    let ca = Vec3::new(
-                        CORNER[e[0]][0] as f32,
-                        CORNER[e[0]][1] as f32,
-                        CORNER[e[0]][2] as f32,
-                    );
-                    let cb = Vec3::new(
-                        CORNER[e[1]][0] as f32,
-                        CORNER[e[1]][1] as f32,
-                        CORNER[e[1]][2] as f32,
-                    );
-                    acc += ca.lerp(cb, t);
-                    count += 1.0;
+                    let mut acc = Vec3::ZERO;
+                    let mut count = 0.0;
+                    for e in EDGE {
+                        let (va, vb) = (val[e[0]], val[e[1]]);
+                        if (va < 0.0) == (vb < 0.0) {
+                            continue;
+                        }
+                        let t = (va / (va - vb)).clamp(0.0, 1.0);
+                        let ca = Vec3::new(
+                            CORNER[e[0]][0] as f32,
+                            CORNER[e[0]][1] as f32,
+                            CORNER[e[0]][2] as f32,
+                        );
+                        let cb = Vec3::new(
+                            CORNER[e[1]][0] as f32,
+                            CORNER[e[1]][1] as f32,
+                            CORNER[e[1]][2] as f32,
+                        );
+                        acc += ca.lerp(cb, t);
+                        count += 1.0;
+                    }
+                    if count == 0.0 {
+                        continue;
+                    }
+                    let local = acc / count;
+                    let p = origin + (Vec3::new(i as f32, j as f32, k as f32) + local) * h;
+                    found.push((cidx(i, j, k) as u32, p));
                 }
-                if count == 0.0 {
-                    continue;
-                }
-                let local = acc / count;
-                let p = origin + (Vec3::new(i as f32, j as f32, k as f32) + local) * h;
-                cell_vert[cidx(i, j, k)] = positions.len() as u32;
-                positions.push(p);
             }
+            found
+        })
+        .collect();
+    for slice in slices {
+        for (cell, p) in slice {
+            cell_vert[cell as usize] = positions.len() as u32;
+            positions.push(p);
         }
     }
 
     // Quads around every sign-changing grid edge, wound so normals point out.
-    let mut faces: Vec<[u32; 3]> = Vec::new();
     let quad = |a: u32, b: u32, c: u32, d: u32, flip: bool, faces: &mut Vec<[u32; 3]>| {
         if a == u32::MAX || b == u32::MAX || c == u32::MAX || d == u32::MAX {
             return;
@@ -392,43 +441,54 @@ pub fn voxel_remesh(mesh: &Mesh, opts: &RemeshOptions) -> Mesh {
         }
     };
 
-    for k in 0..nz {
-        for j in 0..ny {
-            for i in 0..nx {
-                let here = field[idx(i, j, k)] < 0.0;
-                // +X edge, shared by the four cells around it in Y and Z.
-                if i + 1 < nx && j > 0 && k > 0 && j < ny && k < nz {
-                    let there = field[idx(i + 1, j, k)] < 0.0;
-                    if here != there {
-                        let a = cell_vert[cidx(i, j - 1, k - 1)];
-                        let b = cell_vert[cidx(i, j, k - 1)];
-                        let c = cell_vert[cidx(i, j, k)];
-                        let d = cell_vert[cidx(i, j - 1, k)];
-                        quad(a, b, c, d, here, &mut faces);
+    // One slice per thread again, gathered in order so the result does not
+    // depend on how many cores the machine has.
+    let slabs: Vec<Vec<[u32; 3]>> = (0..nz)
+        .into_par_iter()
+        .map(|k| {
+            let mut faces: Vec<[u32; 3]> = Vec::new();
+            for j in 0..ny {
+                for i in 0..nx {
+                    let here = field[idx(i, j, k)] < 0.0;
+                    // +X edge, shared by the four cells around it in Y and Z.
+                    if i + 1 < nx && j > 0 && k > 0 && j < ny && k < nz {
+                        let there = field[idx(i + 1, j, k)] < 0.0;
+                        if here != there {
+                            let a = cell_vert[cidx(i, j - 1, k - 1)];
+                            let b = cell_vert[cidx(i, j, k - 1)];
+                            let c = cell_vert[cidx(i, j, k)];
+                            let d = cell_vert[cidx(i, j - 1, k)];
+                            quad(a, b, c, d, here, &mut faces);
+                        }
                     }
-                }
-                if j + 1 < ny && i > 0 && k > 0 && i < nx && k < nz {
-                    let there = field[idx(i, j + 1, k)] < 0.0;
-                    if here != there {
-                        let a = cell_vert[cidx(i - 1, j, k - 1)];
-                        let b = cell_vert[cidx(i, j, k - 1)];
-                        let c = cell_vert[cidx(i, j, k)];
-                        let d = cell_vert[cidx(i - 1, j, k)];
-                        quad(a, b, c, d, !here, &mut faces);
+                    if j + 1 < ny && i > 0 && k > 0 && i < nx && k < nz {
+                        let there = field[idx(i, j + 1, k)] < 0.0;
+                        if here != there {
+                            let a = cell_vert[cidx(i - 1, j, k - 1)];
+                            let b = cell_vert[cidx(i, j, k - 1)];
+                            let c = cell_vert[cidx(i, j, k)];
+                            let d = cell_vert[cidx(i - 1, j, k)];
+                            quad(a, b, c, d, !here, &mut faces);
+                        }
                     }
-                }
-                if k + 1 < nz && i > 0 && j > 0 && i < nx && j < ny {
-                    let there = field[idx(i, j, k + 1)] < 0.0;
-                    if here != there {
-                        let a = cell_vert[cidx(i - 1, j - 1, k)];
-                        let b = cell_vert[cidx(i, j - 1, k)];
-                        let c = cell_vert[cidx(i, j, k)];
-                        let d = cell_vert[cidx(i - 1, j, k)];
-                        quad(a, b, c, d, here, &mut faces);
+                    if k + 1 < nz && i > 0 && j > 0 && i < nx && j < ny {
+                        let there = field[idx(i, j, k + 1)] < 0.0;
+                        if here != there {
+                            let a = cell_vert[cidx(i - 1, j - 1, k)];
+                            let b = cell_vert[cidx(i, j - 1, k)];
+                            let c = cell_vert[cidx(i, j, k)];
+                            let d = cell_vert[cidx(i - 1, j, k)];
+                            quad(a, b, c, d, here, &mut faces);
+                        }
                     }
                 }
             }
-        }
+            faces
+        })
+        .collect();
+    let mut faces: Vec<[u32; 3]> = Vec::with_capacity(slabs.iter().map(Vec::len).sum());
+    for slab in slabs {
+        faces.extend_from_slice(&slab);
     }
 
     if positions.is_empty() || faces.is_empty() {

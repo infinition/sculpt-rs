@@ -77,6 +77,9 @@ struct State {
     /// Set for one frame after we reordered a mesh ourselves, so the change
     /// mark that reordering leaves behind is not mistaken for news.
     partition_fresh: bool,
+    /// Whether the interface asked to be drawn again soon, which it does while
+    /// a panel is sliding, a tooltip is fading or a text cursor is blinking.
+    egui_animating: bool,
 }
 
 impl State {
@@ -243,7 +246,24 @@ impl State {
             full_resync: true,
             partitions: Vec::new(),
             partition_fresh: false,
+            egui_animating: true,
         }
+    }
+
+    /// Whether anything on screen is still moving, and therefore whether the
+    /// next frame is worth drawing.
+    ///
+    /// Everything that changes the picture without an event behind it has to be
+    /// named here: a view still gliding to where it was sent, a stroke under
+    /// the pen, the radial menu, a status line fading out, and whatever the
+    /// interface says about itself. Anything driven by an event asks for its
+    /// own frame when the event arrives.
+    fn animating(&self) -> bool {
+        self.egui_animating
+            || self.sculptor.is_stroking()
+            || self.camera.is_settling()
+            || self.ui.wheel.open
+            || (!self.ui.status.is_empty() && self.ui.status_age < 4.0)
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -1289,6 +1309,13 @@ impl State {
                 }
             })
         };
+        // A delay of zero is the interface asking for the next frame at once;
+        // a long one is it saying there is nothing to wait for. A second is
+        // well past anything a person reads as motion.
+        self.egui_animating = full_output
+            .viewport_output
+            .values()
+            .any(|v| v.repaint_delay < std::time::Duration::from_secs(1));
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
         let paint_jobs = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -1499,12 +1526,25 @@ impl ApplicationHandler for App {
         }
         let egui_captured = response.consumed || st.egui_ctx.egui_wants_pointer_input();
 
+        // Anything that is not the frame itself may have changed what the
+        // frame should show, so it asks for one. Events are rare next to
+        // frames, and one frame too many costs nothing.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            st.window.request_redraw();
+        }
+
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => st.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 st.render();
-                st.window.request_redraw();
+                // Only keep drawing while something is actually moving.
+                // Redrawing an idle twenty-five million triangle model sixty
+                // times a second heats the machine, flattens a battery and
+                // leaves the card with nothing spare for the next stroke.
+                if st.animating() {
+                    st.window.request_redraw();
+                }
             }
             WindowEvent::ModifiersChanged(m) => {
                 let s = m.state();
@@ -1673,7 +1713,9 @@ impl ApplicationHandler for App {
 
 fn main() {
     let el = EventLoop::new().expect("failed to create event loop");
-    el.set_control_flow(ControlFlow::Poll);
+    // Wait rather than poll: the application draws when it is asked to, and
+    // `animating` is what decides whether it asks itself again.
+    el.set_control_flow(ControlFlow::Wait);
     let mut app = App::default();
     el.run_app(&mut app).expect("event loop failed");
 }

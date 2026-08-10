@@ -231,6 +231,17 @@ impl Camera {
     }
 
     /// Advances the smoothing. `dt` is in seconds.
+    /// True while the view is still catching up with where it was sent.
+    ///
+    /// What tells the application it has to draw another frame. The thresholds
+    /// are below anything an eye can catch at any sane zoom level.
+    pub fn is_settling(&self) -> bool {
+        self.live.target.distance_squared(self.goal.target) > 1e-12
+            || (self.live.distance - self.goal.distance).abs() > 1e-6
+            || (self.live.yaw - self.goal.yaw).abs() > 1e-6
+            || (self.live.pitch - self.goal.pitch).abs() > 1e-6
+    }
+
     pub fn update(&mut self, dt: f32) {
         if self.smoothing <= 0.001 {
             self.live = self.goal;

@@ -237,6 +237,11 @@ impl Sculptor {
             let m = input.mirrored(self.symmetry_axis, 0.0);
             self.dab(&m);
         }
+        // The faces the dab disturbed go back in their cells here, once, rather
+        // than three times each in the middle of it.
+        if let Some(mesh) = self.mesh_mut() {
+            mesh.flush_refit();
+        }
     }
 
     fn dab(&mut self, input: &StrokeInput) {

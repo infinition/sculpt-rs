@@ -183,6 +183,9 @@ pub struct Mesh {
     /// mutation here keeps it honest by copying a slot before writing it, and
     /// a log filled in by hand would describe a mesh that never existed.
     pub(crate) log: Option<TopoLog>,
+    /// Faces whose cell in the grid is out of date, waiting for
+    /// [`Mesh::flush_refit`].
+    pub(crate) stale_faces: Vec<u32>,
 }
 
 impl Mesh {
@@ -347,7 +350,14 @@ impl Mesh {
         (mid, pa.distance(mid).max(pb.distance(mid)).max(pc.distance(mid)))
     }
 
-    /// Refiles a vertex and, when it changed cell, its incident faces.
+    /// Refiles a vertex and notes the faces around it for later.
+    ///
+    /// The faces are not refiled here. A dab moves tens of thousands of
+    /// vertices and a face has three of them, so doing it on the spot means
+    /// working out the same triangle's centre three times, one thread at a
+    /// time, in the middle of the stroke. Noting them and settling up at the
+    /// end of the dab does each one once, and does the arithmetic on every
+    /// core. Nothing reads a face cell in between.
     fn refile(&mut self, v: u32) {
         self.touch_vert(v);
         if self.accel.is_none() {
@@ -358,13 +368,37 @@ impl Mesh {
         if !moved {
             return;
         }
-        let faces: FaceList = self.vfaces[v as usize].clone();
-        for f in faces {
-            let (c, r) = self.face_sphere(f);
-            if let Some(g) = &mut self.accel {
+        self.stale_faces.extend_from_slice(&self.vfaces[v as usize]);
+    }
+
+    /// Puts every face noted since the last call back in the right cell.
+    ///
+    /// Cheap and safe to call when nothing is waiting, which is most of the
+    /// time.
+    pub fn flush_refit(&mut self) {
+        if self.stale_faces.is_empty() || self.accel.is_none() {
+            self.stale_faces.clear();
+            return;
+        }
+        let mut stale = std::mem::take(&mut self.stale_faces);
+        stale.sort_unstable();
+        stale.dedup();
+        let n = self.faces.len() as u32;
+        stale.retain(|f| *f < n);
+        // Where each face has ended up, worked out across the cores; the
+        // filing itself is a scatter into one structure and stays here.
+        let spheres: Vec<(Vec3, f32)> = stale
+            .par_iter()
+            .with_min_len(256)
+            .map(|&f| self.face_sphere(f))
+            .collect();
+        if let Some(g) = &mut self.accel {
+            for (&f, (c, r)) in stale.iter().zip(spheres) {
                 g.move_face(f, c, r);
             }
         }
+        stale.clear();
+        self.stale_faces = stale;
     }
 
     /// Moves one vertex, keeping the spatial index correct.
@@ -561,10 +595,7 @@ impl Mesh {
         }
         self.faces[f as usize] = tri;
         if self.accel.is_some() {
-            let (c, r) = self.face_sphere(f);
-            if let Some(g) = &mut self.accel {
-                g.move_face(f, c, r);
-            }
+            self.stale_faces.push(f);
         }
         self.touch_face(f);
     }
@@ -675,14 +706,11 @@ impl Mesh {
         // `a` moved to the midpoint and inherited faces: refile everything it
         // now touches.
         self.refile(a);
+        // Everything `a` now touches has a new centre, whether or not `a`
+        // itself changed cell, since it inherited the faces of `b`.
         if self.accel.is_some() {
             let faces: FaceList = self.vfaces[a as usize].clone();
-            for f in faces {
-                let (c, r) = self.face_sphere(f);
-                if let Some(g) = &mut self.accel {
-                    g.move_face(f, c, r);
-                }
-            }
+            self.stale_faces.extend_from_slice(&faces);
         }
         true
     }
