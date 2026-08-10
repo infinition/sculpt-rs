@@ -123,15 +123,60 @@ pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
 /// of a form means putting the cursor slightly outside it, and a plain ray cast
 /// answers "nothing there"; this answers "the surface is right here".
 ///
-/// Deliberately a linear scan: it only runs when the ray missed, which is the
-/// cheap case for everything else, and it keeps the result exact.
+/// It walks the ray through the grid rather than scanning the model. It used to
+/// scan, on the reasoning that it only runs when the ray missed. That reasoning
+/// was wrong: the ray misses on every frame the cursor is not exactly over the
+/// model, and the viewport asks once a frame to draw the brush ring. A pass
+/// over every vertex, sixty times a second, is what made half a million
+/// triangles crawl.
 pub fn nearest_to_ray(mesh: &Mesh, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<Hit> {
-    if mesh.verts.is_empty() {
+    if mesh.verts.is_empty() || max_dist <= 0.0 {
         return None;
     }
     let d = dir.normalize_or(-Vec3::Z);
-    let limit = max_dist * max_dist;
 
+    if let Some(g) = &mesh.accel {
+        // Miss the box and there is nothing to find, for the price of six
+        // divisions. This is the answer most of the time.
+        let (t0, t1) = g.ray_span(origin, d, max_dist)?;
+        // Steps of one radius leave no gap: consecutive spheres of that radius
+        // centred a radius apart overlap along the whole corridor.
+        let step = max_dist.max(g.cell_size() * 0.5);
+        let mut best: Option<(f32, f32, u32)> = None;
+        let mut t = t0;
+        // A hard cap keeps a grazing ray across a huge model from turning into
+        // a long walk; past this the fallback below is the cheaper answer.
+        let mut budget = 64;
+        loop {
+            for v in verts_in_sphere(mesh, origin + d * t, max_dist) {
+                let to = mesh.verts[v as usize].pos - origin;
+                let along = to.dot(d);
+                if along <= 0.0 {
+                    continue;
+                }
+                let off = (to - d * along).length_squared();
+                let better = best.is_none_or(|(bo, ba, _)| off < bo || (off == bo && along < ba));
+                if better {
+                    best = Some((off, along, v));
+                }
+            }
+            budget -= 1;
+            if t >= t1 || budget == 0 {
+                break;
+            }
+            t = (t + step).min(t1);
+        }
+        if let Some((_, along, index)) = best {
+            return Some(hit_at_vertex(mesh, index, along));
+        }
+        if budget > 0 {
+            // The walk covered the whole corridor and found nothing.
+            return None;
+        }
+    }
+
+    // No grid, or a walk too long to be worth it.
+    let limit = max_dist * max_dist;
     let best = mesh
         .verts
         .par_iter()
@@ -151,16 +196,14 @@ pub fn nearest_to_ray(mesh: &Mesh, origin: Vec3, dir: Vec3, max_dist: f32) -> Op
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         })?;
-
     let (_, along, index) = best;
+    Some(hit_at_vertex(mesh, index, along))
+}
+
+fn hit_at_vertex(mesh: &Mesh, index: u32, along: f32) -> Hit {
     let v = &mesh.verts[index as usize];
     let face = mesh.vfaces[index as usize].first().copied().unwrap_or(0);
-    Some(Hit {
-        face,
-        point: v.pos,
-        normal: v.nrm,
-        t: along,
-    })
+    Hit { face, point: v.pos, normal: v.nrm, t: along }
 }
 
 /// Nearest vertex to a point within `radius`, for colour picking and snapping.

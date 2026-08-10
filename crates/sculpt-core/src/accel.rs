@@ -94,6 +94,26 @@ impl Grid {
         g
     }
 
+    /// The corner of the box every inserted vertex has fallen inside.
+    ///
+    /// Only ever grown, so it stays a valid bound after a collapse even though
+    /// it may end up larger than it needs to be.
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        (self.lo, self.hi)
+    }
+
+    /// Where a ray enters and leaves the box, widened by `margin`.
+    ///
+    /// Answers `None` when the ray misses entirely, which is the answer worth
+    /// having: it costs nothing and it is the common case for a cursor that is
+    /// not over the model.
+    pub fn ray_span(&self, o: Vec3, d: Vec3, margin: f32) -> Option<(f32, f32)> {
+        let m = Vec3::splat(margin);
+        let (t0, t1) = slab(o, d, self.lo - m, self.hi + m)?;
+        let t0 = t0.max(0.0);
+        (t1 >= t0).then_some((t0, t1))
+    }
+
     pub fn cell_size(&self) -> f32 {
         self.cell
     }

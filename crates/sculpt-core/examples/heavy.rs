@@ -89,6 +89,33 @@ fn main() {
         s.history.used_bytes() as f64 / 1e6
     );
 
+    // Ce que le viewport demande à chaque image, curseur à côté du modèle.
+    println!();
+    {
+        let m = s.mesh();
+        let o = Vec3::new(1.4, 0.0, 5.0);
+        let d = -Vec3::Z;
+        let t = Instant::now();
+        for _ in 0..60 {
+            let _ = sculpt_core::query::nearest_to_ray(m, o, d, 0.05);
+        }
+        println!(
+            "{:<46} {:>9.2} ms   par image",
+            "surface la plus proche, curseur à côté",
+            t.elapsed().as_secs_f64() * 1000.0 / 60.0
+        );
+        let o = Vec3::new(0.0, 0.0, 5.0);
+        let t = Instant::now();
+        for _ in 0..60 {
+            let _ = sculpt_core::query::nearest_to_ray(m, o, d, 0.05);
+        }
+        println!(
+            "{:<46} {:>9.2} ms   par image",
+            "la même, curseur sur le modèle",
+            t.elapsed().as_secs_f64() * 1000.0 / 60.0
+        );
+    }
+
     // Le mode réel de l'application: topologie dynamique activée.
     println!();
     s.dyntopo_enabled = true;

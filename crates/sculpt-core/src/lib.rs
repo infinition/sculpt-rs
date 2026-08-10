@@ -824,6 +824,45 @@ mod tests {
         assert!((fast_hit.t - slow_hit.t).abs() < 1e-4, "{fast_hit:?} vs {slow_hit:?}");
     }
 
+    /// La recherche de surface proche marche le long du rayon quand la grille
+    /// existe et balaye tout sinon. Les deux doivent répondre la même chose.
+    #[test]
+    fn the_near_miss_search_agrees_with_the_scan() {
+        let mut m = primitives::icosphere(4);
+        // Des rayons qui frôlent la sphère de près, de loin, et qui la ratent.
+        let cases = [
+            (Vec3::new(1.02, 0.0, 5.0), -Vec3::Z, 0.2),
+            (Vec3::new(0.0, 1.05, 5.0), -Vec3::Z, 0.15),
+            (Vec3::new(0.9, 0.9, 5.0), -Vec3::Z, 0.3),
+            (Vec3::new(3.0, 0.0, 5.0), -Vec3::Z, 0.2),
+            (Vec3::new(0.0, 0.0, 5.0), Vec3::Z, 0.5),
+        ];
+        for (o, d, reach) in cases {
+            m.invalidate_accel();
+            let slow = query::nearest_to_ray(&m, o, d, reach);
+            m.ensure_accel(reach);
+            let fast = query::nearest_to_ray(&m, o, d, reach);
+            match (slow, fast) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    // Deux sommets à égalité sont l'un et l'autre corrects; ce
+                    // qui compte est la distance au rayon.
+                    let off = |h: &query::Hit| {
+                        let to = h.point - o;
+                        (to - d.normalize() * to.dot(d.normalize())).length()
+                    };
+                    assert!(
+                        (off(&a) - off(&b)).abs() < 1e-4,
+                        "rayon depuis {o:?}: {:?} contre {:?}",
+                        off(&a),
+                        off(&b)
+                    );
+                }
+                (a, b) => panic!("désaccord depuis {o:?}: {a:?} contre {b:?}"),
+            }
+        }
+    }
+
     #[test]
     fn undo_restores_the_previous_state() {
         let mut s = Sculptor::new(primitives::icosphere(2));
