@@ -185,6 +185,12 @@ pub struct UiState {
     pub brush_reach: f32,
     /// Bytes the last frame sent to the GPU, shown in the statistics.
     pub upload_bytes: u64,
+    /// Faces actually sent to the GPU last frame, and how many draw calls it
+    /// took. Shown in the statistics: the whole point of the partition is that
+    /// the first number is far below the triangle count, and there is no way to
+    /// tell without looking.
+    pub drawn_faces: u32,
+    pub draw_calls: u32,
     pub nav: NavWidget,
     pub show_nav: bool,
     pub hud: Hud,
@@ -370,6 +376,8 @@ impl Default for UiState {
             add_primitive: Primitive::Sphere,
             brush_reach: 10.0,
             upload_bytes: 0,
+            drawn_faces: 0,
+            draw_calls: 0,
             nav: NavWidget::default(),
             show_nav: true,
             hud: Hud::default(),

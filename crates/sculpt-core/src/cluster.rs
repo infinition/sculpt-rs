@@ -25,6 +25,9 @@ use rayon::prelude::*;
 /// même fourchette que les meshlets des cartes récentes.
 pub const TARGET_FACES: usize = 2048;
 
+/// Trou maximal comblé entre deux plages plutôt que d'ouvrir un appel de plus.
+const GAP_TOLERANCE: u32 = 2 * TARGET_FACES as u32;
+
 /// Un paquet de faces contiguës dans le tampon d'indices.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cluster {
@@ -121,6 +124,20 @@ impl Partition {
         self.clusters.is_empty()
     }
 
+    /// Remesure tous les paquets, sans toucher à l'ordre des faces.
+    ///
+    /// Ce qu'il faut quand les faces ont été réécrites par autre chose: les
+    /// boîtes sont fausses, mais les paquets couvrent toujours le maillage, et
+    /// remesurer coûte le cinquième d'une remise en ordre.
+    pub fn remeasure_all(&mut self, mesh: &Mesh, target: usize) {
+        self.clusters = measure(mesh, target);
+        self.reference = if self.clusters.is_empty() {
+            0.0
+        } else {
+            self.clusters.iter().map(|c| c.radius()).sum::<f32>() / self.clusters.len() as f32
+        };
+    }
+
     /// À quel point les paquets se sont élargis depuis la mise en ordre.
     ///
     /// Un sur la partition d'origine, et cela monte à mesure que la topologie
@@ -151,7 +168,13 @@ impl Partition {
                 continue;
             }
             match out.last_mut() {
-                Some((first, count)) if *first + *count == c.first => *count += c.count,
+                // Un trou de quelques paquets est comblé plutôt que coupé:
+                // redessiner deux mille triangles coûte moins cher au pilote
+                // qu'un appel de dessin de plus, et à vingt-cinq millions de
+                // faces le découpage produirait des centaines d'appels.
+                Some((first, count)) if c.first.saturating_sub(*first + *count) <= GAP_TOLERANCE => {
+                    *count = c.first + c.count - *first;
+                }
                 _ => out.push((c.first, c.count)),
             }
         }

@@ -74,8 +74,9 @@ struct State {
     full_resync: bool,
     /// One partition per object, for deciding what to draw.
     partitions: Vec<sculpt_core::Partition>,
-    /// Set when the partition should be rebuilt rather than patched.
-    repartition: bool,
+    /// Set for one frame after we reordered a mesh ourselves, so the change
+    /// mark that reordering leaves behind is not mistaken for news.
+    partition_fresh: bool,
 }
 
 impl State {
@@ -241,7 +242,7 @@ impl State {
             dirty_object: None,
             full_resync: true,
             partitions: Vec::new(),
-            repartition: true,
+            partition_fresh: false,
         }
     }
 
@@ -269,24 +270,42 @@ impl State {
         let want = self.sculptor.scene.objects.len();
         if self.partitions.len() != want {
             self.partitions.resize(want, sculpt_core::Partition::default());
-            self.repartition = true;
         }
-        // A mesh whose arrays were rewritten wholesale, by a subdivision, a
-        // remesh, an undo or an import, has no order left to patch.
-        self.repartition |= rewritten;
+        // Reordering marks the whole mesh as changed, because the index buffer
+        // really has changed. Reading that back as "the order is gone, reorder
+        // it" is a loop, and at twenty-five million faces each turn of it costs
+        // a second: this is what took the application to one frame a second.
+        // The mark this frame is ours, and it is not news.
+        let rewritten = rewritten && !self.partition_fresh;
+        self.partition_fresh = false;
+
         let active = self.sculptor.scene.active;
         let target = sculpt_core::cluster::TARGET_FACES;
+        // Reordering is a long job and it drops the spatial grid with it.
+        // Never in the middle of a stroke: a second of silence with the pen
+        // down is worse than packets that have grown loose.
+        let may_reorder = !self.sculptor.is_stroking();
 
         for (i, obj) in self.sculptor.scene.objects.iter_mut().enumerate() {
             let p = &mut self.partitions[i];
-            let stale = p.is_empty() || p.drift() > 2.0;
-            if (self.repartition && i == active) || (stale && !obj.mesh.faces.is_empty()) {
+            if obj.mesh.faces.is_empty() {
+                p.clusters.clear();
+                continue;
+            }
+            let loose = p.drift() > 2.0;
+            if p.is_empty() || (may_reorder && loose && i == active) {
                 *p = sculpt_core::cluster::build(&mut obj.mesh, target);
+                self.partition_fresh = true;
+            } else if rewritten && i == active {
+                // The faces were rewritten by something else, so the boxes are
+                // wrong but the packets still cover them. Measuring again is a
+                // fifth of the cost of putting them back in order, and it is
+                // enough to keep the picture right.
+                p.remeasure_all(&obj.mesh, target);
             } else if i == active && !dirty_faces.is_empty() {
                 sculpt_core::cluster::follow(&obj.mesh, p, dirty_faces, target);
             }
         }
-        self.repartition = false;
     }
 
     /// The face ranges worth drawing for each object this frame.
@@ -1158,6 +1177,12 @@ impl State {
         // before anything consumes it.
         self.update_partitions(&dirty_faces, fully_dirty || self.full_resync);
         let visible = self.visible_ranges();
+        // What the sorting actually saved, for the statistics panel.
+        let active_ranges = visible.get(self.sculptor.scene.active).and_then(|r| r.as_ref());
+        self.ui.drawn_faces = active_ranges
+            .map(|r| sculpt_core::Partition::faces_in(r))
+            .unwrap_or(0);
+        self.ui.draw_calls = active_ranges.map(|r| r.len() as u32).unwrap_or(0);
         let object = self.sculptor.scene.active;
         let changed = self.sculptor.verts_dirty || self.sculptor.topology_dirty;
         let sparse_ok = self.ui.settings.gpu_scatter
