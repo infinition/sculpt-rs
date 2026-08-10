@@ -32,12 +32,55 @@ const COLLAPSE_FACTOR: f32 = 0.45;
 /// Refinement passes per stroke step.
 const PASSES: usize = 3;
 
+/// The edges a dab is about to cut or close, found before anything is touched.
+///
+/// Split out from the work so the caller can learn whether the topology is
+/// about to move while there is still time to act on it: a stroke remembers
+/// itself as moved vertices until the first cut, and once a cut has happened
+/// there is no going back to record what was there before. Finding out by
+/// looking twice would cost as much as the refinement itself.
+#[derive(Default)]
+pub struct Plan {
+    long: Vec<(u32, u32)>,
+    short: Vec<(u32, u32)>,
+}
+
+impl Plan {
+    pub fn is_empty(&self) -> bool {
+        self.long.is_empty() && self.short.is_empty()
+    }
+}
+
+/// Works out what a dab here would change, without changing it.
+pub fn plan(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> Plan {
+    let r = radius * 1.15;
+    let long = if p.subdivide && mesh.vert_count() < p.max_verts {
+        collect_edges(mesh, center, r, |len| len > p.detail * SPLIT_FACTOR)
+    } else {
+        Vec::new()
+    };
+    let short = if p.decimate {
+        collect_edges(mesh, center, r, |len| len < p.detail * COLLAPSE_FACTOR)
+    } else {
+        Vec::new()
+    };
+    Plan { long, short }
+}
+
 /// Refines the mesh inside the brush sphere. Returns true when topology changed.
 pub fn refine(mesh: &mut Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
+    let plan = plan(mesh, center, radius, p);
+    apply(mesh, plan, center, radius, p)
+}
+
+/// Carries out a plan. The first pass reuses what the plan already found; the
+/// later ones have to look again, since splitting makes new edges.
+pub fn apply(mesh: &mut Mesh, plan: Plan, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
     let mut changed = false;
     // Work slightly wider than the brush so the detail gradient is not sliced
     // off exactly at the falloff boundary.
     let r = radius * 1.15;
+    let mut first_long = Some(plan.long);
 
     if p.subdivide {
         let max_len = p.detail * SPLIT_FACTOR;
@@ -45,7 +88,10 @@ pub fn refine(mesh: &mut Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
             if mesh.vert_count() >= p.max_verts {
                 break;
             }
-            let long = collect_edges(mesh, center, r, |len| len > max_len);
+            let long = match first_long.take() {
+                Some(found) => found,
+                None => collect_edges(mesh, center, r, |len| len > max_len),
+            };
             if long.is_empty() {
                 break;
             }
@@ -65,10 +111,9 @@ pub fn refine(mesh: &mut Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
 
     if p.decimate {
         let min_len = p.detail * COLLAPSE_FACTOR;
-        let short = collect_edges(mesh, center, r, |len| len < min_len);
         // Collapses use swap_remove, so queued indices can go stale. Revalidate
         // each candidate instead of rebuilding the list.
-        for (a, b) in short {
+        for (a, b) in plan.short {
             let n = mesh.vert_count() as u32;
             if a >= n || b >= n || a == b {
                 continue;
@@ -116,27 +161,4 @@ where
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     out
-}
-
-/// Whether a dab here would change the topology at all.
-///
-/// Cheaper than finding out by doing it, and it has to be known first: a stroke
-/// that leaves the topology alone can be remembered as a handful of moved
-/// vertices, while one that splits or collapses edges needs a copy of the
-/// geometry taken before the first cut.
-pub fn would_change(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
-    let r = radius * 1.15;
-    if p.subdivide && mesh.vert_count() < p.max_verts {
-        let max_len = p.detail * SPLIT_FACTOR;
-        if !collect_edges(mesh, center, r, |len| len > max_len).is_empty() {
-            return true;
-        }
-    }
-    if p.decimate {
-        let min_len = p.detail * COLLAPSE_FACTOR;
-        if !collect_edges(mesh, center, r, |len| len < min_len).is_empty() {
-            return true;
-        }
-    }
-    false
 }

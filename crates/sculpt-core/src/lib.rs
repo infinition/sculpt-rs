@@ -252,19 +252,20 @@ impl Sculptor {
 
         if deforms && dyn_on {
             // Splitting and collapsing renumber vertices, so a record of which
-            // ones moved stops meaning anything. If this dab is about to do
-            // that, the stroke falls back to a copy of the geometry, taken now,
-            // while it still describes the state before the cut.
-            let needs = {
+            // ones moved stops meaning anything. The plan says whether this dab
+            // is about to do that, while there is still time to take a copy of
+            // the state before the cut, and the work then reuses the plan
+            // rather than looking for the same edges twice.
+            let plan = {
                 let mesh = self.mesh();
-                dyntopo::would_change(mesh, point, radius, &dyn_params)
+                dyntopo::plan(mesh, point, radius, &dyn_params)
             };
-            if needs && self.journal.is_some() {
+            if !plan.is_empty() && self.journal.is_some() {
                 self.journal = None;
                 self.history.push_geometry(&self.scene, self.scene.active);
             }
             let Some(mesh) = self.mesh_mut() else { return };
-            if dyntopo::refine(mesh, point, radius, &dyn_params) {
+            if dyntopo::apply(mesh, plan, point, radius, &dyn_params) {
                 self.topology_dirty = true;
             }
         }

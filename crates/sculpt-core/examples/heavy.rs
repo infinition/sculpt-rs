@@ -137,6 +137,25 @@ fn main() {
         s.mesh().verts.len() as i64 - 2621442
     );
 
+    // Décimer puis sculpter: la séquence qui a fermé la fenêtre.
+    println!();
+    let before = s.mesh().face_count();
+    ms("décimation à la moitié", || s.decimate(0.5));
+    println!("  {} faces -> {}", before, s.mesh().face_count());
+    s.begin_stroke();
+    let t = Instant::now();
+    for i in 0..20 {
+        let p = Vec3::new((i as f32) * 0.01, 1.0, 0.0);
+        s.stroke(&StrokeInput { point: p, normal: Vec3::Y, ..Default::default() });
+    }
+    s.end_stroke();
+    println!(
+        "{:<46} {:>9.1} ms   {} faces",
+        "20 coups après décimation",
+        t.elapsed().as_secs_f64() * 1000.0,
+        s.mesh().face_count()
+    );
+
     // La subdivision, et le pic qu'elle demande.
     println!();
     let m = s.mesh().clone();

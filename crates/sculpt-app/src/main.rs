@@ -121,6 +121,19 @@ impl State {
         }))
         .expect("failed to create device");
 
+        // Say what went wrong before going down.
+        //
+        // A validation error left uncaught kills the process where it happens,
+        // which from the outside is a window that closes with nothing written
+        // anywhere. Anything that gets here is a bug, but it should be a bug
+        // with a name attached.
+        device.on_uncaptured_error(Arc::new(|e| {
+            eprintln!("
+=== GPU error ===
+{e}
+");
+        }));
+
         // Start from the driver's own defaults, then override only what we care
         // about. Less brittle than spelling out every field.
         let mut config = surface
