@@ -360,8 +360,44 @@ impl Mesh {
         (pb - pa).cross(pc - pa)
     }
 
+    /// Rewrites one face in place, touching only the adjacency that changed.
+    ///
+    /// The alternative is removing the face and adding the new one, which walks
+    /// the adjacency of six vertices, renumbers whatever `swap_remove` moved,
+    /// and refiles two faces in the grid. Rewriting touches the one vertex that
+    /// left and the one that arrived.
+    fn replace_face(&mut self, f: u32, tri: [u32; 3]) {
+        let old = self.faces[f as usize];
+        if old == tri {
+            return;
+        }
+        for &v in &old {
+            if !tri.contains(&v) {
+                self.vfaces[v as usize].retain(|x| *x != f);
+            }
+        }
+        for &v in &tri {
+            if !old.contains(&v) {
+                self.vfaces[v as usize].push(f);
+            }
+        }
+        self.faces[f as usize] = tri;
+        if self.accel.is_some() {
+            let (c, r) = self.face_sphere(f);
+            if let Some(g) = &mut self.accel {
+                g.move_face(f, c, r);
+            }
+        }
+        self.touch_face(f);
+    }
+
     /// Splits edge `(a, b)` at its midpoint, returning the new vertex.
     /// Winding of the affected faces is preserved.
+    ///
+    /// Each face across the edge becomes two, and the first of the two is the
+    /// original face rewritten rather than a removal and two additions. A dab
+    /// on a dense mesh does a couple of thousand of these, so what a single
+    /// split costs is most of what dynamic topology costs.
     pub fn split_edge(&mut self, a: u32, b: u32) -> Option<u32> {
         let fs = self.faces_around_edge(a, b);
         if fs.is_empty() {
@@ -370,26 +406,20 @@ impl Mesh {
         let mid = Vertex::lerp_attrs(&self.verts[a as usize], &self.verts[b as usize], 0.5);
         let m = self.add_vertex(mid);
 
-        // Collect first: remove_face invalidates the indices in `fs`.
-        let tris: SmallVec<[[u32; 3]; 2]> = fs.iter().map(|&f| self.faces[f as usize]).collect();
-        let mut sorted: SmallVec<[u32; 2]> = fs;
-        sorted.sort_unstable_by(|x, y| y.cmp(x));
-        for f in sorted {
-            self.remove_face(f);
-        }
-
-        for tri in tris {
+        // Face indices stay put: rewriting keeps them, and adding only appends.
+        let pairs: SmallVec<[(u32, [u32; 3]); 2]> =
+            fs.iter().map(|&f| (f, self.faces[f as usize])).collect();
+        for (f, tri) in pairs {
             let i = tri.iter().position(|&x| x == a).unwrap();
-            let o;
             if tri[(i + 1) % 3] == b {
                 // winding reads (a, b, o)
-                o = tri[(i + 2) % 3];
-                self.add_face([a, m, o]);
+                let o = tri[(i + 2) % 3];
+                self.replace_face(f, [a, m, o]);
                 self.add_face([m, b, o]);
             } else {
                 // winding reads (a, o, b)
-                o = tri[(i + 1) % 3];
-                self.add_face([a, o, m]);
+                let o = tri[(i + 1) % 3];
+                self.replace_face(f, [a, o, m]);
                 self.add_face([m, o, b]);
             }
         }

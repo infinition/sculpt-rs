@@ -84,6 +84,19 @@ fn main() {
         println!("  sommets dans la sphère {t_verts:>8.2} ms");
         println!("  faces dans la sphère   {t_faces:>8.2} ms");
         println!("  plan de raffinement    {t_plan:>8.2} ms  ({} à couper)", plan.len());
+        drop(plan);
+        // Le raffinement lui-même, sur un plan fraîchement calculé.
+        let dyn_params = s.dyntopo;
+        let mesh = s.mesh_mut().unwrap();
+        let plan = sculpt_core::dyntopo::plan(mesh, p, radius, &dyn_params);
+        let n = plan.len();
+        let t = Instant::now();
+        sculpt_core::dyntopo::apply(mesh, plan, p, radius, &dyn_params);
+        let t_apply = t.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "  raffinement            {t_apply:>8.2} ms  ({n} arêtes, {:.2} us par arête)",
+            t_apply * 1000.0 / n.max(1) as f64
+        );
     }
 
     println!();
