@@ -85,6 +85,7 @@ pub enum Action {
     SetView(ViewPreset),
     PickColorMode,
     LoadAlpha,
+    LoadMatcap,
     ResetBrushes,
     ResetTheme,
 }
@@ -196,6 +197,36 @@ pub struct UiState {
     /// when the library changes: an alpha is a full image, and uploading them
     /// every frame to draw a row of postage stamps would be absurd.
     pub alpha_thumbs: Vec<egui::TextureHandle>,
+    /// Where the matcap comes from.
+    pub matcap_source: MatcapSource,
+    /// The material and lights behind the generated matcap, editable.
+    pub lightcap: matcap::Lightcap,
+    /// A matcap loaded from a file: side length and RGBA8 pixels.
+    pub matcap_image: Option<(u32, Vec<u8>)>,
+}
+
+/// The three ways to get a matcap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MatcapSource {
+    /// One of the built-in materials, lit the built-in way.
+    Preset,
+    /// The same thing taken apart: material and three lights, all editable.
+    Lightcap,
+    /// An image someone else baked.
+    Image,
+}
+
+impl MatcapSource {
+    pub const ALL: [MatcapSource; 3] =
+        [MatcapSource::Preset, MatcapSource::Lightcap, MatcapSource::Image];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MatcapSource::Preset => "Preset",
+            MatcapSource::Lightcap => "Lights",
+            MatcapSource::Image => "Image",
+        }
+    }
 }
 
 impl Default for UiState {
@@ -236,6 +267,9 @@ impl Default for UiState {
             rebinding_wheel: false,
             ui_scale_draft: UiTheme::default().ui_scale,
             alpha_thumbs: Vec::new(),
+            matcap_source: MatcapSource::Preset,
+            lightcap: matcap::Lightcap::default(),
+            matcap_image: None,
         }
     }
 }
@@ -1405,6 +1439,168 @@ fn scene_tab(
     );
 }
 
+/// Where the matcap comes from, and how to take it apart.
+fn matcap_controls(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
+    let labels: Vec<&str> = MatcapSource::ALL.iter().map(|s| s.label()).collect();
+    let current = MatcapSource::ALL
+        .iter()
+        .position(|s| *s == st.matcap_source)
+        .unwrap_or(0);
+    if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+        let chosen = MatcapSource::ALL[i];
+        // Nothing to show yet is worse than the wrong thing: ask for the file
+        // the moment the image source is picked with none loaded.
+        if chosen == MatcapSource::Image && st.matcap_image.is_none() {
+            cx.actions.push(Action::LoadMatcap);
+        } else {
+            st.matcap_source = chosen;
+            cx.actions.push(Action::MatcapChanged);
+        }
+    }
+
+    match st.matcap_source {
+        MatcapSource::Preset => {
+            egui::ComboBox::from_id_salt("matcap")
+                .selected_text(st.matcap.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for preset in matcap::Preset::ALL {
+                        if ui.selectable_value(&mut st.matcap, preset, preset.label()).clicked() {
+                            cx.actions.push(Action::MatcapChanged);
+                        }
+                    }
+                });
+            if widgets::wide_button(ui, Icon::Settings, "Take this one apart", m.row, false)
+                .clicked()
+            {
+                st.lightcap = matcap::Lightcap::from_preset(st.matcap);
+                st.matcap_source = MatcapSource::Lightcap;
+                cx.actions.push(Action::MatcapChanged);
+            }
+        }
+        MatcapSource::Lightcap => lightcap_editor(ui, st, cx),
+        MatcapSource::Image => {
+            ui.label(
+                egui::RichText::new(match &st.matcap_image {
+                    Some((size, _)) => format!("Loaded, {size} by {size}."),
+                    None => "Nothing loaded yet.".to_string(),
+                })
+                .small()
+                .color(p.dim),
+            );
+            if widgets::wide_button(ui, Icon::Open, "Load a matcap image", m.row, false).clicked() {
+                cx.actions.push(Action::LoadMatcap);
+            }
+        }
+    }
+}
+
+/// The material and the three lights behind a generated matcap.
+fn lightcap_editor(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
+    let mut changed = false;
+    let lc = &mut st.lightcap;
+
+    changed |= vec_color_row(ui, "Surface", &mut lc.look.base, m);
+    changed |= vec_color_row(ui, "Highlight", &mut lc.look.spec, m);
+    changed |= vec_color_row(ui, "Rim", &mut lc.look.rim, m);
+    changed |= BigSlider::new(&mut lc.look.shininess, 2.0..=180.0, "Tightness")
+        .decimals(0)
+        .height(m.row)
+        .show(ui)
+        .changed();
+    changed |= BigSlider::new(&mut lc.look.spec_amt, 0.0..=1.0, "Gloss")
+        .height(m.row)
+        .show(ui)
+        .changed();
+    changed |= BigSlider::new(&mut lc.look.ambient, 0.0..=1.0, "Ambient")
+        .height(m.row)
+        .show(ui)
+        .changed();
+
+    for (i, light) in lc.lights.iter_mut().enumerate() {
+        widgets::section_title(ui, ["KEY", "FILL", "BOUNCE"][i]);
+        changed |= widgets::toggle(ui, &mut light.on, "On", m.row).clicked();
+        ui.add_enabled_ui(light.on, |ui| {
+            ui.horizontal(|ui| {
+                changed |= light_dial(ui, &mut light.dir, m.row * 2.6, p);
+                ui.vertical(|ui| {
+                    changed |= vec_color_row(ui, "Colour", &mut light.color, m);
+                    changed |= BigSlider::new(&mut light.power, 0.0..=2.0, "Power")
+                        .height(m.row)
+                        .show(ui)
+                        .changed();
+                });
+            });
+        });
+    }
+
+    ui.label(
+        egui::RichText::new(
+            "Drag inside a dial to aim its light. The dial is the model as you see it: the middle points straight at you, the rim is edge on.",
+        )
+        .small()
+        .color(p.dim),
+    );
+    if widgets::wide_button(ui, Icon::Reset, "Back to the preset", m.row, false).clicked() {
+        st.lightcap = matcap::Lightcap::from_preset(st.matcap);
+        changed = true;
+    }
+    if changed {
+        cx.actions.push(Action::MatcapChanged);
+    }
+}
+
+/// A colour row over a `Vec3`, which is how the lighting stores its colours.
+fn vec_color_row(ui: &mut egui::Ui, label: &str, c: &mut glam::Vec3, m: Metrics) -> bool {
+    let mut rgb = [c.x, c.y, c.z];
+    let changed = widgets::color_row(ui, label, &mut rgb, m.row).changed();
+    if changed {
+        *c = glam::Vec3::from_array(rgb);
+    }
+    changed
+}
+
+/// A disc you drag to aim a light, drawn as the lit sphere it acts on.
+///
+/// The obvious alternative is two angle sliders, which nobody can read: this
+/// shows the model from where the artist is sitting, so the light goes where it
+/// is pointed rather than where the numbers said.
+fn light_dial(ui: &mut egui::Ui, dir: &mut glam::Vec3, size: f32, p: Palette) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::drag());
+    let center = rect.center();
+    let radius = size * 0.5 - 2.0;
+    let mut changed = false;
+
+    if response.dragged() || response.drag_started() {
+        if let Some(at) = ui.ctx().pointer_interact_pos() {
+            let mut d = (at - center) / radius;
+            // Past the rim the light is behind the model, so the direction is
+            // clamped to the silhouette rather than wrapping round.
+            let len = d.length();
+            if len > 1.0 {
+                d /= len;
+            }
+            let z = (1.0f32 - d.length() * d.length()).max(0.0).sqrt();
+            *dir = glam::Vec3::new(d.x, -d.y, z).normalize_or(glam::Vec3::Z);
+            changed = true;
+        }
+    }
+
+    let painter = ui.painter();
+    painter.circle(center, radius, p.bg, Stroke::new(1.0, p.line));
+    // A few rings to read the tilt against.
+    for t in [0.33, 0.66] {
+        painter.circle_stroke(center, radius * t, Stroke::new(1.0, p.line.gamma_multiply(0.5)));
+    }
+    let n = dir.normalize_or(glam::Vec3::Z);
+    let at = egui::Pos2::new(center.x + n.x * radius, center.y - n.y * radius);
+    painter.line_segment([center, at], Stroke::new(1.0, p.accent.gamma_multiply(0.5)));
+    painter.circle(at, 5.0, p.accent, Stroke::new(1.0, p.bg));
+    changed
+}
+
 fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx) {
     let (p, m) = (cx.p, cx.m);
     widgets::section_title(ui, "SHADING");
@@ -1418,16 +1614,7 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
     }
 
     if matches!(st.settings.shading, Shading::Matcap | Shading::Cavity) {
-        egui::ComboBox::from_id_salt("matcap")
-            .selected_text(st.matcap.label())
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for preset in matcap::Preset::ALL {
-                    if ui.selectable_value(&mut st.matcap, preset, preset.label()).clicked() {
-                        cx.actions.push(Action::MatcapChanged);
-                    }
-                }
-            });
+        matcap_controls(ui, st, cx);
     }
     if st.settings.shading == Shading::Cavity {
         BigSlider::new(&mut st.settings.cavity_strength, 0.5..=40.0, "Cavity")

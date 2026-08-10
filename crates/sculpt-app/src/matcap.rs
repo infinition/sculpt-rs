@@ -1,10 +1,19 @@
-//! Procedurally generated matcaps.
+//! Matcaps, generated or loaded.
 //!
 //! A matcap is a pre-lit sphere looked up by the view-space normal. Generating
 //! it in code instead of shipping PNGs keeps the repository asset-free and
 //! license-clean, which matters for a project meant to be published.
+//!
+//! Every preset here is really a lightcap: a material and three lights, which
+//! the renderer bakes into a sphere. Keeping the description rather than only
+//! the picture is what lets a preset be taken apart and edited, and a light
+//! dragged around the model in the middle of a session.
 
 use glam::Vec3;
+
+/// Side of the generated texture. Big enough that a broad highlight has no
+/// visible steps, small enough to rebuild while a light is being dragged.
+pub const SIZE: u32 = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Preset {
@@ -28,7 +37,7 @@ impl Preset {
         }
     }
 
-    fn look(self) -> Look {
+    pub fn look(self) -> Look {
         match self {
             Preset::Clay => Look {
                 base: Vec3::new(0.72, 0.40, 0.31),
@@ -74,31 +83,81 @@ impl Preset {
     }
 }
 
-struct Look {
-    base: Vec3,
-    spec: Vec3,
-    shininess: f32,
-    spec_amt: f32,
-    rim: Vec3,
-    ambient: f32,
+/// The surface a lightcap is lighting.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Look {
+    pub base: Vec3,
+    pub spec: Vec3,
+    pub shininess: f32,
+    pub spec_amt: f32,
+    pub rim: Vec3,
+    pub ambient: f32,
 }
 
-struct Light {
-    dir: Vec3,
-    color: Vec3,
-    power: f32,
+/// One of the three lights, aimed in view space: +X is to the right of the
+/// screen, +Y is up it, +Z is out of it toward the viewer.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Light {
+    pub dir: Vec3,
+    pub color: Vec3,
+    pub power: f32,
+    pub on: bool,
+}
+
+/// A material and the lights on it: everything a matcap is baked from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Lightcap {
+    pub look: Look,
+    pub lights: [Light; 3],
+}
+
+/// The lighting every preset starts from: a key over the left shoulder, a cool
+/// fill from the right, and a warm bounce from below.
+pub const DEFAULT_LIGHTS: [Light; 3] = [
+    Light {
+        dir: Vec3::new(-0.45, 0.62, 0.65),
+        color: Vec3::new(1.0, 0.97, 0.92),
+        power: 1.0,
+        on: true,
+    },
+    Light {
+        dir: Vec3::new(0.75, 0.05, 0.55),
+        color: Vec3::new(0.62, 0.72, 0.95),
+        power: 0.42,
+        on: true,
+    },
+    Light {
+        dir: Vec3::new(0.10, -0.75, 0.35),
+        color: Vec3::new(0.95, 0.85, 0.75),
+        power: 0.22,
+        on: true,
+    },
+];
+
+impl Lightcap {
+    pub fn from_preset(preset: Preset) -> Self {
+        Self { look: preset.look(), lights: DEFAULT_LIGHTS }
+    }
+
+    /// Renders the lit sphere into an RGBA8 buffer of `size` x `size`.
+    pub fn render(&self, size: u32) -> Vec<u8> {
+        render(&self.look, &self.lights, size)
+    }
+}
+
+impl Default for Lightcap {
+    fn default() -> Self {
+        Self::from_preset(Preset::Clay)
+    }
 }
 
 /// Renders a lit sphere into an RGBA8 buffer of `size` x `size`.
 pub fn generate(preset: Preset, size: u32) -> Vec<u8> {
-    let look = preset.look();
-    let lights = [
-        Light { dir: Vec3::new(-0.45, 0.62, 0.65).normalize(), color: Vec3::new(1.0, 0.97, 0.92), power: 1.0 },
-        Light { dir: Vec3::new(0.75, 0.05, 0.55).normalize(), color: Vec3::new(0.62, 0.72, 0.95), power: 0.42 },
-        Light { dir: Vec3::new(0.10, -0.75, 0.35).normalize(), color: Vec3::new(0.95, 0.85, 0.75), power: 0.22 },
-    ];
-    let view = Vec3::Z;
+    render(&preset.look(), &DEFAULT_LIGHTS, size)
+}
 
+fn render(look: &Look, lights: &[Light; 3], size: u32) -> Vec<u8> {
+    let view = Vec3::Z;
     let mut out = vec![0u8; (size * size * 4) as usize];
     for y in 0..size {
         for x in 0..size {
@@ -115,11 +174,15 @@ pub fn generate(preset: Preset, size: u32) -> Vec<u8> {
             };
 
             let mut c = look.base * look.ambient;
-            for l in &lights {
-                let ndl = n.dot(l.dir).max(0.0);
+            for l in lights {
+                if !l.on {
+                    continue;
+                }
+                let dir = l.dir.normalize_or(Vec3::Z);
+                let ndl = n.dot(dir).max(0.0);
                 c += look.base * l.color * (ndl * l.power);
                 if ndl > 0.0 {
-                    let h = (l.dir + view).normalize_or(view);
+                    let h = (dir + view).normalize_or(view);
                     let s = n.dot(h).max(0.0).powf(look.shininess);
                     c += look.spec * l.color * (s * look.spec_amt * l.power);
                 }

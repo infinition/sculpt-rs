@@ -501,7 +501,12 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let matcap_view = upload_matcap(device, queue, matcap::Preset::Clay);
+        let matcap_view = upload_matcap(
+            device,
+            queue,
+            &matcap::generate(matcap::Preset::Clay, MATCAP_SIZE),
+            MATCAP_SIZE,
+        );
 
         let global_bind =
             make_global_bind(device, &global_layout, &global_buf, &matcap_view, &sampler);
@@ -701,8 +706,18 @@ impl Renderer {
         self.build_pipelines(device);
     }
 
-    pub fn set_matcap(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, preset: matcap::Preset) {
-        self.matcap_view = upload_matcap(device, queue, preset);
+    /// Replaces the matcap with a square RGBA8 image.
+    ///
+    /// Pixels rather than a preset: a generated lightcap, an edited one and a
+    /// file loaded off disk are all the same thing by the time they get here.
+    pub fn set_matcap(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pixels: &[u8],
+        size: u32,
+    ) {
+        self.matcap_view = upload_matcap(device, queue, pixels, size);
         self.global_bind = make_global_bind(
             device,
             &self.global_layout,
@@ -1011,14 +1026,23 @@ fn make_global_bind(
 fn upload_matcap(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    preset: matcap::Preset,
+    pixels: &[u8],
+    size: u32,
 ) -> wgpu::TextureView {
-    let pixels = matcap::generate(preset, MATCAP_SIZE);
+    // A short buffer would be a validation error and take the window with it,
+    // so fall back to a generated one rather than trusting the caller.
+    let generated;
+    let (pixels, size) = if pixels.len() == (size as usize) * (size as usize) * 4 && size > 0 {
+        (pixels, size)
+    } else {
+        generated = matcap::generate(matcap::Preset::Clay, MATCAP_SIZE);
+        (generated.as_slice(), MATCAP_SIZE)
+    };
     let tex = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
             label: Some("matcap"),
-            size: wgpu::Extent3d { width: MATCAP_SIZE, height: MATCAP_SIZE, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1027,7 +1051,7 @@ fn upload_matcap(
             view_formats: &[],
         },
         wgpu::util::TextureDataOrder::LayerMajor,
-        &pixels,
+        pixels,
     );
     tex.create_view(&wgpu::TextureViewDescriptor::default())
 }

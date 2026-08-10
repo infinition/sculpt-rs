@@ -22,7 +22,7 @@ use renderer::Renderer;
 use sculpt_core::{io, primitives, BrushKind, Mesh, Object, Sculptor, StrokeInput};
 use std::sync::Arc;
 use std::time::Instant;
-use ui::{Action, Overlay, Primitive, UiState};
+use ui::{Action, MatcapSource, Overlay, Primitive, UiState};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -589,10 +589,8 @@ impl State {
                     }
                 }
                 Action::FrameView => self.frame_view(),
-                Action::MatcapChanged => {
-                    self.renderer
-                        .set_matcap(&self.device, &self.queue, self.ui.matcap);
-                }
+                Action::MatcapChanged => self.rebuild_matcap(),
+                Action::LoadMatcap => self.load_matcap(),
                 Action::SampleCountChanged(n) => {
                     let n = n.min(self.max_samples).max(1);
                     self.ui.sample_count = n;
@@ -768,6 +766,61 @@ impl State {
             }
             Err(e) => self.ui.say(format!("could not open: {e}")),
         }
+    }
+
+    /// Bakes the matcap the interface is currently pointing at and hands it to
+    /// the renderer.
+    fn rebuild_matcap(&mut self) {
+        let (pixels, size) = match self.ui.matcap_source {
+            MatcapSource::Preset => (
+                matcap::generate(self.ui.matcap, matcap::SIZE),
+                matcap::SIZE,
+            ),
+            MatcapSource::Lightcap => (self.ui.lightcap.render(matcap::SIZE), matcap::SIZE),
+            MatcapSource::Image => match &self.ui.matcap_image {
+                Some((size, pixels)) => (pixels.clone(), *size),
+                None => (
+                    matcap::generate(self.ui.matcap, matcap::SIZE),
+                    matcap::SIZE,
+                ),
+            },
+        };
+        self.renderer
+            .set_matcap(&self.device, &self.queue, &pixels, size);
+    }
+
+    /// Loads a matcap image: a sphere lit by someone else, in any of the usual
+    /// formats. Anything that is not square is cropped to its middle, which is
+    /// where a matcap keeps its sphere.
+    fn load_matcap(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga"])
+            .pick_file()
+        else {
+            return;
+        };
+        let img = match image::open(&path) {
+            Ok(i) => i,
+            Err(e) => {
+                self.ui.say(format!("could not read the image: {e}"));
+                return;
+            }
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let side = w.min(h).min(1024);
+        let (ox, oy) = ((w - side) / 2, (h - side) / 2);
+        let mut pixels = Vec::with_capacity((side * side * 4) as usize);
+        for y in 0..side {
+            for x in 0..side {
+                pixels.extend_from_slice(&rgba.get_pixel(ox + x, oy + y).0);
+            }
+        }
+        self.ui.matcap_image = Some((side, pixels));
+        self.ui.matcap_source = MatcapSource::Image;
+        self.ui.settings.shading = renderer::Shading::Matcap;
+        self.rebuild_matcap();
+        self.ui.say("matcap loaded");
     }
 
     /// Loads an image as a brush alpha.
