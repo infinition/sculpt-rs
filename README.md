@@ -91,12 +91,16 @@ built for a pen and a touch screen as much as for a mouse.
 
 ## Architecture
 
+The vocabulary below is set out in full in [docs/NAMES.md](docs/NAMES.md): every
+part of the engine has a name of ours, and a note on the published work it rests
+on.
+
 Two crates:
 
 - `sculpt-core` is the engine. No graphics dependency, so it runs in headless
   tests and could later be compiled to WebAssembly unchanged. It owns the
-  scene, the mesh, adjacency, the spatial index, dynamic topology, brushes,
-  topology commands, history and file I/O.
+  scene, the mesh, the ring of faces around each vertex, the grid, live
+  topology, brushes, topology commands, the undo log and file I/O.
 - `sculpt-app` is the desktop shell: wgpu renderer, winit window, egui
   interface, orbit camera, and pointer, pen and touch handling.
 
@@ -105,12 +109,20 @@ without a compaction pass. Removal uses `swap_remove` plus an index fixup for
 the element that moved into the hole.
 
 Sculpting is local but a naive query is not: every dab would otherwise scan the
-whole model. `accel.rs` keeps an incremental spatial hash grid over vertices and
-faces, sized so a sphere query always walks a constant number of cells whatever
-the zoom level. Every mesh mutation that goes through the safe API keeps it in
-sync; anything that rewrites the arrays wholesale drops it, and the next query
-rebuilds. Ray casts walk the same grid front to back and stop as soon as the
-nearest hit is certain. Brushes and the heavier commands run in parallel over
+whole model. The grid is an incremental spatial hash over vertices and faces,
+sized so a sphere query always walks a constant number of cells whatever the
+zoom level. Every mesh mutation that goes through the safe API keeps it in sync;
+anything that rewrites the arrays wholesale drops it, and the next query
+rebuilds. It is filled across every core, and never rebuilt in the middle of a
+stroke: a rebuild between two dabs is a freeze with the pen down, where cells
+that no longer match the radius only cost a wider walk. Ray casts walk the same
+grid front to back and stop as soon as the nearest hit is certain.
+
+A stroke is remembered as the slots it wrote over and the lengths the arrays
+started at, which is enough to rebuild them exactly and holds whether or not the
+stroke cut the topology. The faces are grouped into packets, contiguous runs
+carrying a box and a normal cone, so the view can throw away what it cannot see
+before anything is drawn. Brushes and the heavier commands run in parallel over
 rayon.
 
 A vertex is twelve floats in the engine and twenty-four bytes on the card, in
@@ -225,9 +237,12 @@ colour sent through the sparse update must both arrive.
 ## Where this is going
 
 [docs/ROADMAP.md](docs/ROADMAP.md) sets what is here against what a finished
-sculpting application contains, item by item, and puts the rest in the order it
-is worth doing. It also carries the performance numbers and how to reproduce
-them.
+sculpting application contains, item by item, with what each missing piece rests
+on and how we will know it works. It puts the rest in the order it is worth
+doing, and carries the performance numbers with the commands to reproduce them.
+
+[docs/NAMES.md](docs/NAMES.md) is the vocabulary: what every part of the engine
+is called here, and the published work behind it.
 
 ## Notes on origin
 
