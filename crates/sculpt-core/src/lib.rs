@@ -66,9 +66,6 @@ pub struct Sculptor {
     pub vertex_buffer_limit: Option<u64>,
     stroking: bool,
     stroke_state: brush::StrokeState,
-    /// Vertices this stroke has already copied, when it is being remembered by
-    /// difference. `None` means a full copy was taken instead.
-    journal: Option<history::StrokeJournal>,
 }
 
 impl Sculptor {
@@ -95,7 +92,6 @@ impl Sculptor {
             vertex_buffer_limit: None,
             stroking: false,
             stroke_state: brush::StrokeState::default(),
-            journal: None,
             scene,
         };
         s.brush = s.presets[Self::preset_index(BrushKind::Clay)];
@@ -190,20 +186,18 @@ impl Sculptor {
             let radius = self.local_radius();
             if let Some(mesh) = self.mesh_mut() {
                 mesh.ensure_accel(radius);
+                mesh.begin_log();
             }
             self.stroking = true;
             self.stroke_state = brush::StrokeState::default();
-            self.journal = Some(history::StrokeJournal::default());
         }
     }
 
     pub fn end_stroke(&mut self) {
         self.stroking = false;
-        if let Some(journal) = self.journal.take() {
-            if !journal.is_empty() {
-                self.history
-                    .push_vertex_delta(self.scene.active, journal.into_before());
-            }
+        let active = self.scene.active;
+        if let Some(log) = self.mesh_mut().and_then(|m| m.take_log()) {
+            self.history.push_topology(active, log);
         }
     }
 
@@ -268,19 +262,13 @@ impl Sculptor {
         }
 
         if deforms && dyn_on {
-            // Splitting and collapsing renumber vertices, so a record of which
-            // ones moved stops meaning anything. The plan says whether this dab
-            // is about to do that, while there is still time to take a copy of
-            // the state before the cut, and the work then reuses the plan
-            // rather than looking for the same edges twice.
+            // Planning first and applying the plan, rather than looking for the
+            // same edges twice. The undo log follows splits and collapses on
+            // its own, so a cut no longer costs a copy of the whole mesh.
             let plan = {
                 let mesh = self.mesh();
                 dyntopo::plan(mesh, point, radius, &dyn_params)
             };
-            if !plan.is_empty() && self.journal.is_some() {
-                self.journal = None;
-                self.history.push_geometry(&self.scene, self.scene.active);
-            }
             let Some(mesh) = self.mesh_mut() else { return };
             if dyntopo::apply(mesh, plan, point, radius, &dyn_params) {
                 self.topology_dirty = true;
@@ -293,16 +281,8 @@ impl Sculptor {
             .alpha
             .and_then(|i| self.alphas.get(i as usize))
             .cloned();
-        let mut journal = self.journal.take();
         let Some(mesh) = self.mesh_mut() else { return };
-        let touched = brush::apply(
-            mesh,
-            &brush,
-            input,
-            &mut state,
-            alpha.as_deref(),
-            journal.as_mut(),
-        );
+        let touched = brush::apply(mesh, &brush, input, &mut state, alpha.as_deref());
         if !touched.is_empty() {
             if deforms {
                 // Normals change one ring further out than the positions did,
@@ -313,7 +293,6 @@ impl Sculptor {
             }
             self.verts_dirty = true;
         }
-        self.journal = journal;
         self.stroke_state = state;
     }
 
@@ -989,7 +968,7 @@ mod tests {
     /// Un trait qui coupe la topologie ne peut pas se retenir par différence:
     /// les indices ne veulent plus rien dire. Il doit reprendre la copie.
     #[test]
-    fn a_stroke_that_cuts_falls_back_to_a_copy() {
+    fn a_stroke_that_cuts_is_undone_slot_by_slot() {
         let mut s = Sculptor::new(primitives::icosphere(3));
         s.symmetry = false;
         s.dyntopo_enabled = true;
@@ -998,8 +977,9 @@ mod tests {
         s.brush.radius = 0.4;
         s.brush.strength = 0.8;
 
-        let faces_before = s.mesh().face_count();
+        let faces_before = s.mesh().faces.clone();
         let verts_before: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+        let mesh_bytes = s.mesh_bytes();
 
         s.begin_stroke();
         for _ in 0..4 {
@@ -1010,15 +990,65 @@ mod tests {
             });
         }
         s.end_stroke();
-        assert!(s.mesh().face_count() > faces_before, "rien n'a été raffiné");
+        assert!(s.mesh().face_count() > faces_before.len(), "rien n'a été raffiné");
+        let after: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+
+        // Ce que le trait a coûté à l'historique doit suivre ce qu'il a touché,
+        // pas la taille du modèle: c'est toute la raison du journal.
+        assert!(
+            s.history.used_bytes() < mesh_bytes,
+            "l'historique a pris {} octets pour un maillage de {mesh_bytes}",
+            s.history.used_bytes()
+        );
 
         s.undo();
-        assert_eq!(s.mesh().face_count(), faces_before);
+        assert_eq!(s.mesh().faces, faces_before, "les faces ne sont pas revenues");
         assert_eq!(s.mesh().vert_count(), verts_before.len());
         for (i, v) in s.mesh().verts.iter().enumerate() {
             assert!(v.pos.distance(verts_before[i]) < 1e-6, "sommet {i}");
         }
         validate(s.mesh());
+
+        // Et refaire doit rendre exactement ce que l'annulation a repris.
+        s.redo();
+        assert_eq!(s.mesh().vert_count(), after.len(), "le refait a perdu des sommets");
+        for (i, v) in s.mesh().verts.iter().enumerate() {
+            assert!(v.pos.distance(after[i]) < 1e-6, "sommet {i} refait");
+        }
+        validate(s.mesh());
+    }
+
+    /// Un trait qui ne fait que déplacer des sommets doit s'annuler sans
+    /// reconstruire l'adjacence, et rendre le maillage au sommet près.
+    #[test]
+    fn a_stroke_that_only_moves_is_undone_exactly() {
+        let mut s = Sculptor::new(primitives::icosphere(4));
+        s.symmetry = false;
+        s.dyntopo_enabled = false;
+        s.brush.kind = BrushKind::Draw;
+        s.brush.radius = 0.3;
+        s.brush.strength = 0.7;
+
+        let before: Vec<Vertex> = s.mesh().verts.clone();
+        let faces = s.mesh().faces.clone();
+
+        s.begin_stroke();
+        for i in 0..5 {
+            let p = Vec3::new(i as f32 * 0.03, 1.0, 0.0).normalize();
+            s.stroke(&StrokeInput { point: p, normal: p, ..Default::default() });
+        }
+        s.end_stroke();
+        assert!(
+            s.mesh().verts.iter().zip(&before).any(|(a, b)| a.pos != b.pos),
+            "le trait n'a rien déplacé"
+        );
+
+        s.undo();
+        assert_eq!(s.mesh().faces, faces, "la topologie a bougé alors qu'elle ne devait pas");
+        for (i, (now, was)) in s.mesh().verts.iter().zip(&before).enumerate() {
+            assert!(now.pos.distance(was.pos) < 1e-6, "sommet {i}");
+            assert!(now.nrm.distance(was.nrm) < 1e-4, "normale {i}");
+        }
     }
 
     #[test]

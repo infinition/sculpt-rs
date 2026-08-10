@@ -145,13 +145,21 @@ fn main() {
         s.stroke(&StrokeInput { point: moved, normal: Vec3::Y, ..Default::default() });
     }
     s.end_stroke();
+    let elapsed = t.elapsed().as_secs_f64() * 1000.0;
     println!(
-        "{:<46} {:>9.1} ms   soit {:.1} ms par coup, {} sommets ajoutés",
-        "20 coups avec topologie dynamique",
-        t.elapsed().as_secs_f64() * 1000.0,
-        t.elapsed().as_secs_f64() * 1000.0 / 20.0,
-        s.mesh().verts.len() as i64 - 2621442
+        "{:<46} {:>9.1} ms   soit {:.1} ms par coup",
+        "20 coups avec topologie dynamique", elapsed, elapsed / 20.0
     );
+    // Ce qu'un trait qui coupe coûte à l'historique. La copie complète qu'il
+    // fallait prendre avant pesait le maillage entier, à chaque trait.
+    println!(
+        "  historique du trait: {:>5.0} Mo, contre {:.0} Mo pour une copie du maillage",
+        s.history.used_bytes() as f64 / 1e6,
+        (s.mesh().verts.len() * std::mem::size_of::<sculpt_core::Vertex>()
+            + s.mesh().faces.len() * 12) as f64
+            / 1e6
+    );
+    ms("annuler ce trait", || s.undo());
 
     // Décimer puis sculpter: la séquence qui a fermé la fenêtre.
     println!();

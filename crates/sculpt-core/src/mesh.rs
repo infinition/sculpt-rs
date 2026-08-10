@@ -101,6 +101,64 @@ impl Vertex {
     }
 }
 
+/// What it would take to put a mesh back the way it was.
+///
+/// A stroke used to be remembered as a list of moved vertices, which is small
+/// and exact right up to the moment dynamic topology cuts an edge: after that
+/// the indices mean something else and the list is worthless. The fallback was
+/// a copy of the whole mesh, taken on the first cut of every stroke, which on
+/// five million triangles is a hundred and ninety megabytes and the pause that
+/// goes with it, once per stroke.
+///
+/// This records the same thing a copy would, minus everything that did not
+/// change. An array is fully described by its length and its contents, so
+/// keeping the original value of every slot that was written or dropped, along
+/// with the length it started at, is enough to rebuild it exactly. The cost
+/// follows what the stroke touched rather than how large the model is.
+#[derive(Clone, Debug)]
+pub struct TopoLog {
+    /// Vertex and face counts when the stroke began.
+    pub vlen: usize,
+    pub flen: usize,
+    vseen: rustc_hash::FxHashSet<u32>,
+    fseen: rustc_hash::FxHashSet<u32>,
+    /// Slots as they were before the first write of this stroke reached them.
+    pub verts: Vec<(u32, Vertex)>,
+    pub faces: Vec<(u32, [u32; 3])>,
+}
+
+impl TopoLog {
+    fn new(vlen: usize, flen: usize) -> Self {
+        Self {
+            vlen,
+            flen,
+            vseen: rustc_hash::FxHashSet::default(),
+            fseen: rustc_hash::FxHashSet::default(),
+            verts: Vec::new(),
+            faces: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.verts.is_empty() && self.faces.is_empty()
+    }
+
+    /// Whether putting this back changes the shape of the arrays, rather than
+    /// only what is in them.
+    ///
+    /// A stroke that only moved vertices can be undone without rebuilding the
+    /// adjacency, which on a dense mesh is the difference between an instant
+    /// undo and a noticeable one.
+    pub fn structural(&self, vlen: usize, flen: usize) -> bool {
+        !self.faces.is_empty() || self.vlen != vlen || self.flen != flen
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.verts.len() * (std::mem::size_of::<Vertex>() + 8)
+            + self.faces.len() * (std::mem::size_of::<[u32; 3]>() + 8)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Mesh {
     pub verts: Vec<Vertex>,
@@ -119,6 +177,12 @@ pub struct Mesh {
     /// Set by anything that rewrites the arrays wholesale, where per-slot
     /// tracking would be meaningless.
     pub fully_dirty: bool,
+    /// What the stroke in progress has to put back, if one is being recorded.
+    ///
+    /// Driven through [`Mesh::begin_log`] and [`Mesh::take_log`] only: every
+    /// mutation here keeps it honest by copying a slot before writing it, and
+    /// a log filled in by hand would describe a mesh that never existed.
+    pub(crate) log: Option<TopoLog>,
 }
 
 impl Mesh {
@@ -163,6 +227,59 @@ impl Mesh {
         self.fully_dirty = true;
         self.dirty_verts.clear();
         self.dirty_faces.clear();
+        // A log describes how to walk back a set of slot writes. Once the
+        // arrays have been rewritten from end to end it describes nothing, so
+        // it is dropped rather than left to restore a mesh that no longer
+        // exists. Nothing that lands here runs during a stroke.
+        self.log = None;
+    }
+
+    // ---- undo log -----------------------------------------------------------
+
+    /// Starts recording what it would take to undo what comes next.
+    pub fn begin_log(&mut self) {
+        self.log = Some(TopoLog::new(self.verts.len(), self.faces.len()));
+    }
+
+    /// Hands the recording over and stops recording.
+    pub fn take_log(&mut self) -> Option<TopoLog> {
+        self.log.take()
+    }
+
+    pub fn is_logging(&self) -> bool {
+        self.log.is_some()
+    }
+
+    /// Keeps a vertex as it is now, before something writes over it.
+    ///
+    /// Must be called before the write, which is the whole contract. Slots past
+    /// the length the stroke started at are ignored: undoing truncates them
+    /// away, so what they held is of no interest.
+    #[inline]
+    fn log_vert(&mut self, v: u32) {
+        let Some(log) = &mut self.log else { return };
+        if (v as usize) < log.vlen && (v as usize) < self.verts.len() && log.vseen.insert(v) {
+            log.verts.push((v, self.verts[v as usize]));
+        }
+    }
+
+    #[inline]
+    fn log_face(&mut self, f: u32) {
+        let Some(log) = &mut self.log else { return };
+        if (f as usize) < log.flen && (f as usize) < self.faces.len() && log.fseen.insert(f) {
+            log.faces.push((f, self.faces[f as usize]));
+        }
+    }
+
+    /// Keeps a batch of vertices, for a brush that is about to write into them
+    /// directly rather than through [`Mesh::set_pos`].
+    pub fn log_verts(&mut self, verts: &[u32]) {
+        if self.log.is_none() {
+            return;
+        }
+        for &v in verts {
+            self.log_vert(v);
+        }
     }
 
     #[inline]
@@ -252,6 +369,7 @@ impl Mesh {
 
     /// Moves one vertex, keeping the spatial index correct.
     pub fn set_pos(&mut self, v: u32, p: Vec3) {
+        self.log_vert(v);
         self.verts[v as usize].pos = p;
         self.refile(v);
     }
@@ -311,6 +429,10 @@ impl Mesh {
     /// Removes a face, moving the last face into its slot.
     pub fn remove_face(&mut self, f: u32) {
         let fi = f as usize;
+        // Two slots stop holding what they held: this one, which the last face
+        // is about to move into, and the last one, which goes away.
+        self.log_face(f);
+        self.log_face((self.faces.len() - 1) as u32);
         let tri = self.faces[fi];
         for &v in &tri {
             // SmallVec hands out `&mut T` here, unlike Vec::retain.
@@ -343,9 +465,12 @@ impl Mesh {
         let vi = v as usize;
         debug_assert!(self.vfaces[vi].is_empty(), "remove_vertex on a used vertex");
         let last = self.verts.len() - 1;
+        self.log_vert(v);
+        self.log_vert(last as u32);
         if vi != last {
             let moved: FaceList = self.vfaces[last].clone();
             for f in moved {
+                self.log_face(f);
                 for x in self.faces[f as usize].iter_mut() {
                     if *x == last as u32 {
                         *x = v;
@@ -423,6 +548,7 @@ impl Mesh {
         if old == tri {
             return;
         }
+        self.log_face(f);
         for &v in &old {
             if !tri.contains(&v) {
                 self.vfaces[v as usize].retain(|x| *x != f);
@@ -522,6 +648,7 @@ impl Mesh {
         }
 
         let merged = Vertex::lerp_attrs(&self.verts[a as usize], &self.verts[b as usize], 0.5);
+        self.log_vert(a);
         self.verts[a as usize] = merged;
         self.touch_vert(a);
 
@@ -534,6 +661,7 @@ impl Mesh {
         // Retarget b's remaining faces onto a.
         let rest: FaceList = self.vfaces[b as usize].clone();
         for f in rest {
+            self.log_face(f);
             for x in self.faces[f as usize].iter_mut() {
                 if *x == b {
                     *x = a;
