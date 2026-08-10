@@ -16,11 +16,18 @@
 //! rebuilds it.
 
 use crate::mesh::Mesh;
+use rayon::prelude::*;
 use crate::query::Hit;
 use glam::Vec3;
 use smallvec::SmallVec;
 
-type Bucket = SmallVec<[u32; 8]>;
+/// A cell holds four elements before it reaches for the heap.
+///
+/// Eight was too generous. A cell is sized to hold a couple of vertices, and
+/// every unused slot is paid for across the whole table: at forty bytes a cell
+/// over two million cells, building a grid meant writing 168 MB before looking
+/// at a single vertex.
+type Bucket = SmallVec<[u32; 4]>;
 
 /// Query radius over cell size. 2.0 means a sphere query walks at most 5^3
 /// cells, whatever the absolute scale.
@@ -60,7 +67,13 @@ impl Grid {
     /// Fills a grid sized for `mesh` with cells of `cell` world units.
     pub fn build(mesh: &Mesh, cell: f32) -> Self {
         let n = mesh.verts.len().max(mesh.faces.len()).max(64);
-        let table = (n / 2).next_power_of_two().clamp(1024, 1 << 21);
+        // Roughly four elements a cell, and a firm ceiling.
+        //
+        // One element a cell sounds better and is not: the table is written
+        // once per build and read a handful of cells at a time, so a table that
+        // does not fit in cache costs more in misses than the extra comparisons
+        // cost in a cell. This one stays under 6 MB at any mesh size.
+        let table = (n / 4).next_power_of_two().clamp(1024, 1 << 17);
         let mut g = Self {
             cell: cell.max(1e-6),
             inv: 1.0 / cell.max(1e-6),
@@ -73,16 +86,25 @@ impl Grid {
             lo: Vec3::splat(f32::MAX),
             hi: Vec3::splat(f32::MIN),
         };
-        for (i, v) in mesh.verts.iter().enumerate() {
-            let s = g.slot(v.pos);
-            g.vbuckets[s as usize].push(i as u32);
-            g.vslot[i] = s;
-            g.lo = g.lo.min(v.pos);
-            g.hi = g.hi.max(v.pos);
+        // Cells first, in parallel, then the filing. Hashing is arithmetic
+        // and splits perfectly across threads; the filing is a scatter that
+        // does not.
+        let vcells: Vec<u32> = mesh.verts.par_iter().map(|v| g.slot(v.pos)).collect();
+        let (lo, hi) = mesh.bounds();
+        g.lo = lo;
+        g.hi = hi;
+        for (i, s) in vcells.iter().enumerate() {
+            g.vbuckets[*s as usize].push(i as u32);
+            g.vslot[i] = *s;
         }
-        for i in 0..mesh.faces.len() {
-            let (c, r) = face_sphere(mesh, i as u32);
-            let s = g.slot(c);
+        let spheres: Vec<(u32, f32)> = (0..mesh.faces.len())
+            .into_par_iter()
+            .map(|i| {
+                let (c, r) = face_sphere(mesh, i as u32);
+                (g.slot(c), r)
+            })
+            .collect();
+        for (i, (s, r)) in spheres.into_iter().enumerate() {
             g.fbuckets[s as usize].push(i as u32);
             g.fslot[i] = s;
             g.face_radius = g.face_radius.max(r);
