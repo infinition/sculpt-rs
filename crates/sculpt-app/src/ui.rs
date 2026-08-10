@@ -174,6 +174,9 @@ pub struct UiState {
     /// Highest sample count this GPU accepts for both colour and depth.
     pub max_samples: u32,
     pub wireframe_available: bool,
+    /// Turn multisampling off by itself once the triangles are smaller than a
+    /// pixel, where it costs four times the rasterising for no visible gain.
+    pub adaptive_msaa: bool,
     pub picking_color: bool,
     /// Colour under the cursor while the eyedropper is armed. Sampled off the
     /// model as the pointer moves, so what a click would take is on screen
@@ -371,6 +374,7 @@ impl Default for UiState {
             msaa_available: true,
             max_samples: 4,
             wireframe_available: true,
+            adaptive_msaa: true,
             picking_color: false,
             hover_color: None,
             add_primitive: Primitive::Sphere,
@@ -2295,6 +2299,16 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
         st.sample_count = n;
         cx.actions.push(Action::SampleCountChanged(n));
     }
+    ui.add_enabled_ui(msaa_ok, |ui| {
+        widgets::toggle(ui, &mut st.adaptive_msaa, "Drop it on dense models", m.row);
+    });
+    ui.label(
+        egui::RichText::new(
+            "Past a few million triangles the triangles are smaller than a pixel, so the picture is already smooth and multisampling only multiplies the work.",
+        )
+        .small()
+        .color(p.dim),
+    );
 }
 
 fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {

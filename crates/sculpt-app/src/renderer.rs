@@ -696,6 +696,10 @@ impl Renderer {
     }
 
     /// Rebuilds every pipeline for a new sample count.
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
     pub fn set_sample_count(&mut self, device: &wgpu::Device, samples: u32) {
         if samples == self.sample_count {
             return;

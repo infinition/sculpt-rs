@@ -258,6 +258,40 @@ impl State {
 
     // ---- what to draw -------------------------------------------------------
 
+    /// Drops multisampling on a model dense enough not to need it.
+    ///
+    /// Multisampling exists because a triangle edge crosses a pixel and has to
+    /// be shaded twice. Past a few million triangles the triangles are smaller
+    /// than a pixel, so the edges are everywhere and the pixel already averages
+    /// several of them: the picture is antialiased by the geometry itself, and
+    /// four samples multiply the rasteriser's work for a difference nobody can
+    /// point at. The two thresholds are far apart so a stroke that sits on the
+    /// line does not rebuild the pipelines every frame.
+    fn adapt_sampling(&mut self) {
+        if !self.ui.adaptive_msaa || !self.ui.msaa_available {
+            return;
+        }
+        const DENSE: usize = 3_000_000;
+        const SPARSE: usize = 1_500_000;
+        let faces = self.sculptor.mesh().face_count();
+        let chosen = self.ui.sample_count.min(self.max_samples).max(1);
+        let want = if faces > DENSE {
+            1
+        } else if faces < SPARSE {
+            chosen
+        } else {
+            return; // between the two, leave whatever is set
+        };
+        if want != self.renderer.sample_count() {
+            self.renderer.set_sample_count(&self.device, want);
+            self.ui.say(if want == 1 {
+                "multisampling off: the triangles are smaller than a pixel"
+            } else {
+                "multisampling back on"
+            });
+        }
+    }
+
     /// Keeps the partitions in step with the meshes.
     ///
     /// Rebuilding one means reordering its faces, which costs about 50 ms per
@@ -1176,6 +1210,7 @@ impl State {
         // The partition follows the same list of touched faces the upload uses,
         // before anything consumes it.
         self.update_partitions(&dirty_faces, fully_dirty || self.full_resync);
+        self.adapt_sampling();
         let visible = self.visible_ranges();
         // What the sorting actually saved, for the statistics panel.
         let active_ranges = visible.get(self.sculptor.scene.active).and_then(|r| r.as_ref());
