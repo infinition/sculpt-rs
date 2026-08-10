@@ -7,6 +7,7 @@
 pub mod accel;
 pub mod alpha;
 pub mod brush;
+pub mod cluster;
 pub mod dyntopo;
 pub mod history;
 pub mod io;
@@ -18,6 +19,7 @@ pub mod topology;
 
 pub use accel::Grid;
 pub use alpha::{Alpha, Shape as AlphaShape};
+pub use cluster::{Cluster, Partition};
 pub use brush::{Axis, BlendMode, Brush, BrushKind, Falloff, FillScope, StrokeInput};
 pub use dyntopo::Dyntopo;
 pub use history::History;
