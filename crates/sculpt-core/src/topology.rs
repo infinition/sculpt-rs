@@ -135,23 +135,33 @@ pub fn decimate(mesh: &mut Mesh, ratio: f32) -> usize {
         if mesh.face_count() <= target {
             break;
         }
-        let mut edges: Vec<(u32, u32, f32)> = Vec::with_capacity(mesh.faces.len() * 3 / 2);
-        {
-            let mut seen: rustc_hash::FxHashSet<(u32, u32)> = Default::default();
-            for tri in &mesh.faces {
-                for k in 0..3 {
-                    let (a, b) = (tri[k], tri[(k + 1) % 3]);
-                    let key = if a < b { (a, b) } else { (b, a) };
-                    if seen.insert(key) {
-                        edges.push((key.0, key.1, mesh.edge_len(key.0, key.1)));
-                    }
-                }
-            }
-        }
-        edges.sort_unstable_by(|x, y| x.2.partial_cmp(&y.2).unwrap_or(std::cmp::Ordering::Equal));
+        // Every edge, shortest first.
+        //
+        // Walked from the vertices rather than from the faces. A vertex knows
+        // its ring, so taking only the neighbours numbered above it names each
+        // edge exactly once: no duplicates to remove, and half the list that
+        // walking the faces would build. What it replaces is a hash table over
+        // fifteen million entries, put up and torn down on every one of the
+        // forty passes, which was most of what a decimation cost.
+        //
+        // The length is carried rather than worked out again inside a
+        // comparator, and a length is never negative, so its bits sort exactly
+        // as it does; the endpoints settle the ties into a total order, so the
+        // result does not depend on how the work was divided.
+        let m: &Mesh = mesh;
+        let mut edges: Vec<(f32, u32, u32)> = (0..m.verts.len() as u32)
+            .into_par_iter()
+            .flat_map_iter(|v| {
+                m.neighbors(v)
+                    .into_iter()
+                    .filter(move |&n| n > v)
+                    .map(move |n| (m.edge_len(v, n), v, n))
+            })
+            .collect();
+        edges.par_sort_unstable_by_key(|(len, a, b)| (len.to_bits(), *a, *b));
 
         let before = mesh.face_count();
-        for (a, b, _) in edges {
+        for (_, a, b) in edges {
             if mesh.face_count() <= target {
                 break;
             }
