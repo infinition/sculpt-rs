@@ -111,11 +111,28 @@ impl Cluster {
 #[derive(Clone, Debug, Default)]
 pub struct Partition {
     pub clusters: Vec<Cluster>,
+    /// Rayon moyen des paquets au moment de la mise en ordre, pour mesurer
+    /// combien ils se sont élargis depuis.
+    reference: f32,
 }
 
 impl Partition {
     pub fn is_empty(&self) -> bool {
         self.clusters.is_empty()
+    }
+
+    /// À quel point les paquets se sont élargis depuis la mise en ordre.
+    ///
+    /// Un sur la partition d'origine, et cela monte à mesure que la topologie
+    /// dynamique brasse les faces. Passé deux, il y a plus à gagner à remettre
+    /// de l'ordre qu'à continuer.
+    pub fn drift(&self) -> f32 {
+        if self.clusters.is_empty() || self.reference <= 0.0 {
+            return 1.0;
+        }
+        let mean: f32 =
+            self.clusters.iter().map(|c| c.radius()).sum::<f32>() / self.clusters.len() as f32;
+        mean / self.reference
     }
 
     /// Les paquets qu'il faut dessiner, dans l'ordre.
@@ -144,6 +161,70 @@ impl Partition {
     /// Combien de faces ces plages couvrent.
     pub fn faces_in(ranges: &[(u32, u32)]) -> u32 {
         ranges.iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// Rattrape la partition après un coup de brosse.
+///
+/// Un coup déplace quelques milliers de faces sur des millions, en ajoute et en
+/// retire au passage. Tout remesurer coûterait plus cher que le coup; tout
+/// réordonner, bien plus encore. Seuls sont repris les paquets qui contiennent
+/// une face touchée, plus la queue de la liste quand le nombre de faces a
+/// changé.
+///
+/// Les paquets se déforment peu à peu: la topologie dynamique déplace des faces
+/// par échange avec la dernière, ce qui casse la localité un peu plus à chaque
+/// coup. Les boîtes restent justes, seulement plus larges, donc le rendu reste
+/// correct et devient seulement moins efficace. `drift` dit à quel point, pour
+/// que l'application décide quand remettre de l'ordre.
+pub fn follow(mesh: &Mesh, p: &mut Partition, dirty_faces: &[u32], target: usize) {
+    let target = target.max(1);
+    let n = mesh.faces.len();
+
+    // La queue d'abord: le dernier paquet grandit ou rétrécit, et il en faut
+    // de nouveaux quand des faces ont été ajoutées.
+    let wanted = n.div_ceil(target);
+    p.clusters.truncate(wanted);
+    if let Some(last) = p.clusters.last_mut() {
+        let first = last.first as usize;
+        last.count = (n - first).min(target) as u32;
+    }
+    let mut fresh: Vec<usize> = Vec::new();
+    while p.clusters.len() < wanted {
+        let first = p.clusters.len() * target;
+        let count = target.min(n - first);
+        fresh.push(p.clusters.len());
+        p.clusters.push(Cluster {
+            first: first as u32,
+            count: count as u32,
+            lo: Vec3::ZERO,
+            hi: Vec3::ZERO,
+            axis: Vec3::Y,
+            cos_spread: -1.0,
+        });
+    }
+
+    let mut todo: Vec<usize> = dirty_faces
+        .iter()
+        .map(|f| *f as usize / target)
+        .chain(fresh)
+        .chain(p.clusters.len().checked_sub(1))
+        .filter(|k| *k < p.clusters.len())
+        .collect();
+    todo.sort_unstable();
+    todo.dedup();
+
+    for k in todo {
+        let c = &mut p.clusters[k];
+        let (first, count) = (c.first as usize, c.count as usize);
+        if count == 0 || first + count > n {
+            continue;
+        }
+        let (lo, hi, axis, cos_spread) = extent(mesh, first, count);
+        c.lo = lo;
+        c.hi = hi;
+        c.axis = axis;
+        c.cos_spread = cos_spread;
     }
 }
 
@@ -200,7 +281,13 @@ pub fn build(mesh: &mut Mesh, target: usize) -> Partition {
     mesh.invalidate_accel();
     mesh.mark_fully_dirty();
 
-    Partition { clusters: measure(mesh, target) }
+    let clusters = measure(mesh, target);
+    let reference = if clusters.is_empty() {
+        0.0
+    } else {
+        clusters.iter().map(|c| c.radius()).sum::<f32>() / clusters.len() as f32
+    };
+    Partition { clusters, reference }
 }
 
 /// Découpe la liste de faces en paquets et mesure chacun.
@@ -486,6 +573,54 @@ mod tests {
             .sum();
         let part = away as f32 / m.face_count() as f32;
         assert!(part > 0.25, "seulement {:.0}% écarté", part * 100.0);
+    }
+
+    /// La partition doit rester juste quand la topologie change sous elle:
+    /// aucune face hors de sa boîte, et le compte doit suivre.
+    #[test]
+    fn following_keeps_the_partition_honest() {
+        use crate::{BrushKind, Sculptor, StrokeInput};
+
+        let mut m = primitives::icosphere(4);
+        let mut p = build(&mut m, 256);
+        let mut s = Sculptor::new(m);
+        s.symmetry = false;
+        s.dyntopo_enabled = true;
+        s.dyntopo.detail = s.mesh().mean_edge_len() * 0.4;
+        s.brush.kind = BrushKind::Draw;
+        s.brush.radius = 0.35;
+        s.brush.strength = 0.6;
+
+        s.begin_stroke();
+        for i in 0..6 {
+            let at = Vec3::new(i as f32 * 0.05, 1.0, 0.0).normalize();
+            s.stroke(&StrokeInput { point: at, normal: at, ..Default::default() });
+            let (dirty_verts, dirty_faces, _) = s.take_dirty();
+            let _ = dirty_verts;
+            follow(s.mesh(), &mut p, &dirty_faces, 256);
+        }
+        s.end_stroke();
+
+        let m = s.mesh();
+        assert!(m.face_count() > 5120, "la topologie n'a pas bougé");
+        let covered: u32 = p.clusters.iter().map(|c| c.count).sum();
+        assert_eq!(covered as usize, m.face_count(), "des faces sans paquet");
+
+        let mut next = 0u32;
+        for c in &p.clusters {
+            assert_eq!(c.first, next);
+            next += c.count;
+            for tri in &m.faces[c.first as usize..(c.first + c.count) as usize] {
+                for &v in tri {
+                    let q = m.verts[v as usize].pos;
+                    assert!(
+                        q.cmpge(c.lo - Vec3::splat(1e-4)).all()
+                            && q.cmple(c.hi + Vec3::splat(1e-4)).all(),
+                        "une face est hors de la boîte de son paquet"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -72,6 +72,10 @@ struct State {
     /// Object whose buffers need re-uploading, or `None` for all of them.
     dirty_object: Option<usize>,
     full_resync: bool,
+    /// One partition per object, for deciding what to draw.
+    partitions: Vec<sculpt_core::Partition>,
+    /// Set when the partition should be rebuilt rather than patched.
+    repartition: bool,
 }
 
 impl State {
@@ -236,6 +240,8 @@ impl State {
             last_frame: Instant::now(),
             dirty_object: None,
             full_resync: true,
+            partitions: Vec::new(),
+            repartition: true,
         }
     }
 
@@ -247,6 +253,76 @@ impl State {
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
         self.renderer.resize(&self.device, w, h);
+    }
+
+    // ---- what to draw -------------------------------------------------------
+
+    /// Keeps the partitions in step with the meshes.
+    ///
+    /// Rebuilding one means reordering its faces, which costs about 50 ms per
+    /// million and drops the spatial grid with it. That is fine when a model
+    /// arrives or its topology is rewritten wholesale, and far too expensive
+    /// between two dabs, so a stroke patches the packets it touched instead.
+    /// Patching lets them widen; `drift` says by how much, and past a point
+    /// there is more to gain from putting them back in order.
+    fn update_partitions(&mut self, dirty_faces: &[u32], rewritten: bool) {
+        let want = self.sculptor.scene.objects.len();
+        if self.partitions.len() != want {
+            self.partitions.resize(want, sculpt_core::Partition::default());
+            self.repartition = true;
+        }
+        // A mesh whose arrays were rewritten wholesale, by a subdivision, a
+        // remesh, an undo or an import, has no order left to patch.
+        self.repartition |= rewritten;
+        let active = self.sculptor.scene.active;
+        let target = sculpt_core::cluster::TARGET_FACES;
+
+        for (i, obj) in self.sculptor.scene.objects.iter_mut().enumerate() {
+            let p = &mut self.partitions[i];
+            let stale = p.is_empty() || p.drift() > 2.0;
+            if (self.repartition && i == active) || (stale && !obj.mesh.faces.is_empty()) {
+                *p = sculpt_core::cluster::build(&mut obj.mesh, target);
+            } else if i == active && !dirty_faces.is_empty() {
+                sculpt_core::cluster::follow(&obj.mesh, p, dirty_faces, target);
+            }
+        }
+        self.repartition = false;
+    }
+
+    /// The face ranges worth drawing for each object this frame.
+    ///
+    /// `None` for an object means draw it whole: a model small enough that
+    /// sorting it costs more than the triangles it would save.
+    fn visible_ranges(&self) -> Vec<Option<Vec<(u32, u32)>>> {
+        const WORTH_SORTING: usize = 100_000;
+        let planes = frustum_planes(self.camera.view_proj(self.aspect()));
+        let eye = self.camera.eye();
+        self.sculptor
+            .scene
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(i, obj)| {
+                let p = self.partitions.get(i)?;
+                if p.is_empty() || obj.mesh.faces.len() < WORTH_SORTING {
+                    return None;
+                }
+                // The partition lives in the object's own space, so the camera
+                // has to be brought into it rather than the other way round.
+                let (planes, eye) = if obj.transform.is_identity() {
+                    (planes, eye)
+                } else {
+                    let inv = obj.transform.inverse_matrix();
+                    (
+                        frustum_planes(
+                            self.camera.view_proj(self.aspect()) * obj.transform.matrix(),
+                        ),
+                        inv.transform_point3(eye),
+                    )
+                };
+                Some(p.visible_ranges(&planes, Some(eye)))
+            })
+            .collect()
     }
 
     fn aspect(&self) -> f32 {
@@ -1078,6 +1154,10 @@ impl State {
         // a scene change, or a mesh that outgrew its buffers, still goes in
         // full.
         let (mut dirty_verts, mut dirty_faces, fully_dirty) = self.sculptor.take_dirty();
+        // The partition follows the same list of touched faces the upload uses,
+        // before anything consumes it.
+        self.update_partitions(&dirty_faces, fully_dirty || self.full_resync);
+        let visible = self.visible_ranges();
         let object = self.sculptor.scene.active;
         let changed = self.sculptor.verts_dirty || self.sculptor.topology_dirty;
         let sparse_ok = self.ui.settings.gpu_scatter
@@ -1208,7 +1288,7 @@ impl State {
                 multiview_mask: None,
             });
             self.renderer
-                .draw(&mut pass, &self.sculptor.scene, &self.ui.settings);
+                .draw(&mut pass, &self.sculptor.scene, &self.ui.settings, &visible);
         }
 
         {
@@ -1536,4 +1616,33 @@ fn main() {
     el.set_control_flow(ControlFlow::Poll);
     let mut app = App::default();
     el.run_app(&mut app).expect("event loop failed");
+}
+
+/// The six frustum planes of a view-projection matrix, pointing inward.
+///
+/// The standard extraction: each plane is the fourth row of the matrix plus or
+/// minus one of the others, normalised so the distance it reports is a real
+/// distance rather than a scaled one.
+fn frustum_planes(m: glam::Mat4) -> [[f32; 4]; 6] {
+    let r = m.transpose();
+    let row = |i: usize| -> [f32; 4] { r.col(i).to_array() };
+    let combine = |a: [f32; 4], b: [f32; 4], sign: f32| -> [f32; 4] {
+        let p = [
+            a[0] + sign * b[0],
+            a[1] + sign * b[1],
+            a[2] + sign * b[2],
+            a[3] + sign * b[3],
+        ];
+        let n = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-9);
+        [p[0] / n, p[1] / n, p[2] / n, p[3] / n]
+    };
+    let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+    [
+        combine(r3, r0, 1.0),
+        combine(r3, r0, -1.0),
+        combine(r3, r1, 1.0),
+        combine(r3, r1, -1.0),
+        combine(r3, r2, 1.0),
+        combine(r3, r2, -1.0),
+    ]
 }

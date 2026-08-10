@@ -928,7 +928,33 @@ impl Renderer {
         (eye.length() * 2.5).clamp(4.0, 60.0)
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, scene: &Scene, s: &FrameSettings) {
+    /// Draws one object, whole or by the ranges the view left standing.
+    fn draw_object(
+        pass: &mut wgpu::RenderPass<'_>,
+        buffers: &MeshBuffers,
+        ranges: Option<&[(u32, u32)]>,
+    ) {
+        match ranges {
+            // Ranges are in faces; the index buffer counts in indices.
+            Some(ranges) => {
+                for (first, count) in ranges {
+                    let start = first * 3;
+                    pass.draw_indexed(start..start + count * 3, 0, 0..1);
+                }
+            }
+            None => pass.draw_indexed(0..buffers.index_count, 0, 0..1),
+        }
+    }
+
+    /// `visible` holds, per object, the face ranges worth drawing, or `None` to
+    /// draw the object whole.
+    pub fn draw(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        scene: &Scene,
+        s: &FrameSettings,
+        visible: &[Option<Vec<(u32, u32)>>],
+    ) {
         pass.set_bind_group(0, &self.global_bind, &[]);
         pass.set_pipeline(&self.background_pipeline);
         pass.draw(0..3, 0..1);
@@ -946,7 +972,7 @@ impl Renderer {
             pass.set_bind_group(1, &self.object_bind, &[offset]);
             pass.set_vertex_buffer(0, buffers.vbuf.slice(..));
             pass.set_index_buffer(buffers.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..buffers.index_count, 0, 0..1);
+            Self::draw_object(pass, buffers, visible.get(i).and_then(|r| r.as_deref()));
         }
 
         if s.wireframe {
@@ -964,7 +990,7 @@ impl Renderer {
                     pass.set_bind_group(1, &self.object_bind, &[offset]);
                     pass.set_vertex_buffer(0, buffers.vbuf.slice(..));
                     pass.set_index_buffer(buffers.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..buffers.index_count, 0, 0..1);
+                    Self::draw_object(pass, buffers, visible.get(i).and_then(|r| r.as_deref()));
                 }
             }
         }
