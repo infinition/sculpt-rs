@@ -106,10 +106,26 @@ name is the ownership; the citation is the paper trail.
 | **the channel store** | the packed blobs a manifest points into | ours |
 | **the packet reorder** | putting faces back in spatial order | Morton curve ordering |
 
+## Platforms and input
+
+| Our name | What it is | Rests on |
+|---|---|---|
+| **the input layer** | where every device becomes an action, once, for every platform | ours |
+| **an action** | what the application handles, never a key or a button | ours |
+| **hover** | the pen located before it touches | platform pointer proximity |
+| **the orbit device** | a six axis controller turning the model in the off hand | plain USB human interface reports, no vendor runtime |
+| **degrading** | asking the card for a feature, being refused, and taking the cheaper path | ours |
+
 ## Names we keep
 
 Some names are not anyone's design, they are the thing itself, and replacing
 them would only cost a reader time: **LZ4**, **glTF**, **OBJ**, **PLY**,
 **STL**, **FBX**, **PNG**, **sRGB**, **PBR**, **wgpu**, **WGSL**, **rayon**,
-**Morton**, **matcap**. A file format is a contract with other programs, not a
-design decision of ours.
+**Morton**, **matcap**, and the names of the graphics backends: **Vulkan**,
+**Metal**, **Direct3D**, **WebGPU**, **WebGL**. A file format or a driver
+interface is a contract with other programs, not a design decision of ours.
+
+Hardware is named as its makers name it, because a person shopping for one needs
+to recognise it: **Apple Pencil**, **SpaceMouse**, **Wacom**. What we build to
+talk to them is ours, and is called the **orbit device** layer and the **input
+layer**.

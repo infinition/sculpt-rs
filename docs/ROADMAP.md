@@ -31,13 +31,21 @@ found to be regressions, and reverted; that is the process working.
 
 **Invariants that hold across every item:**
 
-- *Portable.* Runs on Windows, macOS, Linux, and a tablet through the browser.
-  No architecture intrinsics, no platform paths, no assumption about core count.
-  The engine keeps no graphics dependency, so it compiles to WebAssembly
-  unchanged.
+- *Portable.* Windows, Linux, macOS, iPadOS, and the browser, with iOS behind
+  the same work as iPadOS. No architecture intrinsics, no platform paths, no
+  assumption about how many cores there are. The engine keeps no graphics
+  dependency, so it compiles to WebAssembly unchanged. Phase 7 is where each
+  platform actually gets stood up and kept working.
+- *Fastest path the machine offers.* Every backend the device supports is
+  available and the best one is chosen at start: Direct3D 12 or Vulkan on
+  Windows, Vulkan on Linux, Metal on Apple, WebGPU in the browser with WebGL 2
+  behind it. Features are asked for and degraded, never assumed. A phone-class
+  GPU and a workstation card run the same code down different paths.
 - *Parallel by default.* Anything touching more than a few thousand elements is
   spread across cores, with a threshold below which it stays sequential because
-  handing work to a pool is not free.
+  handing work to a pool is not free. Work that belongs on the GPU goes to the
+  GPU: the sparse vertex update is already a compute pass, and culling follows
+  in R11.
 - *Deterministic.* The same input gives the same mesh. Where a parallel pass
   could reorder work, the result is sorted into a total order. One known
   exception is recorded in the open questions below.
@@ -295,6 +303,39 @@ A 25 million triangle glTF is unusable uncompressed.
 
 Large dependency, narrow audience. Not planned until asked for.
 
+### F11. Baking
+
+**Why.** Sculpted detail has to reach a renderer that will not take twenty
+million triangles. Baking writes it into images over a low mesh.
+
+**Rests on.** Ray cast from the low surface along its normal into the high one,
+with a cage offset and edge bleed.
+
+**Shape.** Colour, normal, roughness, metalness, opacity, occlusion, group and
+mask, at a chosen size, with bleed past the island borders so filtering does not
+pull in background.
+
+**Depends on.** M2, T7.
+
+**Done when.** A baked normal map applied to the low mesh reproduces the high
+one at a glance, and no seam shows at an island border.
+
+**Effort.** 1 week.
+
+### F12. Autosave
+
+**Why.** A session that dies takes the work with it. There is no recovery today.
+
+**Shape.** Write the scene container to a rotating slot on a timer and after
+every heavy command, and offer it at start if the last exit was not clean.
+
+**Depends on.** F2. **Effort.** 2 days.
+
+### F13. More images in
+
+WebP, GIF and PSD arrive as reference and as alphas. Low priority next to the
+formats already read. **Effort.** 3 days.
+
 ---
 
 ## Phase 3. Topology
@@ -398,6 +439,27 @@ vertices back onto the old surface recovers most of it.
 
 **Depends on.** T2. **Effort.** 3 days.
 
+### T10. Quad tidying
+
+**Why.** A remesh leaves quads whose diagonals run against the surface flow,
+which shades badly and subdivides worse.
+
+**Rests on.** An in-circle test per quad, flipping the diagonal when the other
+one is the better triangulation.
+
+**Depends on.** T3. **Effort.** 3 days.
+
+### T11. Surface remesh
+
+**Why.** Not every cleanup wants a full rebuild through the field. Sometimes the
+answer is to even out the triangles that are already there.
+
+**Shape.** Three modes over the existing surface: decimate, subdivide, or
+even out edge lengths in place, all of them respecting the mask so a region can
+be left alone.
+
+**Depends on.** T1. **Effort.** 4 days.
+
 ---
 
 ## Phase 4. Sculpting
@@ -479,6 +541,52 @@ Array, mirror, radial and along a curve, live rather than baked.
 
 Select, name, colour, hide and isolate groups of faces.
 **Depends on.** M3. **Effort.** 4 days.
+
+### S13. Radial and limited symmetry
+
+**Why.** Symmetry is one mirror plane. The product also repeats radially around
+an axis, limits symmetry to part of the model, and works in local or world
+space. A radial pattern is otherwise built by hand.
+
+**Shape.** A count and an offset per axis for the radial case, a plane or a
+masked region for the limited case, and a switch between the object's own axes
+and the world's. Cutting along the mirror, and splitting into halves, follow
+from the same plane.
+
+**Effort.** 4 days.
+
+### S14. Extraction, properly
+
+**Why.** Extraction lifts a masked region into a solid. The product offers what
+happens at the border and what the result is made of.
+
+**Shape.** Shell, fill, layer or nothing at the border; carve inwards rather
+than outwards; polish the border, the whole thing, or just the sharp parts; a
+thickness; an edge loop; and a preview before it commits.
+
+**Depends on.** T4 for a clean border. **Effort.** 4 days.
+
+### S15. A remesh brush
+
+**Why.** Remeshing is all or nothing. Painting where the density should go, then
+remeshing to that, is how detail gets spent where it matters.
+
+**Shape.** A brush writing the density channel, and a remesh that reads it.
+
+**Depends on.** M3, T2. **Effort.** 4 days.
+
+### S16. Selecting by mask
+
+Grow, shrink, select by cavity, by group, by connected region, by angle. The
+mask exists; the ways of making one do not. **Depends on.** M3.
+**Effort.** 3 days.
+
+### S17. More primitives
+
+Six today: sphere from an icosahedron, sphere from a grid, cube, cylinder,
+torus, plane. Missing: cone, tube, a cube projected to a sphere, and a surface
+revolved from a drawn profile. **Depends on.** S7 for the last.
+**Effort.** 3 days.
 
 ---
 
@@ -587,6 +695,35 @@ writing an indirect buffer removes that, and the gap-merging heuristic with it.
 
 Shader variants, cheap, each a real aid while sculpting. **Effort.** 3 days.
 
+### R13. Shader variants
+
+**Why.** There are seven shaders today and no way to share code between them.
+The rendering phase multiplies that by every material kind, every light type and
+every optional effect. Pasting the same twenty lines into each is how a renderer
+rots.
+
+**Shape.** Text inclusion and conditional blocks resolved before a shader
+reaches the driver, with a compiled variant cached per set of flags. The product
+does exactly this, down to a repeat directive that emits one block per light.
+
+**Depends on.** Nothing. **Blocks.** R5, R7 in practice. **Effort.** 4 days.
+
+### R14. Texture encodings and GPU compression
+
+**Why.** An environment at high range costs four bytes a channel unless it is
+encoded, and an uncompressed texture set will not fit on a tablet.
+
+**Rests on.** RGBM and its relatives for range in eight bits per channel. ASTC
+where the device offers it, BC7 elsewhere, both detected rather than assumed.
+
+**Depends on.** R4, R6. **Effort.** 1 week.
+
+### R15. The rest of the final pass
+
+Chromatic aberration, a curvature pass that reads creases and ridges, and a
+pixel art mode that renders low and holds the grid. Small, and each is a look
+somebody wants. **Depends on.** R9. **Effort.** 4 days.
+
 ---
 
 ## Phase 6. Scene and application
@@ -626,6 +763,234 @@ Pressure only today. Tilt shapes the brush, rotation turns the alpha.
 
 Rotate, render, write an animation with an alpha silhouette. **Effort.** 3 days.
 
+### A8. Settings that persist
+
+**Why.** Bindings, theme, interface scale and every preference are lost on exit.
+Nothing is written anywhere.
+
+**Shape.** A versioned settings file next to the scene container, written on
+change and read at start, with an unreadable one falling back to defaults rather
+than refusing to launch.
+
+**Effort.** 3 days. **Small, and it is felt on the second launch.**
+
+### A9. The rest of the gestures
+
+Palm rejection, so a hand resting on a tablet is not a stroke. An air stroke, so
+a pen that leaves the surface mid-line does not break it. Four fingers to shrink
+the interface out of the way. **Effort.** 4 days.
+
+### A10. Snapping
+
+The grid is drawn but nothing snaps to it. Position, rotation and scale to the
+grid or to an increment, and a plane to work on. **Effort.** 3 days.
+
+### A11. Script coverage for text
+
+**Why.** A translation is worthless if its glyphs do not draw. Arabic, Hebrew,
+Thai, Japanese, Korean and both Chinese sets need font coverage and, for two of
+them, right to left layout.
+
+**Depends on.** A5. **Effort.** 1 week, and it is the real cost of translation.
+
+### A12. Long operations without a frozen window
+
+**Why.** A remesh at high resolution, a bake or a boolean can take a minute.
+The window is unresponsive for all of it, and there is no way to tell what is
+happening or to stop it.
+
+**Shape.** Heavy commands run off the interface thread against a snapshot,
+report progress by stage, and can be cancelled. The stages the product shows are
+loading, binding, atlas, baking, voxel, boolean and remesh.
+
+**Effort.** 1 week.
+
+---
+
+## Phase 7. Platforms and input
+
+Nothing in the teardown covers this: the analysed product runs on Windows,
+macOS and the web, and has no six degree of freedom device support at all. These
+items are ours.
+
+Two of them, P1 and P10, should be done early. A platform that is only stood up
+at the end is a platform that never works.
+
+### P1. Linux
+
+**Why.** The cheapest platform to add, and the one most likely to be already
+working: `wgpu` speaks Vulkan and `winit` speaks Wayland and X11.
+
+**Shape.** Build, run and pass the offscreen check on both display servers.
+Confirm the file dialogs, which go through a portal on Wayland and need one
+installed. Confirm pen and touch, which arrive through libinput and not through
+the same path as Windows.
+
+**Done when.** The offscreen example passes on Wayland and on X11, in continuous
+integration, on llvmpipe so it runs without a GPU present.
+
+**Effort.** 3 days. **Do this early.**
+
+### P2. macOS
+
+**Why.** Metal is a first class `wgpu` backend and half the sculpting audience
+is there.
+
+**Shape.** A bundle with an icon and the usual metadata. Trackpad gestures,
+which arrive differently from a touch screen. The system file dialogs.
+Distribution needs signing and notarisation, which is an account and a
+certificate rather than code.
+
+**Done when.** It launches from a bundle on an Apple silicon machine, the
+offscreen check passes on Metal, and a pinch on the trackpad zooms.
+
+**Effort.** 4 days, plus whatever notarisation costs in paperwork.
+
+### P3. The browser
+
+**Why.** The engine was written with no graphics dependency precisely so this
+would be possible, and it is how the tool reaches a tablet without an app store.
+
+**Shape.** The engine compiles to WebAssembly unchanged. The shell needs a
+canvas, `wgpu` on WebGPU with WebGL 2 behind it, files through the browser
+rather than the disk, and pointer events for pen and touch.
+
+**The hard part is threads.** Parallelism in the browser needs shared memory,
+which needs cross-origin isolation headers on whoever serves the page. Without
+them everything still runs, on one core. That has to be a supported
+configuration, not a broken one, which means every threshold in the engine has
+to behave when there is exactly one worker.
+
+**Done when.** A model loads, sculpts and exports in a browser on WebGPU and
+again on WebGL 2, and the same page still works with isolation headers absent,
+slower and correct.
+
+**Effort.** 2 to 3 weeks. **Depends on.** P10.
+
+### P4. iPadOS, and iOS behind it
+
+**Why.** A pen on a screen is the reason the interface was built the way it was.
+
+**Two routes, and they are not equivalent.** The browser build of P3 reaches an
+iPad with no app store and no account, and it cannot have pencil hover, the
+double tap, the squeeze or the barrel roll, because Safari does not expose them.
+A native shell can have all of it: a Rust static library under a thin platform
+host that owns the window, the touch handling and the pencil.
+
+**Shape.** The native route: the engine and the renderer build for the platform,
+the host owns the view and forwards events into the same input layer the desktop
+uses. Memory is the real constraint, not speed, which makes M1 and F1 load
+bearing here rather than merely worthwhile.
+
+**Done when.** A model of a few million triangles sculpts at a usable frame rate
+on a recent iPad without the system killing the process for memory.
+
+**Effort.** 3 weeks for the native shell after P3, which is why P3 comes first
+even for people who want the native one.
+
+### P5. Pen hover
+
+**Why.** A pen that reports where it is before it touches lets the brush ring
+follow it. Every sculpting tool worth using does this, and its absence is felt
+immediately by anyone who has used one.
+
+**Shape.** Proximity arrives differently everywhere: through the pointer API on
+Windows, through libinput on Linux, and through the pencil interaction on Apple
+hardware that has it. One event in our input layer, several ways of producing
+it, and everything above it unchanged.
+
+**Depends on.** The platform it is being read on. **Effort.** 4 days per
+platform family.
+
+### P6. Apple Pencil gestures
+
+**Why.** The double tap, the squeeze and the barrel roll are how a pencil
+changes tool without reaching for the screen.
+
+**Shape.** All three are surfaced only through the platform's pencil
+interaction, so they need the native shell of P4. They map onto actions in the
+binding system like any other input, so nothing above the input layer knows they
+are special. Barrel roll drives the alpha angle, which already exists for tilt.
+
+**Depends on.** P4, A6. **Effort.** 3 days once the native shell exists.
+
+### P7. Stylus buttons everywhere else
+
+Barrel buttons on a graphics tablet, and the eraser end. Some arrive as mouse
+buttons, some through a tablet driver protocol. They should reach the binding
+system as themselves, not as a right click.
+
+**Effort.** 4 days.
+
+### P8. Six degree of freedom devices
+
+**Why.** A SpaceMouse in the off hand while the pen is in the other is how the
+model gets turned without ever stopping the stroke. There is no other input that
+changes sculpting ergonomics as much.
+
+**Rests on.** The device is a plain USB human interface device. Its reports
+carry six signed axes, three of translation and three of rotation, plus its
+buttons. Reading the raw reports works identically on Windows, macOS and Linux
+and needs no vendor runtime, no driver install and no licence. The vendor
+software offers a higher level path on two of the three platforms; taking it
+would mean a dependency that we do not control on a device that does not need
+one.
+
+**Shape.** A device layer that opens anything matching the known vendor and
+product identifiers, decodes the axis reports, applies a deadzone and a
+per-axis curve, and feeds the camera. Translation pans and dollies, rotation
+orbits, and the whole thing can be locked per axis for people who want two of
+the six. Buttons reach the binding system. Hot plug is handled: a device
+appearing mid-session is picked up, one disappearing is not an error.
+
+**Done when.** A SpaceMouse orbits and pans on all three desktop platforms while
+a stroke is in progress and the stroke is unaffected, and unplugging it
+mid-stroke changes nothing.
+
+**Effort.** 1 week. **Medium priority, high delight.**
+
+### P9. One input layer
+
+**Why.** Mouse, pen, touch, gestures, keyboard, gamepad and now a six axis
+device all arrive differently on five platforms. Without one place where they
+become actions, every feature above pays for the difference.
+
+**Shape.** Devices produce events, events map to actions through the bindings,
+actions are what the application handles. The mapping already exists for
+keyboard and pointer; this is extending it to cover everything and keeping the
+platform differences underneath it.
+
+**Depends on.** A8 to keep the bindings. **Effort.** 1 week.
+
+### P10. Backend selection and capability degradation
+
+**Why.** The same code has to run on a workstation card and on a tablet. Today
+the adapter is asked for its limits and they are taken; there is no fallback if
+a feature is missing, and no way to choose a backend.
+
+**Shape.** Rank the backends the platform offers and take the best that starts.
+Ask for features, notice which were refused, and take the cheaper path where one
+was: no compute scatter without compute, no wireframe without polygon mode, a
+smaller vertex ceiling on a smaller buffer limit. Report what was chosen and
+what was degraded, in the interface, where somebody can read it.
+
+**Done when.** Forcing each backend in turn produces a working window or a clear
+message, and forcing a minimal feature set still sculpts.
+
+**Effort.** 1 week. **Do this early: it is what makes P3 and P4 possible at
+all.**
+
+### P11. Keeping every platform working
+
+**Why.** Five platforms and one pair of hands is how platforms quietly rot.
+
+**Shape.** Continuous integration builds every target and runs the tests. The
+offscreen example runs wherever a software rasteriser is available, which makes
+it a real rendering check and not just a compile. A performance run on a known
+model, recorded per platform, so a regression is visible as a number.
+
+**Effort.** 4 days, then it pays for itself.
+
 ---
 
 ## What is deliberately not planned
@@ -641,6 +1006,16 @@ Rotate, render, write an animation with an alpha silhouette. **Effort.** 3 days.
 - **Third-party remeshers.** A published algorithm implemented here is worth
   more than a library that needs its own activation server.
 - **USD.** Large dependency, narrow audience, nobody has asked.
+- **Automatic updates and a shell thumbnail handler.** The product ships both.
+  Both are packaging concerns, and both are per-platform work that buys nothing
+  for the engine.
+- **An interface drawn from a sprite atlas.** The product draws its own widgets
+  in OpenGL from an atlas of 453 icons. We draw ours in code through egui, which
+  is why the binary ships no assets at all. A deliberate divergence, not a gap.
+- **An octree or a bounding volume hierarchy for queries.** The product uses an
+  octree on the web and a ray tracing library on the desktop. We measured a
+  chained flat structure against our hash grid and the grid won on every hot
+  path; the reasons are in `accel.rs`. Revisit only if a measurement says so.
 
 ---
 
@@ -684,12 +1059,104 @@ ones given a second pair of hands.
 | 30 | T7 the flattener | | 3 wk |
 | 31 | T8 levels | | 2 wk |
 | 32 | R10 the packet tree, R11 GPU culling | once scenes pass 20 M triangles | 4 wk |
-| 33 | F7 FBX, F9 mesh compression, A5 translations | | 3 wk |
+| 33 | F7 FBX, F9 mesh compression, A5 and A11 translations | | 4 wk |
+| 34 | F11 baking, F13 images, R14 encodings, R15 final extras | | 3 wk |
 
-Roughly nine months for one pair of hands, and the first five items, about three
-weeks together, carry most of the day-to-day improvement.
+Platforms run alongside rather than after, and two of them come early:
+
+| # | Item | Why here | Effort |
+|---|---|---|---|
+| early | P10 backend selection | nothing else ports without it | 1 wk |
+| early | P1 Linux | cheapest platform, catches assumptions now | 3 d |
+| early | P11 continuous checks | five platforms rot without them | 4 d |
+| with phase 2 | P2 macOS | | 4 d |
+| with phase 3 | P9 one input layer | before more devices arrive | 1 wk |
+| with phase 3 | P5 pen hover | felt immediately, cheap per platform | 4 d each |
+| with phase 4 | P8 six degree of freedom devices | | 1 wk |
+| with phase 4 | P7 stylus buttons | | 4 d |
+| after M1 and F1 | P3 the browser | memory has to come down first | 2-3 wk |
+| after P3 | P4 iPadOS native | | 3 wk |
+| after P4 | P6 pencil gestures | needs the native shell | 3 d |
+
+Slotted in wherever they fit, because each is small and none blocks anything:
+A8 settings that persist, A10 snapping, S4 spacing, S10 measure, S13 symmetry,
+S16 mask selection, S17 primitives, T10 quad tidying, R12 view modes. Two more
+belong early despite sitting low in the table: **R13 shader variants**, before
+the rendering work multiplies the shaders it has to share code between, and
+**A12 long operations off the interface thread**, before the first command that
+takes a minute ships.
+
+Roughly ten to eleven months for one pair of hands. The first five items, about
+three weeks together, carry most of the day-to-day improvement.
 
 ---
+
+## Coverage of the teardown
+
+Every section of the analysis, and where it lands here. This is the table to
+check when asking whether something was missed.
+
+| Section | Subject | Where it lands |
+|---|---|---|
+| 1.1 to 1.7 | builds, stack, third-party libraries | context; the library list is replaced item by item |
+| 1.8 | denoising a final image | not planned |
+| 2.1 to 2.5 | project container, per-channel blocks, compression | F1, F2 |
+| 2.6 | material entries | R7, A4 |
+| 2.7 | light entries | A3 |
+| 2.8, 2.9 | writing and reading order | F2 |
+| 3.1 | hybrid deferred and forward | R3 |
+| 3.2 | shader preprocessor and variants | R13 |
+| 3.3 | surface targets | R3 |
+| 3.4 | direct lighting, image based lighting, shadows | R4, R5 |
+| 3.4 | occlusion, reflections, indirect, refraction | R2, R7, R8 |
+| 3.5 | material kinds and channels | R6, R7 |
+| 3.6 | the effect chain and tone curves | R1, R8, R9, R15 |
+| 3.7 | scene passes, outline, cursor, navigation cube | R12, done |
+| 3.8 | atlases, environments, texture encodings | R4, R14, and a divergence |
+| 4.1 | channels and quantisation | M1, M2, M3 |
+| 4.2 | four-sided faces, half-edge, adjacency | M4, M5 |
+| 4.3 | layer separation, channel copy, UV reorder | S1, M1, T7 |
+| 4.4 | mesh kinds, levels, primitives, groups | T8, S17, M3 |
+| 4.5 | CPU parallelism | done |
+| 4.6 | spatial indexing | done, with the octree recorded as not planned |
+| 4.7 | packets for incremental upload | done |
+| 5.1 | the tool list | done for 16, S1 and S6 to S12 for the rest |
+| 5.2.1 | the remesh pipeline, seven stages | T2, T3, T4, T9, T10 |
+| 5.2.2 | live topology and its detail measures | done |
+| 5.2.3 | quad remeshing | T6 |
+| 5.2.4 | decimation, surface remesh, levels, repair | T1, T11, T8, T4 |
+| 5.3 | scene operations, extraction, repeats | S11, S14, T5, A1 |
+| 5.4 | primitives | S17 |
+| 5.5 | history | done |
+| 5.6 | masks and painting | done, S16 for making a mask |
+| 5.7 | symmetry, radial and limited | S13 |
+| 5.8 | the brush kernel, spacing, screen radius | S2, S3, S4, S5 |
+| 5.9 | ray casting and picking | done |
+| 6.1 | the format table | F3 to F10, F13 |
+| 6.2 | the OBJ writer | F5 |
+| 6.3 | asynchronous export with progress | A12 |
+| 6.4 | glTF, morph targets, compression extensions | F3, F4, F9 |
+| 6.5 | FBX | F7 |
+| 6.6 | baking | F11 |
+| 6.7 | compression and encoders | F1, F9, R14 |
+| 7.1 | a custom drawn interface | a divergence, recorded |
+| 7.2 | bindings and their file | done, A8 for keeping them |
+| 7.3 | pointer, pen, gestures | done, A6 and A9 for the rest |
+| 7.4 | the radial menu | done |
+| 7.5 | translations | A5, A11 |
+| 7.6 | navigation cube, snapping, gizmo, measure, stats | done, A10 and S10 |
+| annexe | how the analysis was made | not applicable |
+
+**Phase 7 has no row above, and that is correct.** The analysed product ships
+on Windows, macOS and the web, has no support for a six degree of freedom
+device, and reaches a tablet only through a browser. Everything in that phase is
+ours to decide, so there is nothing to trace it back to.
+
+**One section of the analysis is missing from the folder.** Its index lists
+`08-licences.md`, covering activation, licensing and commercial integration, and
+the file is not there. Nothing in this roadmap depends on it: everything in that
+domain is already under what is deliberately not planned. Worth knowing rather
+than discovering later.
 
 ## Open questions
 
