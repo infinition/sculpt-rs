@@ -164,6 +164,19 @@ impl Mesh {
         }
     }
 
+    /// Builds a grid only if there is none at all.
+    ///
+    /// What a stroke in progress wants. A rebuild walks the whole mesh, and
+    /// between two dabs that is a freeze with the pen down; a grid whose cells
+    /// no longer match the radius only costs a wider walk, and the stroke that
+    /// follows will size it properly. The mismatch is bounded because the
+    /// radius is settled before the stroke starts.
+    pub fn ensure_accel_if_missing(&mut self, radius: f32) {
+        if self.accel.is_none() {
+            self.accel = Some(Grid::build(self, crate::accel::ideal_cell(radius)));
+        }
+    }
+
     pub fn invalidate_accel(&mut self) {
         self.accel = None;
     }

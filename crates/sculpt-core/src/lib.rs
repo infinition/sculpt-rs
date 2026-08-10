@@ -184,6 +184,13 @@ impl Sculptor {
     pub fn begin_stroke(&mut self) {
         if !self.stroking {
             self.history.fit_budget_to(self.mesh_bytes());
+            // The one moment worth paying for a grid sized to this brush: the
+            // radius is settled, and every dab that follows will be spared the
+            // rebuild.
+            let radius = self.local_radius();
+            if let Some(mesh) = self.mesh_mut() {
+                mesh.ensure_accel(radius);
+            }
             self.stroking = true;
             self.stroke_state = brush::StrokeState::default();
             self.journal = Some(history::StrokeJournal::default());
@@ -247,9 +254,17 @@ impl Sculptor {
         let point = input.point;
 
         {
+            let stroking = self.stroking;
             let Some(mesh) = self.mesh_mut() else { return };
-            // The grid is sized from the query radius, so tell it before we query.
-            mesh.ensure_accel(radius);
+            // The grid is sized from the query radius, so tell it before we
+            // query. Mid-stroke it is only built when there is none: resizing
+            // it there would stop the pen dead, and `begin_stroke` has already
+            // sized it for this brush.
+            if stroking {
+                mesh.ensure_accel_if_missing(radius);
+            } else {
+                mesh.ensure_accel(radius);
+            }
         }
 
         if deforms && dyn_on {

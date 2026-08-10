@@ -80,35 +80,39 @@ impl Grid {
             mask: (table - 1) as u32,
             vbuckets: vec![Bucket::new(); table],
             fbuckets: vec![Bucket::new(); table],
-            vslot: vec![0; mesh.verts.len()],
-            fslot: vec![0; mesh.faces.len()],
+            vslot: Vec::new(),
+            fslot: Vec::new(),
             face_radius: 0.0,
             lo: Vec3::splat(f32::MAX),
             hi: Vec3::splat(f32::MIN),
         };
-        // Cells first, in parallel, then the filing. Hashing is arithmetic
-        // and splits perfectly across threads; the filing is a scatter that
-        // does not.
-        let vcells: Vec<u32> = mesh.verts.par_iter().map(|v| g.slot(v.pos)).collect();
         let (lo, hi) = mesh.bounds();
         g.lo = lo;
         g.hi = hi;
-        for (i, s) in vcells.iter().enumerate() {
-            g.vbuckets[*s as usize].push(i as u32);
-            g.vslot[i] = *s;
-        }
-        let spheres: Vec<(u32, f32)> = (0..mesh.faces.len())
-            .into_par_iter()
-            .map(|i| {
-                let (c, r) = face_sphere(mesh, i as u32);
-                (g.slot(c), r)
-            })
-            .collect();
-        for (i, (s, r)) in spheres.into_iter().enumerate() {
-            g.fbuckets[s as usize].push(i as u32);
-            g.fslot[i] = s;
-            g.face_radius = g.face_radius.max(r);
-        }
+
+        // Which cell everything falls in, vertices and faces at the same time.
+        let (vslot, spheres) = rayon::join(
+            || mesh.verts.par_iter().map(|v| g.slot(v.pos)).collect::<Vec<u32>>(),
+            || {
+                (0..mesh.faces.len())
+                    .into_par_iter()
+                    .map(|i| {
+                        let (c, r) = face_sphere(mesh, i as u32);
+                        (g.slot(c), r)
+                    })
+                    .collect::<Vec<(u32, f32)>>()
+            },
+        );
+        g.vslot = vslot;
+        g.face_radius = spheres.par_iter().map(|(_, r)| *r).reduce(|| 0.0, f32::max);
+        g.fslot = spheres.into_par_iter().map(|(s, _)| s).collect();
+
+        // And the filing, which used to be the one serial half of the build.
+        rayon::join(
+            || fill(&mut g.vbuckets, &g.vslot),
+            || fill(&mut g.fbuckets, &g.fslot),
+        );
+
         if mesh.verts.is_empty() {
             g.lo = Vec3::ZERO;
             g.hi = Vec3::ZERO;
@@ -380,6 +384,43 @@ impl Grid {
 /// Cell size that keeps a sphere query to a handful of cells.
 pub fn ideal_cell(radius: f32) -> f32 {
     (radius / CELLS_PER_RADIUS).max(1e-5)
+}
+
+/// Files every element into its bucket, across every core.
+///
+/// A scatter cannot be split by element: two threads would push into the same
+/// bucket. It can be split by bucket. Each thread takes a slice of the table,
+/// reads the whole list of cells, and keeps what falls in its slice. That reads
+/// the list once per thread rather than once in total, which is a streaming
+/// read the prefetcher handles for free, and in exchange it turns a scatter
+/// across the whole table into writes inside a slice small enough to stay in
+/// cache. On a machine with one core it is the loop it replaces.
+fn fill(buckets: &mut [Bucket], slots: &[u32]) {
+    // Below this the sequential loop wins: the extra reads are not free, and a
+    // small table is in cache already.
+    if slots.len() < 64_000 || rayon::current_num_threads() < 2 {
+        for (i, &s) in slots.iter().enumerate() {
+            buckets[s as usize].push(i as u32);
+        }
+        return;
+    }
+    let parts = rayon::current_num_threads();
+    let chunk = buckets.len().div_ceil(parts).max(1);
+    buckets
+        .par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(k, part)| {
+            let lo = (k * chunk) as u32;
+            let hi = lo + part.len() as u32;
+            // Counting first to size each cell exactly was tried and is
+            // slower: the extra pass over the list costs more in bandwidth
+            // than the reallocations it saves.
+            for (i, &s) in slots.iter().enumerate() {
+                if s >= lo && s < hi {
+                    part[(s - lo) as usize].push(i as u32);
+                }
+            }
+        });
 }
 
 #[inline]
