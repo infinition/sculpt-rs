@@ -222,6 +222,13 @@ back and looks at them: the centre must carry the normal that faces the camera,
 which is the octahedral encoding checked end to end, and a stroke and a painted
 colour sent through the sparse update must both arrive.
 
+## Where this is going
+
+[docs/ROADMAP.md](docs/ROADMAP.md) sets what is here against what a finished
+sculpting application contains, item by item, and puts the rest in the order it
+is worth doing. It also carries the performance numbers and how to reproduce
+them.
+
 ## Notes on origin
 
 This is a clean-room implementation. It reuses well known, published techniques
