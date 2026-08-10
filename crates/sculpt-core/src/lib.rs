@@ -60,10 +60,10 @@ pub struct Sculptor {
     pub verts_dirty: bool,
     /// Set when the index buffer needs a re-upload.
     pub topology_dirty: bool,
-    /// Largest vertex buffer the GPU will accept, in bytes, when the caller
-    /// knows. The engine has no graphics dependency, so it is told rather than
-    /// asking, and `None` simply means no check.
-    pub vertex_buffer_limit: Option<u64>,
+    /// Most vertices the GPU will hold, when the caller knows. The engine has
+    /// no graphics dependency, so it is told rather than asking, and `None`
+    /// simply means no check.
+    pub max_gpu_verts: Option<usize>,
     stroking: bool,
     stroke_state: brush::StrokeState,
 }
@@ -89,7 +89,7 @@ impl Sculptor {
             history: History::default(),
             verts_dirty: true,
             topology_dirty: true,
-            vertex_buffer_limit: None,
+            max_gpu_verts: None,
             stroking: false,
             stroke_state: brush::StrokeState::default(),
             scene,
@@ -173,10 +173,9 @@ impl Sculptor {
     /// Opens a stroke.
     ///
     /// No copy is taken here. A stroke moves a few thousand vertices out of
-    /// millions, so it is remembered as the vertices it touched, recorded as it
-    /// touches them. Only a stroke that cuts the topology needs a copy of the
-    /// geometry, and it takes one at the moment of the first cut rather than
-    /// on the chance of one.
+    /// millions, so it is remembered as the slots it writes over, recorded as
+    /// it writes them. That holds whether or not it cuts the topology, so
+    /// there is nothing to fall back to.
     pub fn begin_stroke(&mut self) {
         if !self.stroking {
             self.history.fit_budget_to(self.mesh_bytes());
@@ -427,12 +426,11 @@ impl Sculptor {
         // A vertex buffer the card will not take is a validation error, and a
         // validation error on this path takes the window with it. Better to say
         // no here, with the number that says why.
-        if let Some(limit) = self.vertex_buffer_limit {
-            let needed = projected_verts as u64 * std::mem::size_of::<Vertex>() as u64;
-            if needed > limit {
+        if let Some(limit) = self.max_gpu_verts {
+            if projected_verts > limit {
                 return Err(format!(
-                    "subdividing would need a {:.0} MB vertex buffer, and this GPU takes {:.0} MB at most",
-                    needed as f64 / 1.0e6,
+                    "subdividing would reach {:.1} M vertices, and this GPU takes {:.1} M at most",
+                    projected_verts as f64 / 1.0e6,
                     limit as f64 / 1.0e6
                 ));
             }

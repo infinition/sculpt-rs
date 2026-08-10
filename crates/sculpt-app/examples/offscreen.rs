@@ -1,0 +1,281 @@
+//! Dessine une image sans ouvrir de fenêtre, et vérifie ce qu'elle contient.
+//!
+//! `cargo run --release -p sculpt-app --example offscreen`
+//!
+//! Le reste des tests s'arrête au bord de la carte: ils vérifient le maillage,
+//! pas ce qui en est affiché. Or une erreur dans la disposition d'un sommet ne
+//! se voit qu'à l'exécution, et sur ce chemin la fenêtre se ferme sans rien
+//! écrire. Ici les pipelines sont réellement construits, une sphère est
+//! réellement dessinée, et les pixels sont relus et contrôlés.
+//!
+//! Quatre contrôles. En mode normales, le pixel du centre doit porter la
+//! normale qui regarde la caméra: c'est le décodage octaédrique qui est vérifié
+//! là, et une erreur y donne une couleur quelconque. En mode matcap, le centre
+//! doit être nettement plus clair que le coin, ce qui dit que la sphère est
+//! arrivée là où on l'attendait. Puis un coup de brosse et un coup de peinture
+//! passés par la mise à jour creuse, qui est le chemin de tous les traits: le
+//! premier ne touche que le flux chaud, le second que le froid, et chacun doit
+//! se voir sans déranger l'autre.
+
+#![allow(dead_code)]
+
+#[path = "../src/gpu_vertex.rs"]
+mod gpu_vertex;
+#[path = "../src/matcap.rs"]
+mod matcap;
+#[path = "../src/renderer.rs"]
+mod renderer;
+
+use glam::{Mat4, Vec3};
+use renderer::{FrameSettings, Renderer, Shading};
+use sculpt_core::{primitives, BrushKind, Object, Scene, Sculptor, StrokeInput};
+
+const SIZE: u32 = 256;
+const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+fn main() {
+    let instance = wgpu::Instance::new(
+        wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+    );
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .expect("aucune carte utilisable");
+    println!("carte: {}", adapter.get_info().name);
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("offscreen"),
+        required_features: wgpu::Features::empty(),
+        required_limits: adapter.limits(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
+    .expect("device refusé");
+    // Une erreur de validation tue le processus là où elle arrive, sans rien
+    // dire. Celle-ci aura un nom.
+    device.on_uncaptured_error(std::sync::Arc::new(|e| {
+        eprintln!("\n=== erreur GPU ===\n{e}\n");
+        std::process::exit(2);
+    }));
+
+    let mut r = Renderer::new(&device, &queue, FORMAT, SIZE, SIZE, false, 1);
+    let scene = Scene::with_object(Object::new("sphere", primitives::icosphere(5)));
+    r.sync(&device, &queue, &scene, None);
+
+    // Caméra sur +Z qui regarde l'origine, sphère de rayon 1.
+    let eye = Vec3::new(0.0, 0.0, 3.0);
+    let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+    let proj = glam::camera::rh::proj::directx::perspective(0.9, 1.0, 0.05, 100.0);
+
+    let normals = draw(&device, &queue, &r, &scene, Shading::Normals, view, proj, eye);
+    let matcap = draw(&device, &queue, &r, &scene, Shading::Matcap, view, proj, eye);
+
+    let centre = pixel(&normals, SIZE / 2, SIZE / 2);
+    println!("centre en mode normales: {centre:?}   (attendu proche de [196, 196, 255])");
+    let (rr, gg, bb) = (centre[0] as i32, centre[1] as i32, centre[2] as i32);
+    // Au centre d'une sphère vue de face la normale monde vaut +Z, donc
+    // l'encodage n * 0.5 + 0.5 donne (0.5, 0.5, 1.0), soit environ 196, 196,
+    // 255 une fois passé en sRGB par la carte.
+    check(bb >= 235, "le bleu du centre devrait être saturé, la normale ne regarde pas la caméra");
+    check((rr - gg).abs() <= 25, "rouge et vert devraient être proches au centre");
+    check((160..=225).contains(&rr), "le rouge du centre est hors de ce qu'une normale +Z donne");
+
+    let centre = pixel(&matcap, SIZE / 2, SIZE / 2);
+    let coin = pixel(&matcap, 3, 3);
+    let lum = |p: [u8; 4]| p[0] as i32 + p[1] as i32 + p[2] as i32;
+    println!("centre en matcap: {centre:?}   coin: {coin:?}");
+    check(
+        lum(centre) > lum(coin) + 120,
+        "le centre n'est pas plus clair que le fond, rien n'a été dessiné là",
+    );
+
+    // Le chemin creux, celui qu'emprunte chaque coup de brosse: seuls les
+    // sommets touchés partent, et une passe de calcul les range.
+    let mut s = Sculptor::with_scene(scene);
+    s.symmetry = false;
+    s.dyntopo_enabled = false;
+    // Un maillage neuf se déclare entièrement changé, ce qu'il est: la sync
+    // complète plus haut s'en est chargée, et la marque est consommée ici pour
+    // que ce qui suit ne parle que du trait.
+    let _ = s.take_dirty();
+
+    // Un coup de brosse au pôle avant. Il ne touche que le flux chaud.
+    s.brush.kind = BrushKind::Draw;
+    s.brush.radius = 0.35;
+    s.brush.strength = 1.0;
+    s.begin_stroke();
+    s.stroke(&StrokeInput { point: Vec3::Z, normal: Vec3::Z, ..Default::default() });
+    s.end_stroke();
+    let sculpted = sparse(&device, &queue, &mut r, &mut s, Shading::Normals, view, proj, eye);
+    // Au sommet du renflement la normale regarde toujours la caméra, alors le
+    // pixel du centre bouge à peine. C'est sur le flanc que la pente change, et
+    // c'est pourquoi on compte les pixels plutôt que d'en regarder un.
+    let bougés = normals
+        .chunks_exact(4)
+        .zip(sculpted.chunks_exact(4))
+        .filter(|(a, b)| a.iter().zip(*b).any(|(x, y)| x.abs_diff(*y) > 4))
+        .count();
+    println!("pixels changés par le coup de brosse: {bougés}");
+    check(
+        bougés > 500,
+        "le coup de brosse n'est pas arrivé sur la carte par la mise à jour creuse",
+    );
+
+    // Et de la peinture au même endroit, qui ne touche que le flux froid.
+    s.brush.kind = BrushKind::Paint;
+    s.brush.paint_color = Vec3::new(1.0, 0.0, 0.0);
+    s.brush.strength = 1.0;
+    s.begin_stroke();
+    for _ in 0..6 {
+        s.stroke(&StrokeInput { point: Vec3::Z, normal: Vec3::Z, ..Default::default() });
+    }
+    s.end_stroke();
+    let peint = sparse(&device, &queue, &mut r, &mut s, Shading::Unlit, view, proj, eye);
+    let centre = pixel(&peint, SIZE / 2, SIZE / 2);
+    println!("centre peint, en mode sans éclairage: {centre:?}");
+    check(
+        centre[0] > 200 && centre[1] < 90 && centre[2] < 90,
+        "la couleur peinte n'est pas arrivée: le flux froid ne suit pas",
+    );
+
+    println!();
+    println!("les pipelines se construisent, la sphère arrive à l'écran, et une");
+    println!("mise à jour creuse porte le relief comme la couleur.");
+}
+
+/// Envoie ce que le dernier trait a touché, puis dessine.
+#[allow(clippy::too_many_arguments)]
+fn sparse(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    r: &mut Renderer,
+    s: &mut Sculptor,
+    shading: Shading,
+    view: Mat4,
+    proj: Mat4,
+    eye: Vec3,
+) -> Vec<u8> {
+    let (mut verts, mut faces, full) = s.take_dirty();
+    check(!full, "le trait a marqué tout le maillage, il n'y a rien de creux à vérifier");
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("creux") });
+    let ok = r.sync_sparse(device, queue, &mut encoder, &s.scene, 0, &mut verts, &mut faces);
+    check(ok, "la mise à jour creuse a renoncé, le contrôle ne veut plus rien dire");
+    queue.submit([encoder.finish()]);
+    draw(device, queue, r, &s.scene, shading, view, proj, eye)
+}
+
+fn check(ok: bool, why: &str) {
+    if !ok {
+        eprintln!("ÉCHEC: {why}");
+        std::process::exit(1);
+    }
+}
+
+fn pixel(rgba: &[u8], x: u32, y: u32) -> [u8; 4] {
+    let o = ((y * SIZE + x) * 4) as usize;
+    [rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]]
+}
+
+/// Une image, rendue puis relue.
+#[allow(clippy::too_many_arguments)]
+fn draw(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    r: &Renderer,
+    scene: &Scene,
+    shading: Shading,
+    view: Mat4,
+    proj: Mat4,
+    eye: Vec3,
+) -> Vec<u8> {
+    let settings = FrameSettings { shading, grid: false, ..Default::default() };
+    r.set_uniforms(queue, scene, view, proj, eye, &settings);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("cible"),
+        size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view_tex = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // La copie depuis une texture veut des lignes alignées sur 256 octets.
+    let row = (SIZE * 4).div_ceil(256) * 256;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("relecture"),
+        size: (row * SIZE) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("offscreen") });
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scène"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view_tex,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: r.depth_view(),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        r.draw(&mut pass, scene, &settings, &[None]);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(SIZE),
+            },
+        },
+        wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+    );
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device
+        .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+        .expect("attente du GPU");
+    let padded = slice.get_mapped_range().expect("tampon non lisible").to_vec();
+
+    // On enlève le remplissage de fin de ligne.
+    let mut out = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in 0..SIZE {
+        let start = (y * row) as usize;
+        out.extend_from_slice(&padded[start..start + (SIZE * 4) as usize]);
+    }
+    out
+}

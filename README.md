@@ -113,6 +113,13 @@ rebuilds. Ray casts walk the same grid front to back and stop as soon as the
 nearest hit is certain. Brushes and the heavier commands run in parallel over
 rayon.
 
+A vertex is twelve floats in the engine and twenty-four bytes on the card, in
+two streams. The hot one holds the position at full precision and the normal
+folded onto an octahedron as two sixteen-bit numbers; the cold one holds the
+colour, mask, roughness and metalness at a byte each. Shading a pixel reads only
+the first, a sculpt stroke writes only the first, and a paint stroke only the
+second.
+
 The renderer draws every object from one uniform buffer addressed with dynamic
 offsets, so a scene costs one bind group rebind per object and no buffer writes
 inside the render pass. The background, the model and the ground grid are three
@@ -190,7 +197,7 @@ keeps drawing.
 ## Tests
 
 ```bash
-cargo test -p sculpt-core
+cargo test
 ```
 
 The engine tests check the invariants directly: adjacency stays consistent
@@ -202,6 +209,18 @@ by the same amount, subdivision quadruples the face count, decimation reduces
 it while staying valid, a voxel remesh comes back watertight, hole filling
 seals an open plane, an alpha shapes the dab it is stamped through, and OBJ,
 PLY, scene and brush round trips preserve what went into them.
+
+Tests stop at the edge of the card, and a mistake in a vertex layout only shows
+at run time. So there is one more check that does not:
+
+```bash
+cargo run --release -p sculpt-app --example offscreen
+```
+
+It builds the real pipelines with no window, draws a sphere, reads the pixels
+back and looks at them: the centre must carry the normal that faces the camera,
+which is the octahedral encoding checked end to end, and a stroke and a painted
+colour sent through the sparse update must both arrive.
 
 ## Notes on origin
 

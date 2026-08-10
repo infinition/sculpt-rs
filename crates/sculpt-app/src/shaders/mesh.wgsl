@@ -25,14 +25,27 @@ struct ObjectData {
 @group(0) @binding(2) var matcap_samp: sampler;
 @group(1) @binding(0) var<uniform> obj: ObjectData;
 
+// Two streams. The first is what placing and shading a pixel cannot do
+// without; the second is what only painting writes to. See gpu_vertex.rs.
 struct VsIn {
+    // Hot: position at full precision, normal folded onto an octahedron.
     @location(0) pos: vec3<f32>,
-    @location(1) nrm: vec3<f32>,
-    @location(2) col: vec3<f32>,
-    @location(3) mask: f32,
-    @location(4) rough: f32,
-    @location(5) metal: f32,
+    @location(1) nrm_oct: vec2<f32>,
+    // Cold: colour with the mask in its alpha, then roughness and metalness.
+    @location(2) paint: vec4<f32>,
+    @location(3) material: vec4<f32>,
 };
+
+// Unfolds the octahedron. The lower half of the sphere was reflected out into
+// the corners of the square, so it is folded back the same way.
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    let f = e * 2.0 - vec2<f32>(1.0, 1.0);
+    var n = vec3<f32>(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    let t = max(-n.z, 0.0);
+    n.x += select(t, -t, n.x >= 0.0);
+    n.y += select(t, -t, n.y >= 0.0);
+    return normalize(n);
+}
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
@@ -48,14 +61,14 @@ struct VsOut {
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     let world = obj.model * vec4<f32>(in.pos, 1.0);
-    let nrm_world = (obj.normal_mat * vec4<f32>(in.nrm, 0.0)).xyz;
+    let nrm_world = (obj.normal_mat * vec4<f32>(oct_decode(in.nrm_oct), 0.0)).xyz;
     out.clip = g.view_proj * world;
     out.world = world.xyz;
     out.nrm_world = nrm_world;
     out.nrm_view = (g.view * vec4<f32>(nrm_world, 0.0)).xyz;
-    out.col = in.col;
-    out.mask = in.mask;
-    out.material = vec2<f32>(in.rough, in.metal);
+    out.col = in.paint.rgb;
+    out.mask = in.paint.a;
+    out.material = in.material.xy;
     return out;
 }
 

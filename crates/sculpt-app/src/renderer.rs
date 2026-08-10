@@ -5,6 +5,7 @@
 //! so drawing a scene costs one bind group rebind per object and no buffer
 //! writes inside the pass.
 
+use crate::gpu_vertex::{self, COLD_BYTES, COLD_WORDS, HOT_BYTES, HOT_WORDS};
 use crate::matcap;
 use glam::{Mat4, Vec3};
 use sculpt_core::Scene;
@@ -148,14 +149,23 @@ const VERTEX_USAGE: wgpu::BufferUsages =
 const INDEX_USAGE: wgpu::BufferUsages =
     wgpu::BufferUsages::INDEX.union(wgpu::BufferUsages::STORAGE);
 
+/// Indices per triangle, which is the third scatter channel's stride.
+const FACE_WORDS: usize = 3;
+
 /// GPU mirror of one mesh.
+///
+/// The vertices arrive in two streams rather than one: see `gpu_vertex`. The
+/// split halves what the card reads to draw a triangle, and it means a paint
+/// stroke never touches the positions nor a sculpt stroke the colours.
 struct MeshBuffers {
-    vbuf: wgpu::Buffer,
-    vcap: u64,
+    hot: wgpu::Buffer,
+    hot_cap: u64,
+    cold: wgpu::Buffer,
+    cold_cap: u64,
     ibuf: wgpu::Buffer,
     icap: u64,
     index_count: u32,
-    /// Set when the buffer was reallocated, which invalidates any bind group
+    /// Set when a buffer was reallocated, which invalidates any bind group
     /// pointing at the old one.
     generation: u32,
 }
@@ -163,8 +173,10 @@ struct MeshBuffers {
 impl MeshBuffers {
     fn new(device: &wgpu::Device) -> Self {
         Self {
-            vbuf: empty_buffer(device, "vertices", VERTEX_USAGE),
-            vcap: 1024,
+            hot: empty_buffer(device, "vertices, hot", VERTEX_USAGE),
+            hot_cap: 1024,
+            cold: empty_buffer(device, "vertices, cold", VERTEX_USAGE),
+            cold_cap: 1024,
             ibuf: empty_buffer(device, "indices", INDEX_USAGE),
             icap: 1024,
             index_count: 0,
@@ -175,14 +187,25 @@ impl MeshBuffers {
     /// Uploads the whole mesh. Buffers grow with 50% headroom so a dyntopo
     /// stroke does not reallocate on every step.
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &sculpt_core::Mesh) -> u64 {
-        let vdata: &[u8] = bytemuck::cast_slice(&mesh.verts);
-        if vdata.len() as u64 > self.vcap {
-            self.vcap = (vdata.len() as u64 * 3 / 2).next_power_of_two();
-            self.vbuf = sized_buffer(device, "vertices", self.vcap, VERTEX_USAGE);
+        // Packing several million vertices is arithmetic on independent
+        // elements, which is to say it runs on every core.
+        let (hot, cold) = gpu_vertex::pack_all(&mesh.verts);
+        let hot_data: &[u8] = bytemuck::cast_slice(&hot);
+        let cold_data: &[u8] = bytemuck::cast_slice(&cold);
+
+        if hot_data.len() as u64 > self.hot_cap {
+            self.hot_cap = (hot_data.len() as u64 * 3 / 2).next_power_of_two();
+            self.hot = sized_buffer(device, "vertices, hot", self.hot_cap, VERTEX_USAGE);
             self.generation = self.generation.wrapping_add(1);
         }
-        if !vdata.is_empty() {
-            queue.write_buffer(&self.vbuf, 0, vdata);
+        if cold_data.len() as u64 > self.cold_cap {
+            self.cold_cap = (cold_data.len() as u64 * 3 / 2).next_power_of_two();
+            self.cold = sized_buffer(device, "vertices, cold", self.cold_cap, VERTEX_USAGE);
+            self.generation = self.generation.wrapping_add(1);
+        }
+        if !hot_data.is_empty() {
+            queue.write_buffer(&self.hot, 0, hot_data);
+            queue.write_buffer(&self.cold, 0, cold_data);
         }
 
         let idata: &[u8] = bytemuck::cast_slice(&mesh.faces);
@@ -194,13 +217,9 @@ impl MeshBuffers {
             queue.write_buffer(&self.ibuf, 0, idata);
         }
         self.index_count = (mesh.faces.len() * 3) as u32;
-        (vdata.len() + idata.len()) as u64
+        (hot_data.len() + cold_data.len() + idata.len()) as u64
     }
 }
-
-/// Words per vertex and per triangle; these must match the shader strides.
-const VERTEX_FLOATS: usize = 12;
-const FACE_WORDS: usize = 3;
 
 /// One sparse upload channel: a list of destination slots and the data to put
 /// in them, pushed to the GPU and scattered into place by a compute pass.
@@ -300,7 +319,11 @@ impl ScatterPass {
         self.reserve(device, count);
         queue.write_buffer(&self.slot_buf, 0, bytemuck::cast_slice(slots));
         queue.write_buffer(&self.data_buf, 0, data);
-        queue.write_buffer(&self.params_buf, 0, bytemuck::cast_slice(&[count, 0u32, 0, 0]));
+        queue.write_buffer(
+            &self.params_buf,
+            0,
+            bytemuck::cast_slice(&[count, self.stride as u32, 0, 0]),
+        );
 
         let stale = !matches!(&self.bind, Some((o, g, _)) if (*o, *g) == key);
         if stale {
@@ -329,12 +352,14 @@ impl ScatterPass {
     }
 }
 
-/// Both sparse channels, sharing one bind group layout.
+/// The three sparse channels, sharing one bind group layout and one shader.
 struct Scatter {
     layout: wgpu::BindGroupLayout,
-    verts: ScatterPass,
+    hot: ScatterPass,
+    cold: ScatterPass,
     faces: ScatterPass,
-    vertex_data: Vec<f32>,
+    hot_data: Vec<u32>,
+    cold_data: Vec<u32>,
     face_data: Vec<u32>,
 }
 
@@ -367,25 +392,20 @@ impl Scatter {
                 ),
             ],
         });
-        let verts = ScatterPass::new(
-            device,
-            &layout,
-            wgpu::ShaderSource::Wgsl(include_str!("shaders/scatter.wgsl").into()),
-            "scatter vertices",
-            VERTEX_FLOATS,
-        );
-        let faces = ScatterPass::new(
-            device,
-            &layout,
-            wgpu::ShaderSource::Wgsl(include_str!("shaders/scatter_index.wgsl").into()),
-            "scatter indices",
-            FACE_WORDS,
-        );
+        // One shader for all three: it copies words and takes the stride from
+        // its parameters, so a triangle, a position with a normal and a colour
+        // with its material are the same job at three different sizes.
+        let source = || wgpu::ShaderSource::Wgsl(include_str!("shaders/scatter.wgsl").into());
+        let hot = ScatterPass::new(device, &layout, source(), "scatter, hot", HOT_WORDS);
+        let cold = ScatterPass::new(device, &layout, source(), "scatter, cold", COLD_WORDS);
+        let faces = ScatterPass::new(device, &layout, source(), "scatter, indices", FACE_WORDS);
         Self {
             layout,
-            verts,
+            hot,
+            cold,
             faces,
-            vertex_data: Vec::new(),
+            hot_data: Vec::new(),
+            cold_data: Vec::new(),
             face_data: Vec::new(),
         }
     }
@@ -578,19 +598,25 @@ impl Renderer {
             immediate_size: 0,
         });
 
-        let stride = std::mem::size_of::<sculpt_core::Vertex>() as u64;
-        let attributes = [
+        // Sixteen bytes of what shading needs, eight of what only painting
+        // writes. The formats have to match `gpu_vertex` word for word.
+        let hot_attrs = [
             wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 24, shader_location: 2 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 36, shader_location: 3 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 40, shader_location: 4 },
-            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 44, shader_location: 5 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Unorm16x2, offset: 12, shader_location: 1 },
         ];
-        let vertex_layout = wgpu::VertexBufferLayout {
-            array_stride: stride,
+        let cold_attrs = [
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Unorm8x4, offset: 0, shader_location: 2 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Unorm8x4, offset: 4, shader_location: 3 },
+        ];
+        let hot_layout = wgpu::VertexBufferLayout {
+            array_stride: HOT_BYTES as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &attributes,
+            attributes: &hot_attrs,
+        };
+        let cold_layout = wgpu::VertexBufferLayout {
+            array_stride: COLD_BYTES as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &cold_attrs,
         };
 
         let samples = self.sample_count;
@@ -605,7 +631,7 @@ impl Renderer {
                     module: &mesh_shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
-                    buffers: &[Some(vertex_layout.clone())],
+                    buffers: &[Some(hot_layout.clone()), Some(cold_layout.clone())],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &mesh_shader,
@@ -798,9 +824,11 @@ impl Renderer {
 
         // A buffer that has to grow cannot be patched in place.
         let buffers = &self.meshes[object];
-        let needed_v = (vcount * std::mem::size_of::<sculpt_core::Vertex>()) as u64;
         let needed_i = (fcount * std::mem::size_of::<[u32; 3]>()) as u64;
-        if needed_v > buffers.vcap || needed_i > buffers.icap {
+        if (vcount * HOT_BYTES) as u64 > buffers.hot_cap
+            || (vcount * COLD_BYTES) as u64 > buffers.cold_cap
+            || needed_i > buffers.icap
+        {
             return false;
         }
 
@@ -817,29 +845,41 @@ impl Renderer {
 
         if !dirty_verts.is_empty() {
             let s = &mut self.scatter;
-            s.vertex_data.clear();
-            s.vertex_data.reserve(dirty_verts.len() * VERTEX_FLOATS);
+            s.hot_data.clear();
+            s.cold_data.clear();
+            s.hot_data.reserve(dirty_verts.len() * HOT_WORDS);
+            s.cold_data.reserve(dirty_verts.len() * COLD_WORDS);
             for &v in dirty_verts.iter() {
                 let vx = &mesh.verts[v as usize];
-                s.vertex_data.extend_from_slice(&[
-                    vx.pos.x, vx.pos.y, vx.pos.z,
-                    vx.nrm.x, vx.nrm.y, vx.nrm.z,
-                    vx.col.x, vx.col.y, vx.col.z,
-                    vx.mask, vx.rough, vx.metal,
-                ]);
+                s.hot_data.extend_from_slice(&gpu_vertex::hot(vx));
+                s.cold_data.extend_from_slice(&gpu_vertex::cold(vx));
             }
-            let data: &[u8] = bytemuck::cast_slice(&s.vertex_data);
-            sent += (dirty_verts.len() * 4 + data.len()) as u64;
+            let hot: &[u8] = bytemuck::cast_slice(&s.hot_data);
+            let cold: &[u8] = bytemuck::cast_slice(&s.cold_data);
+            sent += (dirty_verts.len() * 8 + hot.len() + cold.len()) as u64;
             let layout = &s.layout;
-            s.verts.dispatch(
+            s.hot.dispatch(
                 device,
                 queue,
                 encoder,
                 layout,
-                &self.meshes[object].vbuf,
+                &self.meshes[object].hot,
                 key,
                 dirty_verts,
-                data,
+                hot,
+            );
+            let s = &mut self.scatter;
+            let cold: &[u8] = bytemuck::cast_slice(&s.cold_data);
+            let layout = &s.layout;
+            s.cold.dispatch(
+                device,
+                queue,
+                encoder,
+                layout,
+                &self.meshes[object].cold,
+                key,
+                dirty_verts,
+                cold,
             );
         }
 
@@ -974,7 +1014,8 @@ impl Renderer {
             }
             let offset = (i as u64 * OBJECT_STRIDE) as u32;
             pass.set_bind_group(1, &self.object_bind, &[offset]);
-            pass.set_vertex_buffer(0, buffers.vbuf.slice(..));
+            pass.set_vertex_buffer(0, buffers.hot.slice(..));
+            pass.set_vertex_buffer(1, buffers.cold.slice(..));
             pass.set_index_buffer(buffers.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             Self::draw_object(pass, buffers, visible.get(i).and_then(|r| r.as_deref()));
         }
@@ -992,7 +1033,8 @@ impl Renderer {
                     }
                     let offset = (i as u64 * OBJECT_STRIDE) as u32;
                     pass.set_bind_group(1, &self.object_bind, &[offset]);
-                    pass.set_vertex_buffer(0, buffers.vbuf.slice(..));
+                    pass.set_vertex_buffer(0, buffers.hot.slice(..));
+                    pass.set_vertex_buffer(1, buffers.cold.slice(..));
                     pass.set_index_buffer(buffers.ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     Self::draw_object(pass, buffers, visible.get(i).and_then(|r| r.as_deref()));
                 }

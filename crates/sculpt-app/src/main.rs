@@ -2,6 +2,7 @@
 
 mod camera;
 mod gizmo;
+mod gpu_vertex;
 mod hud;
 mod icons;
 mod input;
@@ -207,10 +208,12 @@ impl State {
         // The buffers grow to the next power of two of one and a half times
         // what is needed, so the headroom the engine may plan for is a third of
         // what the card takes.
-        sculptor.vertex_buffer_limit = Some(limits.max_buffer_size / 3);
+        // A vertex costs the larger of its two streams in the buffer that has
+        // to hold it, which is the hot one.
+        let room = (limits.max_buffer_size / 3) as usize / gpu_vertex::HOT_BYTES;
+        sculptor.max_gpu_verts = Some(room);
         // And the dynamic topology ceiling follows it, so a stroke cannot walk
         // into the wall the subdivision is guarded against.
-        let room = (limits.max_buffer_size / 3) as usize / std::mem::size_of::<sculpt_core::Vertex>();
         sculptor.dyntopo.max_verts = room.clamp(500_000, 24_000_000);
         let mut camera = Camera::default();
         camera.frame(Vec3::ZERO, 1.0);
@@ -903,9 +906,9 @@ impl State {
         if path.extension().and_then(|e| e.to_str()) == Some("sculpt") {
             match io::read_scene(&path) {
                 Ok(scene) => {
-                    let limit = self.sculptor.vertex_buffer_limit;
+                    let limit = self.sculptor.max_gpu_verts;
                     self.sculptor = Sculptor::with_scene(scene);
-                    self.sculptor.vertex_buffer_limit = limit;
+                    self.sculptor.max_gpu_verts = limit;
                     self.frame_view();
                     self.full_resync = true;
                     self.ui.say(format!("opened {name}"));
@@ -964,9 +967,9 @@ impl State {
         };
         match io::read_scene(&path) {
             Ok(scene) => {
-                let limit = self.sculptor.vertex_buffer_limit;
+                let limit = self.sculptor.max_gpu_verts;
                 self.sculptor = Sculptor::with_scene(scene);
-                self.sculptor.vertex_buffer_limit = limit;
+                self.sculptor.max_gpu_verts = limit;
                 self.frame_view();
                 self.full_resync = true;
                 self.ui.say("scene opened");

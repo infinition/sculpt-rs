@@ -8,6 +8,9 @@
 //! est une erreur de validation, et sur ce chemin la fenêtre se ferme. Cet
 //! exemple imprime les deux séries de chiffres côte à côte.
 
+#[path = "../src/gpu_vertex.rs"]
+mod gpu_vertex;
+
 fn main() {
     let instance = wgpu::Instance::new(
         wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
@@ -27,7 +30,9 @@ fn main() {
     let mine = adapter.limits();
     let portable = wgpu::Limits::default();
     let mo = |n: u64| n as f64 / 1.0e6;
-    let sommets = |n: u64| n / std::mem::size_of::<sculpt_core::Vertex>() as u64;
+    // Un sommet occupe ses deux flux, dont le plus gros est le chaud: c'est
+    // lui qui décide de la taille du tampon qui plafonne en premier.
+    let sommets = |n: u64| n / gpu_vertex::HOT_BYTES as u64;
 
     println!("{:<34} {:>14} {:>14}", "", "par défaut", "cette carte");
     println!(
