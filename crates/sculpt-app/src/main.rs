@@ -591,6 +591,26 @@ impl State {
         }
     }
 
+    /// How much of the active object's space one screen pixel covers at a
+    /// point, which is what the screen-relative detail mode is measured in.
+    ///
+    /// Asked of the camera in world units and then brought into the object, so
+    /// a scaled object gets the density its own numbers imply.
+    fn world_per_pixel(&self, point: Vec3) -> f32 {
+        let height = self.viewport().1.max(1.0);
+        let px = self.camera.world_radius_to_pixels(point, 1.0, height);
+        if px <= 1e-6 {
+            return 0.0;
+        }
+        let scale = self
+            .sculptor
+            .scene
+            .active()
+            .map(|o| o.transform.mean_scale())
+            .unwrap_or(1.0);
+        1.0 / (px * scale.max(1e-6))
+    }
+
     fn stroke_input(&self, point: Vec3, normal: Vec3, drag: Vec3, pressure: f32) -> StrokeInput {
         StrokeInput {
             point,
@@ -599,6 +619,7 @@ impl State {
             view_dir: self.camera.forward(),
             view_right: self.camera.right(),
             pressure,
+            world_per_pixel: self.world_per_pixel(point),
             ..Default::default()
         }
     }

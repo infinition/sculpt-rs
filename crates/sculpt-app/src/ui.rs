@@ -1753,9 +1753,25 @@ fn model_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
     widgets::toggle(ui, &mut s.dyntopo_enabled, "Dynamic topology", m.row);
     let enabled = s.dyntopo_enabled;
     ui.add_enabled_ui(enabled, |ui| {
-        BigSlider::new(&mut s.dyntopo.detail, 0.002..=0.3, "Detail size")
+        // What the detail number is measured in. Changing it changes the unit,
+        // so the value moves to that unit's own default rather than being read
+        // as a length in one and a count of pixels in the next.
+        let labels: Vec<&str> =
+            sculpt_core::DetailMode::ALL.iter().map(|k| k.label()).collect();
+        let current = sculpt_core::DetailMode::ALL
+            .iter()
+            .position(|k| *k == s.dyntopo.mode)
+            .unwrap_or(0);
+        if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+            let mode = sculpt_core::DetailMode::ALL[i];
+            s.dyntopo.mode = mode;
+            s.dyntopo.detail = mode.default_detail();
+        }
+        let (lo, hi) = s.dyntopo.mode.range();
+        BigSlider::new(&mut s.dyntopo.detail, lo..=hi, "Detail size")
             .logarithmic(true)
-            .decimals(4)
+            .decimals(if s.dyntopo.mode == sculpt_core::DetailMode::Screen { 1 } else { 4 })
+            .suffix(s.dyntopo.mode.unit())
             .height(m.row)
             .show(ui);
         widgets::toggle(ui, &mut s.dyntopo.subdivide, "Subdivide under the brush", m.row);

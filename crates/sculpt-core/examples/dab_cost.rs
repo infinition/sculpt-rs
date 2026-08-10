@@ -31,6 +31,7 @@ fn main() {
         subdivide: true,
         decimate: true,
         max_verts: 40_000_000,
+        ..Default::default()
     };
     let b = Brush { kind: BrushKind::Draw, radius, strength: 0.6, ..Brush::default() };
     let mut state = brush::StrokeState::default();

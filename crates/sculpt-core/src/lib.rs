@@ -21,7 +21,7 @@ pub use accel::Grid;
 pub use alpha::{Alpha, Shape as AlphaShape};
 pub use cluster::{Cluster, Partition};
 pub use brush::{Axis, BlendMode, Brush, BrushKind, Falloff, FillScope, StrokeInput};
-pub use dyntopo::Dyntopo;
+pub use dyntopo::{DetailMode, Dyntopo};
 pub use history::History;
 pub use mesh::{Mesh, Vertex};
 pub use query::Hit;
@@ -247,7 +247,13 @@ impl Sculptor {
         let deforms = self.brush.kind.deforms();
         let radius = self.local_radius();
         let brush = Brush { radius, ..self.brush };
-        let dyn_params = self.dyntopo;
+        // The detail setting is a number in whatever unit the mode names, so it
+        // is turned into an edge length here, where the brush radius and the
+        // scale of a pixel are both known.
+        let dyn_params = Dyntopo {
+            detail: self.dyntopo.target_edge(radius, input.world_per_pixel),
+            ..self.dyntopo
+        };
         let dyn_on = self.dyntopo_enabled;
         let point = input.point;
 

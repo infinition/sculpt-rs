@@ -425,6 +425,12 @@ pub struct StrokeInput {
     pub pinch: f32,
     /// Tablet or touch pressure, 1.0 when unknown.
     pub pressure: f32,
+    /// How much of the object's space one screen pixel covers at this point.
+    ///
+    /// Only the screen-relative detail mode reads it. Zero means the caller
+    /// does not know, which is what a headless test or a scripted stroke will
+    /// say, and the mode falls back rather than trusting it.
+    pub world_per_pixel: f32,
 }
 
 impl Default for StrokeInput {
@@ -438,6 +444,7 @@ impl Default for StrokeInput {
             twist: 0.0,
             pinch: 0.0,
             pressure: 1.0,
+            world_per_pixel: 0.0,
         }
     }
 }
@@ -507,6 +514,12 @@ impl StrokeInput {
             twist: -self.twist,
             pinch: self.pinch,
             pressure: self.pressure,
+            // The mirrored dab lands somewhere else on screen, often further
+            // from the eye, so strictly it covers a different number of pixels.
+            // It keeps the original scale on purpose: detail that changes
+            // across the symmetry plane is worse than detail that is very
+            // slightly wrong on one side of it.
+            world_per_pixel: self.world_per_pixel,
         }
     }
 }

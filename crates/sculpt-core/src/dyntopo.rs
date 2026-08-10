@@ -15,10 +15,83 @@ use rayon::prelude::*;
 /// enough that the last thread to finish is not holding up the other five.
 const CHUNK: usize = 512;
 
+/// What the detail setting is measured against.
+///
+/// A single target edge length in world units is the simplest thing to
+/// implement and the worst to use. Zoom in on an ear and it keeps cutting to
+/// the size that suited the whole head, so a close-up buries the machine under
+/// vertices too small to see; zoom out and the brush stops adding anything at
+/// all. The other two modes tie the target to something that follows the work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DetailMode {
+    /// A length in world units, the same everywhere on the model.
+    ///
+    /// What to use when the detail has to match across a piece regardless of
+    /// how it was approached.
+    #[default]
+    Constant,
+    /// A fraction of the brush radius.
+    ///
+    /// A small brush cuts fine, a large one stays coarse, which is how a hand
+    /// works: you reach for a smaller tool to do smaller things.
+    Radius,
+    /// A length in pixels.
+    ///
+    /// The density is what you see, whatever the zoom. This is what stops a
+    /// close-up from spending a million vertices on something that will cover
+    /// a thumbnail, and it is the reason a dense session grinds to a halt when
+    /// the only mode is a fixed world size.
+    Screen,
+}
+
+impl DetailMode {
+    pub const ALL: [DetailMode; 3] = [DetailMode::Constant, DetailMode::Radius, DetailMode::Screen];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DetailMode::Constant => "World",
+            DetailMode::Radius => "Brush",
+            DetailMode::Screen => "Screen",
+        }
+    }
+
+    /// What the detail number means in this mode, for an interface that has to
+    /// print it next to a slider.
+    pub fn unit(self) -> &'static str {
+        match self {
+            DetailMode::Constant => "",
+            DetailMode::Radius => " x radius",
+            DetailMode::Screen => " px",
+        }
+    }
+
+    /// The range a slider should offer, and a sensible value inside it.
+    ///
+    /// The number means something different in each mode, so switching without
+    /// resetting would read a length in world units as a count of pixels.
+    pub fn range(self) -> (f32, f32) {
+        match self {
+            DetailMode::Constant => (0.002, 0.3),
+            DetailMode::Radius => (0.02, 1.0),
+            DetailMode::Screen => (2.0, 60.0),
+        }
+    }
+
+    pub fn default_detail(self) -> f32 {
+        match self {
+            DetailMode::Constant => 0.04,
+            DetailMode::Radius => 0.15,
+            DetailMode::Screen => 8.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Dyntopo {
-    /// Target edge length under the brush, in world units.
+    /// Target edge length, read according to `mode`.
     pub detail: f32,
+    /// What that number is measured in.
+    pub mode: DetailMode,
     pub subdivide: bool,
     pub decimate: bool,
     /// Safety valve: refuse to grow past this vertex count.
@@ -27,7 +100,33 @@ pub struct Dyntopo {
 
 impl Default for Dyntopo {
     fn default() -> Self {
-        Self { detail: 0.04, subdivide: true, decimate: true, max_verts: 2_000_000 }
+        Self {
+            detail: 0.04,
+            mode: DetailMode::Constant,
+            subdivide: true,
+            decimate: true,
+            max_verts: 2_000_000,
+        }
+    }
+}
+
+impl Dyntopo {
+    /// The edge length a dab should aim for, in the object's own units.
+    ///
+    /// `radius` is the brush radius in those same units and `world_per_pixel`
+    /// how much of them one pixel covers at the point being touched. A caller
+    /// that cannot say passes zero, and the screen mode falls back rather than
+    /// dividing by it.
+    pub fn target_edge(&self, radius: f32, world_per_pixel: f32) -> f32 {
+        let target = match self.mode {
+            DetailMode::Constant => self.detail,
+            DetailMode::Radius => radius * self.detail,
+            DetailMode::Screen if world_per_pixel > 0.0 => self.detail * world_per_pixel,
+            DetailMode::Screen => self.detail,
+        };
+        // A target of zero would ask for infinite subdivision, and the vertex
+        // ceiling is a poor place to find that out.
+        target.max(1e-5)
     }
 }
 
@@ -235,3 +334,50 @@ pub fn apply(mesh: &mut Mesh, todo: Plan, center: Vec3, radius: f32, p: &Dyntopo
     changed
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Chaque mode lit le même nombre dans son unité, et aucun ne peut rendre
+    /// une longueur nulle: une cible à zéro demanderait une subdivision
+    /// infinie, et le plafond de sommets est un mauvais endroit pour
+    /// l'apprendre.
+    #[test]
+    fn each_mode_reads_the_detail_in_its_own_unit() {
+        let radius = 0.2;
+        let world_per_pixel = 0.001;
+
+        let world = Dyntopo { detail: 0.05, mode: DetailMode::Constant, ..Default::default() };
+        assert_eq!(world.target_edge(radius, world_per_pixel), 0.05);
+
+        let brush = Dyntopo { detail: 0.25, mode: DetailMode::Radius, ..Default::default() };
+        assert!((brush.target_edge(radius, world_per_pixel) - 0.05).abs() < 1e-6);
+
+        let screen = Dyntopo { detail: 8.0, mode: DetailMode::Screen, ..Default::default() };
+        assert!((screen.target_edge(radius, world_per_pixel) - 0.008).abs() < 1e-6);
+
+        for mode in DetailMode::ALL {
+            let d = Dyntopo { detail: 0.0, mode, ..Default::default() };
+            assert!(d.target_edge(radius, world_per_pixel) > 0.0, "{mode:?} rend zéro");
+        }
+    }
+
+    /// Le mode écran doit se rabattre quand l'appelant ne sait pas dire ce que
+    /// vaut un pixel, plutôt que de rendre une cible absurde.
+    #[test]
+    fn the_screen_mode_falls_back_when_the_scale_is_unknown() {
+        let d = Dyntopo { detail: 8.0, mode: DetailMode::Screen, ..Default::default() };
+        assert_eq!(d.target_edge(0.2, 0.0), 8.0);
+    }
+
+    /// Zoomer doit resserrer le détail à l'écran, pas dans le monde: c'est
+    /// toute la raison du mode.
+    #[test]
+    fn the_screen_mode_follows_the_zoom() {
+        let d = Dyntopo { detail: 8.0, mode: DetailMode::Screen, ..Default::default() };
+        let loin = d.target_edge(0.2, 0.01);
+        let près = d.target_edge(0.2, 0.001);
+        assert!(près < loin, "de près {près} n'est pas plus fin que de loin {loin}");
+    }
+}
