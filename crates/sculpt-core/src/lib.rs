@@ -58,8 +58,15 @@ pub struct Sculptor {
     pub verts_dirty: bool,
     /// Set when the index buffer needs a re-upload.
     pub topology_dirty: bool,
+    /// Largest vertex buffer the GPU will accept, in bytes, when the caller
+    /// knows. The engine has no graphics dependency, so it is told rather than
+    /// asking, and `None` simply means no check.
+    pub vertex_buffer_limit: Option<u64>,
     stroking: bool,
     stroke_state: brush::StrokeState,
+    /// Vertices this stroke has already copied, when it is being remembered by
+    /// difference. `None` means a full copy was taken instead.
+    journal: Option<history::StrokeJournal>,
 }
 
 impl Sculptor {
@@ -83,8 +90,10 @@ impl Sculptor {
             history: History::default(),
             verts_dirty: true,
             topology_dirty: true,
+            vertex_buffer_limit: None,
             stroking: false,
             stroke_state: brush::StrokeState::default(),
+            journal: None,
             scene,
         };
         s.brush = s.presets[Self::preset_index(BrushKind::Clay)];
@@ -163,17 +172,36 @@ impl Sculptor {
 
     // ---- strokes ------------------------------------------------------------
 
+    /// Opens a stroke.
+    ///
+    /// No copy is taken here. A stroke moves a few thousand vertices out of
+    /// millions, so it is remembered as the vertices it touched, recorded as it
+    /// touches them. Only a stroke that cuts the topology needs a copy of the
+    /// geometry, and it takes one at the moment of the first cut rather than
+    /// on the chance of one.
     pub fn begin_stroke(&mut self) {
         if !self.stroking {
-            let idx = self.scene.active;
-            self.history.push_geometry(&self.scene, idx);
+            self.history.fit_budget_to(self.mesh_bytes());
             self.stroking = true;
             self.stroke_state = brush::StrokeState::default();
+            self.journal = Some(history::StrokeJournal::default());
         }
     }
 
     pub fn end_stroke(&mut self) {
         self.stroking = false;
+        if let Some(journal) = self.journal.take() {
+            if !journal.is_empty() {
+                self.history
+                    .push_vertex_delta(self.scene.active, journal.into_before());
+            }
+        }
+    }
+
+    /// Roughly what the active mesh occupies, for sizing the history against it.
+    fn mesh_bytes(&self) -> usize {
+        let m = self.mesh();
+        m.verts.len() * std::mem::size_of::<Vertex>() + m.faces.len() * 12
     }
 
     pub fn is_stroking(&self) -> bool {
@@ -216,11 +244,26 @@ impl Sculptor {
         let dyn_on = self.dyntopo_enabled;
         let point = input.point;
 
-        let Some(mesh) = self.mesh_mut() else { return };
-        // The grid is sized from the query radius, so tell it before we query.
-        mesh.ensure_accel(radius);
+        {
+            let Some(mesh) = self.mesh_mut() else { return };
+            // The grid is sized from the query radius, so tell it before we query.
+            mesh.ensure_accel(radius);
+        }
 
         if deforms && dyn_on {
+            // Splitting and collapsing renumber vertices, so a record of which
+            // ones moved stops meaning anything. If this dab is about to do
+            // that, the stroke falls back to a copy of the geometry, taken now,
+            // while it still describes the state before the cut.
+            let needs = {
+                let mesh = self.mesh();
+                dyntopo::would_change(mesh, point, radius, &dyn_params)
+            };
+            if needs && self.journal.is_some() {
+                self.journal = None;
+                self.history.push_geometry(&self.scene, self.scene.active);
+            }
+            let Some(mesh) = self.mesh_mut() else { return };
             if dyntopo::refine(mesh, point, radius, &dyn_params) {
                 self.topology_dirty = true;
             }
@@ -232,8 +275,16 @@ impl Sculptor {
             .alpha
             .and_then(|i| self.alphas.get(i as usize))
             .cloned();
+        let mut journal = self.journal.take();
         let Some(mesh) = self.mesh_mut() else { return };
-        let touched = brush::apply(mesh, &brush, input, &mut state, alpha.as_deref());
+        let touched = brush::apply(
+            mesh,
+            &brush,
+            input,
+            &mut state,
+            alpha.as_deref(),
+            journal.as_mut(),
+        );
         if !touched.is_empty() {
             if deforms {
                 // Normals change one ring further out than the positions did,
@@ -244,6 +295,7 @@ impl Sculptor {
             }
             self.verts_dirty = true;
         }
+        self.journal = journal;
         self.stroke_state = state;
     }
 
@@ -370,6 +422,22 @@ impl Sculptor {
                 ceiling as f64 / 1.0e6
             ));
         }
+        // A vertex buffer the card will not take is a validation error, and a
+        // validation error on this path takes the window with it. Better to say
+        // no here, with the number that says why.
+        if let Some(limit) = self.vertex_buffer_limit {
+            let needed = projected_verts as u64 * std::mem::size_of::<Vertex>() as u64;
+            if needed > limit {
+                return Err(format!(
+                    "subdividing would need a {:.0} MB vertex buffer, and this GPU takes {:.0} MB at most",
+                    needed as f64 / 1.0e6,
+                    limit as f64 / 1.0e6
+                ));
+            }
+        }
+        // The history is the one thing here that can be given up, and the peak
+        // of this operation is the moment it is worth the most.
+        self.history.release();
         self.checkpoint();
         if let Some(o) = self.scene.active_mut() {
             o.mesh = topology::subdivide(&o.mesh, smooth);
@@ -818,6 +886,82 @@ mod tests {
         assert_eq!(back.objects[1].name, "b");
         assert_eq!(back.objects[1].transform.position.x, 2.0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Un trait qui ne coupe pas la topologie doit se retenir par différence,
+    /// et cette différence doit rendre exactement l'état d'avant.
+    #[test]
+    fn a_stroke_without_a_cut_is_remembered_by_difference() {
+        let mut s = Sculptor::new(primitives::icosphere(4));
+        s.dyntopo_enabled = false;
+        s.symmetry = false;
+        s.brush.kind = BrushKind::Draw;
+        s.brush.radius = 0.3;
+        s.brush.strength = 1.0;
+
+        let before: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+        let geometry_bytes = before.len() * std::mem::size_of::<Vertex>();
+
+        s.begin_stroke();
+        for _ in 0..5 {
+            s.stroke(&StrokeInput {
+                point: Vec3::new(0.0, 1.0, 0.0),
+                normal: Vec3::Y,
+                ..Default::default()
+            });
+        }
+        s.end_stroke();
+        assert!(s.mesh().verts[0].pos.distance(before[0]) >= 0.0);
+
+        // La trace doit être une fraction de la géométrie, pas une copie.
+        let kept = s.history.used_bytes();
+        assert!(
+            kept < geometry_bytes / 4,
+            "l'annulation a gardé {kept} octets pour une géométrie de {geometry_bytes}"
+        );
+
+        s.undo();
+        for (i, v) in s.mesh().verts.iter().enumerate() {
+            assert!(
+                v.pos.distance(before[i]) < 1e-6,
+                "le sommet {i} n'est pas revenu à sa place"
+            );
+        }
+    }
+
+    /// Un trait qui coupe la topologie ne peut pas se retenir par différence:
+    /// les indices ne veulent plus rien dire. Il doit reprendre la copie.
+    #[test]
+    fn a_stroke_that_cuts_falls_back_to_a_copy() {
+        let mut s = Sculptor::new(primitives::icosphere(3));
+        s.symmetry = false;
+        s.dyntopo_enabled = true;
+        s.dyntopo.detail = s.mesh().mean_edge_len() * 0.35;
+        s.brush.kind = BrushKind::Draw;
+        s.brush.radius = 0.4;
+        s.brush.strength = 0.8;
+
+        let faces_before = s.mesh().face_count();
+        let verts_before: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+
+        s.begin_stroke();
+        for _ in 0..4 {
+            s.stroke(&StrokeInput {
+                point: Vec3::new(0.0, 1.0, 0.0),
+                normal: Vec3::Y,
+                ..Default::default()
+            });
+        }
+        s.end_stroke();
+        assert!(s.mesh().face_count() > faces_before, "rien n'a été raffiné");
+
+        s.undo();
+        assert_eq!(s.mesh().face_count(), faces_before);
+        assert_eq!(s.mesh().vert_count(), verts_before.len());
+        for (i, v) in s.mesh().verts.iter().enumerate() {
+            assert!(v.pos.distance(verts_before[i]) < 1e-6, "sommet {i}");
+        }
+        validate(s.mesh());
     }
 
     #[test]

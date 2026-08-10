@@ -102,10 +102,19 @@ impl State {
             wgpu::Features::empty()
         };
 
+        // The adapter's own limits, not the portable defaults.
+        //
+        // `Limits::default()` caps a buffer at 256 MiB and a storage binding at
+        // 128 MiB, which are the numbers a browser guarantees, not the ones a
+        // desktop card has. A vertex buffer passes 256 MiB at about 3.7 million
+        // vertices, and asking for a buffer over the limit is a validation
+        // error: the window closed, with no message, exactly when a model got
+        // interesting. This card will say what it can really do.
+        let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("sculpt-rs device"),
             required_features: features,
-            required_limits: wgpu::Limits::default(),
+            required_limits: limits.clone(),
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
@@ -173,7 +182,15 @@ impl State {
             },
         );
 
-        let sculptor = Sculptor::new(primitives::icosphere(5));
+        let mut sculptor = Sculptor::new(primitives::icosphere(5));
+        // The buffers grow to the next power of two of one and a half times
+        // what is needed, so the headroom the engine may plan for is a third of
+        // what the card takes.
+        sculptor.vertex_buffer_limit = Some(limits.max_buffer_size / 3);
+        // And the dynamic topology ceiling follows it, so a stroke cannot walk
+        // into the wall the subdivision is guarded against.
+        let room = (limits.max_buffer_size / 3) as usize / std::mem::size_of::<sculpt_core::Vertex>();
+        sculptor.dyntopo.max_verts = room.clamp(500_000, 24_000_000);
         let mut camera = Camera::default();
         camera.frame(Vec3::ZERO, 1.0);
         camera.settle();
@@ -724,7 +741,9 @@ impl State {
         if path.extension().and_then(|e| e.to_str()) == Some("sculpt") {
             match io::read_scene(&path) {
                 Ok(scene) => {
+                    let limit = self.sculptor.vertex_buffer_limit;
                     self.sculptor = Sculptor::with_scene(scene);
+                    self.sculptor.vertex_buffer_limit = limit;
                     self.frame_view();
                     self.full_resync = true;
                     self.ui.say(format!("opened {name}"));
@@ -783,7 +802,9 @@ impl State {
         };
         match io::read_scene(&path) {
             Ok(scene) => {
+                let limit = self.sculptor.vertex_buffer_limit;
                 self.sculptor = Sculptor::with_scene(scene);
+                self.sculptor.vertex_buffer_limit = limit;
                 self.frame_view();
                 self.full_resync = true;
                 self.ui.say("scene opened");

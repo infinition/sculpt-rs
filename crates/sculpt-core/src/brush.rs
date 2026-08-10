@@ -541,6 +541,7 @@ pub fn apply(
     input: &StrokeInput,
     state: &mut StrokeState,
     alpha: Option<&crate::alpha::Alpha>,
+    journal: Option<&mut crate::history::StrokeJournal>,
 ) -> Vec<u32> {
     let pressure = input.pressure.clamp(0.05, 1.0);
     let radius = if b.pressure_radius { b.radius * pressure } else { b.radius };
@@ -552,6 +553,11 @@ pub fn apply(
     }
     if verts.is_empty() {
         return verts;
+    }
+
+    // Copied before anything is written, which is the whole point of it.
+    if let Some(journal) = journal {
+        journal.record(&verts, mesh);
     }
 
     let sign = if b.negative && b.kind.has_negative() { -1.0 } else { 1.0 };

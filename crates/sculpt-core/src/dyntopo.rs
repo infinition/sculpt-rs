@@ -117,3 +117,26 @@ where
     });
     out
 }
+
+/// Whether a dab here would change the topology at all.
+///
+/// Cheaper than finding out by doing it, and it has to be known first: a stroke
+/// that leaves the topology alone can be remembered as a handful of moved
+/// vertices, while one that splits or collapses edges needs a copy of the
+/// geometry taken before the first cut.
+pub fn would_change(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
+    let r = radius * 1.15;
+    if p.subdivide && mesh.vert_count() < p.max_verts {
+        let max_len = p.detail * SPLIT_FACTOR;
+        if !collect_edges(mesh, center, r, |len| len > max_len).is_empty() {
+            return true;
+        }
+    }
+    if p.decimate {
+        let min_len = p.detail * COLLAPSE_FACTOR;
+        if !collect_edges(mesh, center, r, |len| len < min_len).is_empty() {
+            return true;
+        }
+    }
+    false
+}
