@@ -89,6 +89,22 @@ fn main() {
         s.history.used_bytes() as f64 / 1e6
     );
 
+    // Ce qu'une remise en ordre coûte entre deux traits. C'est le seul à-coup
+    // que l'utilisateur voit alors qu'il n'a rien demandé.
+    println!();
+    {
+        let mut copy = s.mesh().clone();
+        ms("reconstruire l'adjacence", || copy.rebuild_adjacency());
+        ms("remettre les faces en ordre", || {
+            sculpt_core::cluster::build(&mut copy, sculpt_core::cluster::TARGET_FACES)
+        });
+        let touched: Vec<u32> = (0..copy.vert_count() as u32).step_by(97).collect();
+        println!("  ({} sommets touchés)", touched.len());
+        ms("normales autour de ce qui a bougé", || {
+            copy.update_normals(&touched)
+        });
+    }
+
     // Ce que le viewport demande à chaque image, curseur à côté du modèle.
     println!();
     {

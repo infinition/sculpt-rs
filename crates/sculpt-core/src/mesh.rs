@@ -18,6 +18,49 @@ pub type FaceList = SmallVec<[u32; 8]>;
 /// Ring-1 neighbourhood of a vertex.
 pub type VertList = SmallVec<[u32; 12]>;
 
+/// Below this many elements, spreading the work costs more than doing it.
+///
+/// Handing a few hundred items to a thread pool is a synchronisation the
+/// straight loop does not pay, and a laptop on battery has cores that take a
+/// moment to wake. The threshold matters most on the machines with the fewest
+/// cores, which are the ones that can least afford the overhead.
+const PARALLEL_MIN: usize = 8192;
+
+/// Fills the vertex-to-face lists, across every core.
+///
+/// Like the filing of the spatial grid, and for the same reason: the scatter
+/// cannot be split by face, because two threads would push into the list of a
+/// shared vertex. Split by vertex instead, and let each thread read the whole
+/// face array keeping only what points into its own slice. A streaming read
+/// per thread replaces a scatter over an array far too large for cache.
+fn fill_adjacency(vfaces: &mut [FaceList], faces: &[[u32; 3]]) {
+    let parts = rayon::current_num_threads();
+    if faces.len() < PARALLEL_MIN || parts < 2 {
+        for (fi, tri) in faces.iter().enumerate() {
+            for &v in tri {
+                vfaces[v as usize].push(fi as u32);
+            }
+        }
+        return;
+    }
+    let parts = parts.min(3);
+    let chunk = vfaces.len().div_ceil(parts).max(1);
+    vfaces
+        .par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(k, part)| {
+            let lo = (k * chunk) as u32;
+            let hi = lo + part.len() as u32;
+            for (fi, tri) in faces.iter().enumerate() {
+                for &v in tri {
+                    if v >= lo && v < hi {
+                        part[(v - lo) as usize].push(fi as u32);
+                    }
+                }
+            }
+        });
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
@@ -107,11 +150,7 @@ impl Mesh {
     pub fn rebuild_adjacency(&mut self) {
         self.vfaces.clear();
         self.vfaces.resize(self.verts.len(), FaceList::new());
-        for (fi, tri) in self.faces.iter().enumerate() {
-            for &v in tri {
-                self.vfaces[v as usize].push(fi as u32);
-            }
-        }
+        fill_adjacency(&mut self.vfaces, &self.faces);
         self.accel = None;
         self.mark_fully_dirty();
     }
@@ -541,9 +580,10 @@ impl Mesh {
                 n.normalize_or(Vec3::Y)
             })
             .collect();
-        for (v, n) in self.verts.iter_mut().zip(normals) {
-            v.nrm = n;
-        }
+        self.verts
+            .par_iter_mut()
+            .zip(normals)
+            .for_each(|(v, n)| v.nrm = n);
         self.mark_fully_dirty();
     }
 
@@ -551,21 +591,65 @@ impl Mesh {
     ///
     /// Returns that wider set, which is exactly the set of vertices whose data
     /// changed and therefore what a renderer has to re-upload.
+    ///
+    /// The hot path of a dab on a dense mesh: a brush moves tens of thousands
+    /// of vertices, and every one of them changes the normal of everything
+    /// around it. Both halves run across every core, and both were written to
+    /// avoid the work rather than to spread it.
     pub fn update_normals(&mut self, touched: &[u32]) -> Vec<u32> {
-        let mut set: Vec<u32> = Vec::with_capacity(touched.len() * 7);
-        set.extend_from_slice(touched);
-        for &v in touched {
-            set.extend(self.neighbors(v));
+        if touched.is_empty() {
+            return Vec::new();
         }
-        set.sort_unstable();
-        set.dedup();
-        for &v in &set {
-            let mut n = Vec3::ZERO;
-            for &f in &self.vfaces[v as usize] {
-                n += self.face_normal(f);
+        // The ring around what moved. Duplicates are pushed and sorted out once
+        // at the end: a neighbourhood that deduplicates as it goes tests every
+        // candidate against everything it already holds, which is quadratic in
+        // the valence and done once per vertex, where this is one sort.
+        let (vfaces, faces) = (&self.vfaces, &self.faces);
+        let ring = |v: u32| {
+            vfaces[v as usize]
+                .iter()
+                .flat_map(|&f| faces[f as usize])
+                .chain(std::iter::once(v))
+        };
+        let mut set: Vec<u32> = if touched.len() < PARALLEL_MIN {
+            let mut s = Vec::with_capacity(touched.len() * 7);
+            for &v in touched {
+                s.extend(ring(v));
             }
-            self.verts[v as usize].nrm = n.normalize_or(Vec3::Y);
+            s
+        } else {
+            touched.par_iter().flat_map_iter(|&v| ring(v)).collect()
+        };
+        if set.len() < PARALLEL_MIN {
+            set.sort_unstable();
+        } else {
+            set.par_sort_unstable();
         }
+        set.dedup();
+
+        // Collected, then written back. A parallel loop cannot write into the
+        // vertices while another reads them, and the write is a cheap scatter
+        // next to the cross products it carries.
+        let verts = &self.verts;
+        let normals: Vec<Vec3> = set
+            .par_iter()
+            .with_min_len(512)
+            .map(|&v| {
+                let mut n = Vec3::ZERO;
+                for &f in &vfaces[v as usize] {
+                    let [a, b, c] = faces[f as usize];
+                    let pa = verts[a as usize].pos;
+                    let pb = verts[b as usize].pos;
+                    let pc = verts[c as usize].pos;
+                    n += (pb - pa).cross(pc - pa);
+                }
+                n.normalize_or(Vec3::Y)
+            })
+            .collect();
+        for (&v, n) in set.iter().zip(&normals) {
+            self.verts[v as usize].nrm = *n;
+        }
+
         if !self.fully_dirty {
             self.dirty_verts.extend_from_slice(&set);
         }
