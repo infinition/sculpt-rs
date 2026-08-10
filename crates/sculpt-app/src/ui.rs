@@ -14,7 +14,7 @@ use crate::matcap;
 use crate::navwidget::{self, NavAction, NavWidget};
 use crate::renderer::{FrameSettings, Shading};
 use crate::theme::{ColorPreset, Metrics, Palette, Side, UiTheme};
-use crate::wheel::Wheel;
+use crate::wheel::{self, Wheel};
 use crate::widgets::{self, BigSlider};
 use egui::{Align2, Color32, CornerRadius, Frame, Margin, Sense, Stroke, Vec2};
 use sculpt_core::{Axis, BlendMode, BrushKind, Falloff, FillScope, RemeshOptions, Sculptor};
@@ -119,9 +119,10 @@ impl Anchor {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Tab {
     Brush,
+    Colour,
     Model,
     Scene,
     View,
@@ -129,11 +130,19 @@ pub enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [Tab::Brush, Tab::Model, Tab::Scene, Tab::View, Tab::Interface];
+    const ALL: [Tab; 6] = [
+        Tab::Brush,
+        Tab::Colour,
+        Tab::Model,
+        Tab::Scene,
+        Tab::View,
+        Tab::Interface,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Brush => "Brush",
+            Tab::Colour => "Colour",
             Tab::Model => "Model",
             Tab::Scene => "Scene",
             Tab::View => "View",
@@ -203,6 +212,81 @@ pub struct UiState {
     pub lightcap: matcap::Lightcap,
     /// A matcap loaded from a file: side length and RGBA8 pixels.
     pub matcap_image: Option<(u32, Vec<u8>)>,
+    /// Tabs that have been torn out of the dock and float over the viewport.
+    pub floating: Vec<Tab>,
+    /// Scheme the colour panel shows alongside the colour in hand.
+    pub harmony: Harmony,
+}
+
+/// Colour schemes built off the hue in hand.
+///
+/// The point is not the arithmetic, which is trivial, but having the other
+/// colours already on screen: picking a shadow by eye from a hue wheel is how
+/// paintings end up muddy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Harmony {
+    None,
+    Complement,
+    Analogous,
+    Triad,
+    Split,
+    Shades,
+}
+
+impl Harmony {
+    pub const ALL: [Harmony; 6] = [
+        Harmony::None,
+        Harmony::Complement,
+        Harmony::Analogous,
+        Harmony::Triad,
+        Harmony::Split,
+        Harmony::Shades,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Harmony::None => "Off",
+            Harmony::Complement => "Opposite",
+            Harmony::Analogous => "Near",
+            Harmony::Triad => "Triad",
+            Harmony::Split => "Split",
+            Harmony::Shades => "Shades",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Harmony::None => "",
+            Harmony::Complement => "The hue across the wheel. Loud, and the fastest way to make one colour read.",
+            Harmony::Analogous => "The neighbours. Quiet, and what most of a painting is made of.",
+            Harmony::Triad => "Three evenly spaced hues. Balanced without being flat.",
+            Harmony::Split => "The two either side of the opposite. Most of the contrast, less of the shouting.",
+            Harmony::Shades => "The same hue at other values, which is what a form needs before it needs another hue.",
+        }
+    }
+
+    /// The colours this scheme puts alongside the one in hand.
+    pub fn mates(self, hue: f32, sat: f32, val: f32) -> Vec<glam::Vec3> {
+        let at = |h: f32, s: f32, v: f32| {
+            let (r, g, b) = wheel::hsv_to_rgb(h.rem_euclid(1.0), s.clamp(0.0, 1.0), v.clamp(0.0, 1.0));
+            glam::Vec3::new(r, g, b)
+        };
+        match self {
+            Harmony::None => Vec::new(),
+            Harmony::Complement => vec![at(hue + 0.5, sat, val)],
+            Harmony::Analogous => vec![at(hue - 1.0 / 12.0, sat, val), at(hue + 1.0 / 12.0, sat, val)],
+            Harmony::Triad => vec![at(hue + 1.0 / 3.0, sat, val), at(hue - 1.0 / 3.0, sat, val)],
+            Harmony::Split => vec![at(hue + 0.5 - 1.0 / 12.0, sat, val), at(hue + 0.5 + 1.0 / 12.0, sat, val)],
+            // Down toward the shadow, up toward the light, and a little less
+            // saturated at both ends the way pigment behaves.
+            Harmony::Shades => vec![
+                at(hue, sat * 0.9, val * 0.45),
+                at(hue, sat * 0.95, val * 0.7),
+                at(hue, sat * 0.8, (val * 1.25).min(1.0)),
+                at(hue, sat * 0.55, (val * 1.5).min(1.0)),
+            ],
+        }
+    }
 }
 
 /// The three ways to get a matcap.
@@ -270,6 +354,8 @@ impl Default for UiState {
             matcap_source: MatcapSource::Preset,
             lightcap: matcap::Lightcap::default(),
             matcap_image: None,
+            floating: Vec::new(),
+            harmony: Harmony::Analogous,
         }
     }
 }
@@ -810,27 +896,124 @@ fn settings_dock(
             // which is how one long sentence swallows the viewport.
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 
-            let labels: Vec<&str> = Tab::ALL.iter().map(|t| t.label()).collect();
-            let current = Tab::ALL.iter().position(|t| *t == st.tab).unwrap_or(0);
-            if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
-                st.tab = Tab::ALL[i];
-            }
-            ui.add_space(6.0);
+            // Only the docked tabs are offered here. A tab that has been torn
+            // off is already on screen, and listing it twice would leave the
+            // dock showing a copy of a window sitting next to it.
+            let docked: Vec<Tab> = Tab::ALL
+                .iter()
+                .copied()
+                .filter(|t| !st.floating.contains(t))
+                .collect();
+            if docked.is_empty() {
+                ui.label(
+                    egui::RichText::new("Every panel is floating.")
+                        .small()
+                        .color(p.dim),
+                );
+            } else {
+                if !docked.contains(&st.tab) {
+                    st.tab = docked[0];
+                }
+                let labels: Vec<&str> = docked.iter().map(|t| t.label()).collect();
+                let current = docked.iter().position(|t| *t == st.tab).unwrap_or(0);
+                if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+                    st.tab = docked[i];
+                }
+                ui.add_space(4.0);
+                if widgets::wide_button(ui, Icon::Pin, "Float this panel", m.row * 0.85, false)
+                    .clicked()
+                {
+                    let tab = st.tab;
+                    st.floating.push(tab);
+                }
+                ui.add_space(4.0);
 
-            let inner_width = ui.available_width();
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.set_max_width(inner_width);
-                    match st.tab {
-                        Tab::Brush => brush_tab(ui, s, st, cx),
-                        Tab::Model => model_tab(ui, s, st, cx),
-                        Tab::Scene => scene_tab(ui, s, st, giz, cx),
-                        Tab::View => view_tab(ui, st, cam, cx),
-                        Tab::Interface => interface_tab(ui, st, cx),
-                    }
-                });
+                let inner_width = ui.available_width();
+                let tab = st.tab;
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_max_width(inner_width);
+                        tab_body(ui, tab, s, st, cam, giz, cx);
+                    });
+            }
         });
+
+    floating_panels(root, s, st, cam, giz, cx);
+}
+
+/// Draws whatever a tab holds, wherever it happens to be living.
+fn tab_body(
+    ui: &mut egui::Ui,
+    tab: Tab,
+    s: &mut Sculptor,
+    st: &mut UiState,
+    cam: &mut Camera,
+    giz: &mut Gizmo,
+    cx: &mut Ctx,
+) {
+    match tab {
+        Tab::Brush => brush_tab(ui, s, st, cx),
+        Tab::Colour => colour_tab(ui, s, st, cx),
+        Tab::Model => model_tab(ui, s, st, cx),
+        Tab::Scene => scene_tab(ui, s, st, giz, cx),
+        Tab::View => view_tab(ui, st, cam, cx),
+        Tab::Interface => interface_tab(ui, st, cx),
+    }
+}
+
+/// The tabs that have been torn out of the dock, each in its own window.
+///
+/// Windows rather than extra docks: a floating panel is for the one control set
+/// you are working through right now, and it should be able to sit over the
+/// model, next to what it is changing, instead of stealing another edge of the
+/// screen.
+fn floating_panels(
+    root: &mut egui::Ui,
+    s: &mut Sculptor,
+    st: &mut UiState,
+    cam: &mut Camera,
+    giz: &mut Gizmo,
+    cx: &mut Ctx,
+) {
+    let (p, m) = (cx.p, cx.m);
+    let open: Vec<Tab> = st.floating.clone();
+    for (i, tab) in open.into_iter().enumerate() {
+        let mut still_open = true;
+        egui::Window::new(tab.label())
+            .id(egui::Id::new(("floating", tab)))
+            .open(&mut still_open)
+            .default_pos(egui::pos2(
+                st.viewport.left() + 40.0 + i as f32 * 26.0,
+                st.viewport.top() + 40.0 + i as f32 * 26.0,
+            ))
+            .default_width(m.panel_width)
+            .resizable(true)
+            .frame(
+                Frame::new()
+                    .fill(p.panel)
+                    .stroke(Stroke::new(1.0, p.line))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(Margin::same(m.pad as i8)),
+            )
+            .show(root.ctx(), |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                let inner_width = ui.available_width();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .max_height(st.viewport.height() * 0.75)
+                    .show(ui, |ui| {
+                        ui.set_max_width(inner_width);
+                        tab_body(ui, tab, s, st, cam, giz, cx);
+                    });
+            });
+        if !still_open {
+            // Closing a floating panel puts it back where it came from rather
+            // than hiding it: there is no other way to get it back.
+            st.floating.retain(|t| *t != tab);
+            st.tab = tab;
+        }
+    }
 }
 
 fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
@@ -1002,6 +1185,226 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
     if widgets::wide_button(ui, Icon::Reset, "Reset every tool", m.row, false).clicked() {
         cx.actions.push(Action::ResetBrushes);
     }
+}
+
+/// The colour panel: a square, a hue strip, harmonies and a palette.
+///
+/// The radial menu already carries a hue ring for the colour you need in the
+/// middle of a stroke. This is the other half of the job: sitting down and
+/// choosing a scheme. It is a tab like any other, so it can be torn off and
+/// parked beside the model while a painting pass goes on.
+fn colour_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
+    let colour = s.brush.paint_color;
+    let (mut hue, mut sat, mut val) = wheel::rgb_to_hsv(colour.x, colour.y, colour.z);
+    let grey = st.wheel.grayscale;
+    // Only a deliberate change is written back. Reading the colour as hue,
+    // saturation and value and writing it straight out again every frame would
+    // grind it down through the rounding, and a grey has no hue to keep at all.
+    let mut touched = false;
+
+    // Saturation and value.
+    let side = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(
+        egui::Vec2::new(side, side * 0.62),
+        egui::Sense::click_and_drag(),
+    );
+    if response.dragged() || response.clicked() {
+        if let Some(at) = ui.ctx().pointer_interact_pos() {
+            sat = ((at.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            val = ((rect.bottom() - at.y) / rect.height()).clamp(0.0, 1.0);
+            touched = true;
+        }
+    }
+    let (hr, hg, hb) = if grey { (1.0, 1.0, 1.0) } else { wheel::hsv_to_rgb(hue, 1.0, 1.0) };
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(rect.left_bottom(), egui::Color32::BLACK);
+    mesh.colored_vertex(rect.right_bottom(), egui::Color32::BLACK);
+    mesh.colored_vertex(rect.left_top(), egui::Color32::WHITE);
+    mesh.colored_vertex(
+        rect.right_top(),
+        egui::Color32::from_rgb((hr * 255.0) as u8, (hg * 255.0) as u8, (hb * 255.0) as u8),
+    );
+    mesh.add_triangle(0, 1, 3);
+    mesh.add_triangle(0, 3, 2);
+    ui.painter().add(egui::Shape::mesh(mesh));
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(4),
+        Stroke::new(1.0, p.line),
+        egui::StrokeKind::Outside,
+    );
+    ui.painter().circle_stroke(
+        egui::Pos2::new(
+            rect.left() + sat * rect.width(),
+            rect.bottom() - val * rect.height(),
+        ),
+        6.0,
+        Stroke::new(1.8, if val > 0.55 { egui::Color32::BLACK } else { egui::Color32::WHITE }),
+    );
+
+    // Hue, as a strip under the square.
+    let (strip, hue_response) = ui.allocate_exact_size(
+        egui::Vec2::new(side, m.row * 0.7),
+        egui::Sense::click_and_drag(),
+    );
+    if hue_response.dragged() || hue_response.clicked() {
+        if let Some(at) = ui.ctx().pointer_interact_pos() {
+            hue = ((at.x - strip.left()) / strip.width()).clamp(0.0, 1.0);
+            touched = true;
+        }
+    }
+    let steps = 48;
+    for i in 0..steps {
+        let t0 = i as f32 / steps as f32;
+        let t1 = (i + 1) as f32 / steps as f32;
+        let (r, g, b) = if grey {
+            (t0, t0, t0)
+        } else {
+            wheel::hsv_to_rgb(t0, 1.0, 1.0)
+        };
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::Pos2::new(strip.left() + t0 * strip.width(), strip.top()),
+                egui::Pos2::new(strip.left() + t1 * strip.width(), strip.bottom()),
+            ),
+            0.0,
+            egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8),
+        );
+    }
+    let marker = strip.left() + if grey { val } else { hue } * strip.width();
+    ui.painter().line_segment(
+        [egui::Pos2::new(marker, strip.top()), egui::Pos2::new(marker, strip.bottom())],
+        Stroke::new(2.0, p.text),
+    );
+
+    let mut next = if grey {
+        let v = if hue_response.dragged() || hue_response.clicked() {
+            hue
+        } else {
+            val
+        };
+        glam::Vec3::splat(v)
+    } else {
+        let (r, g, b) = wheel::hsv_to_rgb(hue, sat, val);
+        glam::Vec3::new(r, g, b)
+    };
+
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let swatch = egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::Vec2::new(m.row * 1.6, m.row),
+        );
+        ui.allocate_rect(swatch, egui::Sense::hover());
+        ui.painter().rect(
+            swatch,
+            egui::CornerRadius::same(5),
+            egui::Color32::from_rgb(
+                (next.x * 255.0) as u8,
+                (next.y * 255.0) as u8,
+                (next.z * 255.0) as u8,
+            ),
+            Stroke::new(1.0, p.line),
+            egui::StrokeKind::Inside,
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "#{:02X}{:02X}{:02X}",
+                (next.x.clamp(0.0, 1.0) * 255.0) as u8,
+                (next.y.clamp(0.0, 1.0) * 255.0) as u8,
+                (next.z.clamp(0.0, 1.0) * 255.0) as u8
+            ))
+            .monospace()
+            .color(p.text),
+        );
+    });
+
+    widgets::toggle(ui, &mut st.wheel.grayscale, "Greys only", m.row);
+    if widgets::wide_button(ui, Icon::Palette, "Pick off the model", m.row, st.picking_color)
+        .clicked()
+    {
+        cx.actions.push(Action::PickColorMode);
+    }
+
+    // Harmonies.
+    widgets::section_title(ui, "HARMONY");
+    let labels: Vec<&str> = Harmony::ALL.iter().map(|h| h.label()).collect();
+    let current = Harmony::ALL.iter().position(|h| *h == st.harmony).unwrap_or(0);
+    if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
+        st.harmony = Harmony::ALL[i];
+    }
+    let mates = st.harmony.mates(hue, sat, val);
+    if !mates.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for c in &mates {
+                if colour_chip(ui, *c, m.row, p).clicked() {
+                    next = *c;
+                    touched = true;
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(st.harmony.hint())
+                .small()
+                .color(p.dim),
+        );
+    }
+
+    // Palette, shared with the radial menu so a colour saved in one is in both.
+    widgets::section_title(ui, "PALETTE");
+    let mut remove = None;
+    let saved: Vec<[f32; 3]> = st.wheel.swatches.clone();
+    ui.horizontal_wrapped(|ui| {
+        for (i, c) in saved.iter().enumerate() {
+            let chip = colour_chip(ui, glam::Vec3::from_array(*c), m.row, p);
+            if chip.clicked() {
+                next = glam::Vec3::from_array(*c);
+                touched = true;
+            }
+            if chip.secondary_clicked() {
+                remove = Some(i);
+            }
+        }
+    });
+    if let Some(i) = remove {
+        st.wheel.swatches.remove(i);
+    }
+    ui.horizontal(|ui| {
+        if widgets::wide_button(ui, Icon::Plus, "Keep this colour", m.row, false).clicked() {
+            st.wheel.swatches.push([next.x, next.y, next.z]);
+            if st.wheel.swatches.len() > wheel::SWATCHES {
+                st.wheel.swatches.remove(0);
+            }
+        }
+    });
+    ui.label(
+        egui::RichText::new("Right click a swatch to drop it.")
+            .small()
+            .color(p.dim),
+    );
+
+    if touched {
+        s.brush.paint_color = next;
+    }
+}
+
+/// One clickable colour square.
+fn colour_chip(ui: &mut egui::Ui, c: glam::Vec3, size: f32, p: Palette) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click());
+    let hovered = response.hovered();
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(5),
+        egui::Color32::from_rgb(
+            (c.x.clamp(0.0, 1.0) * 255.0) as u8,
+            (c.y.clamp(0.0, 1.0) * 255.0) as u8,
+            (c.z.clamp(0.0, 1.0) * 255.0) as u8,
+        ),
+        Stroke::new(if hovered { 2.0 } else { 1.0 }, if hovered { p.accent } else { p.line }),
+        egui::StrokeKind::Inside,
+    );
+    response
 }
 
 /// The alphas the brush can stamp through, as a grid of thumbnails.
@@ -2079,4 +2482,59 @@ fn help_window(ctx: &egui::Context, st: &mut UiState, p: Palette) {
             }
         });
     st.show_help = open;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every scheme has to come back with colours that are actually different
+    /// from the one in hand, or the row of chips is decoration.
+    #[test]
+    fn a_harmony_offers_something_new() {
+        let (h, s, v) = (0.1f32, 0.8f32, 0.7f32);
+        let (r, g, b) = wheel::hsv_to_rgb(h, s, v);
+        let base = glam::Vec3::new(r, g, b);
+        for harmony in Harmony::ALL {
+            let mates = harmony.mates(h, s, v);
+            if harmony == Harmony::None {
+                assert!(mates.is_empty());
+                continue;
+            }
+            assert!(!mates.is_empty(), "{harmony:?} offered nothing");
+            for c in mates {
+                assert!((c - base).length() > 0.05, "{harmony:?} repeated the colour");
+                assert!(
+                    c.cmpge(glam::Vec3::ZERO).all() && c.cmple(glam::Vec3::ONE).all(),
+                    "{harmony:?} left the range"
+                );
+            }
+        }
+    }
+
+    /// The opposite of the opposite is where you started.
+    #[test]
+    fn the_complement_is_its_own_inverse() {
+        let (h, s, v) = (0.2f32, 0.9f32, 0.8f32);
+        let there = Harmony::Complement.mates(h, s, v)[0];
+        let (h2, s2, v2) = wheel::rgb_to_hsv(there.x, there.y, there.z);
+        let back = Harmony::Complement.mates(h2, s2, v2)[0];
+        let (r, g, b) = wheel::hsv_to_rgb(h, s, v);
+        assert!((back - glam::Vec3::new(r, g, b)).length() < 1e-3);
+    }
+
+    /// A tab that is floating must not also be listed in the dock, and closing
+    /// its window has to put it back rather than lose it.
+    #[test]
+    fn a_floating_tab_leaves_the_dock() {
+        let mut st = UiState::default();
+        st.floating.push(Tab::Colour);
+        let docked: Vec<Tab> = Tab::ALL
+            .iter()
+            .copied()
+            .filter(|t| !st.floating.contains(t))
+            .collect();
+        assert!(!docked.contains(&Tab::Colour));
+        assert_eq!(docked.len(), Tab::ALL.len() - 1);
+    }
 }
