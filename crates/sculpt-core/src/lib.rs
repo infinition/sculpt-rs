@@ -5,6 +5,7 @@
 //! headless test, or a future wasm build.
 
 pub mod accel;
+pub mod alpha;
 pub mod brush;
 pub mod dyntopo;
 pub mod history;
@@ -16,6 +17,7 @@ pub mod scene;
 pub mod topology;
 
 pub use accel::Grid;
+pub use alpha::{Alpha, Shape as AlphaShape};
 pub use brush::{Axis, BlendMode, Brush, BrushKind, Falloff, FillScope, StrokeInput};
 pub use dyntopo::Dyntopo;
 pub use history::History;
@@ -43,6 +45,10 @@ pub struct Sculptor {
     pub brush: Brush,
     /// Per-tool settings, so switching brushes restores what you had.
     presets: Vec<Brush>,
+    /// Every alpha the brush can stamp through. Brushes point into this by
+    /// index; the reference count is only there so a dab can hold one while the
+    /// mesh is borrowed.
+    pub alphas: Vec<std::sync::Arc<Alpha>>,
     pub dyntopo: Dyntopo,
     pub dyntopo_enabled: bool,
     pub symmetry: bool,
@@ -65,6 +71,10 @@ impl Sculptor {
         let brush = Brush::default();
         let mut s = Self {
             presets: BrushKind::ALL.iter().map(|&k| Brush::defaults_for(k)).collect(),
+            alphas: alpha::Shape::ALL
+                .iter()
+                .map(|&s| std::sync::Arc::new(Alpha::procedural(s, 256)))
+                .collect(),
             brush,
             dyntopo: Dyntopo::default(),
             dyntopo_enabled: true,
@@ -182,6 +192,7 @@ impl Sculptor {
                 normal: inv.transform_vector3(world.normal).normalize_or(Vec3::Y),
                 drag: inv.transform_vector3(world.drag),
                 view_dir: inv.transform_vector3(world.view_dir).normalize_or(-Vec3::Z),
+                view_right: inv.transform_vector3(world.view_right).normalize_or(Vec3::X),
                 ..*world
             }
         };
@@ -216,8 +227,13 @@ impl Sculptor {
         }
 
         let mut state = self.stroke_state;
+        // Held by the handle, so the mesh can be borrowed at the same time.
+        let alpha = brush
+            .alpha
+            .and_then(|i| self.alphas.get(i as usize))
+            .cloned();
         let Some(mesh) = self.mesh_mut() else { return };
-        let touched = brush::apply(mesh, &brush, input, &mut state);
+        let touched = brush::apply(mesh, &brush, input, &mut state, alpha.as_deref());
         if !touched.is_empty() {
             if deforms {
                 // Normals change one ring further out than the positions did,
@@ -668,6 +684,56 @@ mod tests {
         validate(s.mesh());
         validate_accel(s.mesh());
         assert!(s.mesh().face_count() > before, "dyntopo should have subdivided");
+    }
+
+    /// A stamp has to reach the surface. Half the alpha is solid and half is
+    /// empty, so the dab must move the vertices under the solid half and leave
+    /// the others exactly where they were.
+    #[test]
+    fn an_alpha_shapes_the_dab() {
+        let mut s = Sculptor::new(primitives::icosphere(4));
+        // Solid on the right of the image, empty on the left. Wide enough that
+        // the two halves are not one long interpolation between two pixels.
+        let n = 16;
+        let mut data = vec![0.0f32; n * n];
+        for y in 0..n {
+            for x in n / 2..n {
+                data[y * n + x] = 1.0;
+            }
+        }
+        let half = Alpha::new("half", n as u32, n as u32, data);
+        s.alphas.push(std::sync::Arc::new(half));
+        s.brush.alpha = Some((s.alphas.len() - 1) as u32);
+        s.brush.kind = BrushKind::Draw;
+        s.brush.radius = 0.5;
+        s.brush.strength = 1.0;
+        s.symmetry = false;
+        // Keep the vertex list still, so a vertex can be compared with itself.
+        s.dyntopo_enabled = false;
+
+        let before: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+        s.begin_stroke();
+        s.stroke(&StrokeInput {
+            point: Vec3::new(0.0, 1.0, 0.0),
+            normal: Vec3::Y,
+            view_right: Vec3::X,
+            ..Default::default()
+        });
+        s.end_stroke();
+
+        let mut moved_right = 0;
+        for (i, v) in s.mesh().verts.iter().enumerate() {
+            let d = (v.pos - before[i]).length();
+            // The dab centre is above +Y, and the image runs along +X.
+            if before[i].x > 0.2 && before[i].y > 0.7 {
+                if d > 1e-5 {
+                    moved_right += 1;
+                }
+            } else if before[i].x < -0.05 {
+                assert!(d < 1e-6, "vertex {i} moved where the alpha is empty");
+            }
+        }
+        assert!(moved_right > 0, "the solid half of the alpha did nothing");
     }
 
     #[test]

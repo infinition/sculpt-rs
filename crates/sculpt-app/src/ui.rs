@@ -84,6 +84,7 @@ pub enum Action {
     ApplyTransform,
     SetView(ViewPreset),
     PickColorMode,
+    LoadAlpha,
     ResetBrushes,
     ResetTheme,
 }
@@ -191,6 +192,10 @@ pub struct UiState {
     /// rescales the coordinate space the slider itself lives in, so committing
     /// mid-gesture would move the rail out from under the finger.
     pub ui_scale_draft: f32,
+    /// One thumbnail per alpha, in the same order. Built once and rebuilt only
+    /// when the library changes: an alpha is a full image, and uploading them
+    /// every frame to draw a row of postage stamps would be absurd.
+    pub alpha_thumbs: Vec<egui::TextureHandle>,
 }
 
 impl Default for UiState {
@@ -230,6 +235,7 @@ impl Default for UiState {
             wheel_key: KeyCode::Space,
             rebinding_wheel: false,
             ui_scale_draft: UiTheme::default().ui_scale,
+            alpha_thumbs: Vec::new(),
         }
     }
 }
@@ -238,6 +244,38 @@ impl UiState {
     pub fn say(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.status_age = 0.0;
+    }
+
+    /// Makes sure there is one thumbnail per alpha.
+    ///
+    /// The thumbnails are white with the alpha in their opacity, so the grid
+    /// can tint them with the theme and a selected one lights up in the accent
+    /// colour without a second texture.
+    fn sync_alpha_thumbs(&mut self, ctx: &egui::Context, s: &Sculptor) {
+        if self.alpha_thumbs.len() == s.alphas.len() {
+            return;
+        }
+        self.alpha_thumbs.clear();
+        const SIDE: usize = 48;
+        for (i, a) in s.alphas.iter().enumerate() {
+            let mut pixels = Vec::with_capacity(SIDE * SIDE);
+            for y in 0..SIDE {
+                for x in 0..SIDE {
+                    let v = a.sample(x as f32 / (SIDE - 1) as f32, y as f32 / (SIDE - 1) as f32);
+                    pixels.push(egui::Color32::from_white_alpha((v * 255.0) as u8));
+                }
+            }
+            let image = egui::ColorImage {
+                size: [SIDE, SIDE],
+                pixels,
+                source_size: egui::vec2(SIDE as f32, SIDE as f32),
+            };
+            self.alpha_thumbs.push(ctx.load_texture(
+                format!("alpha_{i}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
     }
 }
 
@@ -797,6 +835,8 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
     }
     falloff_preview(ui, s.brush.falloff, &m, p);
 
+    alpha_picker(ui, st, s, cx, &m, p);
+
     widgets::section_title(ui, "BEHAVIOUR");
     widgets::toggle(ui, &mut s.brush.culling, "Front faces only", m.row);
     widgets::toggle(ui, &mut s.brush.lock_plane, "Lock the stroke plane", m.row);
@@ -927,6 +967,111 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
     ui.add_space(8.0);
     if widgets::wide_button(ui, Icon::Reset, "Reset every tool", m.row, false).clicked() {
         cx.actions.push(Action::ResetBrushes);
+    }
+}
+
+/// The alphas the brush can stamp through, as a grid of thumbnails.
+///
+/// A falloff can only ever make a circle. An alpha is what turns one brush into
+/// cracks, scales or a photographed grain, so it belongs right under the
+/// falloff rather than buried in a menu.
+fn alpha_picker(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    s: &mut Sculptor,
+    cx: &mut Ctx,
+    m: &Metrics,
+    p: Palette,
+) {
+    widgets::section_title(ui, "ALPHA");
+    st.sync_alpha_thumbs(ui.ctx(), s);
+
+    let cell = (m.button * 1.4).max(34.0);
+    let spacing = 4.0;
+    let per_row = ((ui.available_width() + spacing) / (cell + spacing)).floor().max(1.0) as usize;
+
+    let mut chosen: Option<Option<u32>> = None;
+    let mut index = 0usize;
+    // The first cell clears the alpha, so getting back to a plain round brush
+    // is one press and never a hunt through the grid.
+    let slots = st.alpha_thumbs.len() + 1;
+    while index < slots {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = spacing;
+            for _ in 0..per_row {
+                if index >= slots {
+                    break;
+                }
+                let selected = if index == 0 {
+                    s.brush.alpha.is_none()
+                } else {
+                    s.brush.alpha == Some(index as u32 - 1)
+                };
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::Vec2::splat(cell), egui::Sense::click());
+                let hovered = response.hovered();
+                ui.painter().rect(
+                    rect,
+                    egui::CornerRadius::same(6),
+                    p.raised,
+                    Stroke::new(
+                        if selected { 2.0 } else { 1.0 },
+                        if selected {
+                            p.accent
+                        } else if hovered {
+                            p.text
+                        } else {
+                            p.line
+                        },
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+                let inner = rect.shrink(4.0);
+                if index == 0 {
+                    crate::icons::paint(ui.painter(), inner, Icon::Draw, if selected { p.accent } else { p.dim });
+                } else if let Some(tex) = st.alpha_thumbs.get(index - 1) {
+                    egui::Image::new((tex.id(), inner.size()))
+                        .tint(if selected { p.accent } else { p.text })
+                        .paint_at(ui, inner);
+                }
+                if response.clicked() {
+                    chosen = Some(if index == 0 { None } else { Some(index as u32 - 1) });
+                }
+                if hovered && index > 0 {
+                    if let Some(a) = s.alphas.get(index - 1) {
+                        response.on_hover_text(a.name.clone());
+                    }
+                }
+                index += 1;
+            }
+        });
+    }
+    if let Some(choice) = chosen {
+        s.brush.alpha = choice;
+    }
+
+    if s.brush.alpha.is_some() {
+        let mut degrees = s.brush.alpha_angle.to_degrees();
+        if BigSlider::new(&mut degrees, -180.0..=180.0, "Turn")
+            .decimals(0)
+            .suffix("°")
+            .height(m.row)
+            .show(ui)
+            .changed()
+        {
+            s.brush.alpha_angle = degrees.to_radians();
+        }
+        widgets::toggle(ui, &mut s.brush.alpha_follow, "Follow the stroke", m.row);
+        ui.label(
+            egui::RichText::new(
+                "Without this the stamp keeps the angle it has on screen, which is what you want for scales or a grain. With it, it turns to face the way the stroke is going, which is what you want for a scratch.",
+            )
+            .small()
+            .color(p.dim),
+        );
+    }
+    if widgets::wide_button(ui, Icon::Open, "Load an image", m.row, false).clicked() {
+        cx.actions.push(Action::LoadAlpha);
     }
 }
 

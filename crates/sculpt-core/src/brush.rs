@@ -323,6 +323,16 @@ pub struct Brush {
     pub fill_angle: f32,
     /// How readily the smudge tool picks up new colour as it travels.
     pub smudge_pickup: f32,
+    /// Which alpha shapes the dab, as an index into the application's library.
+    ///
+    /// An index rather than the image itself, so a brush stays `Copy` and can
+    /// be swapped between presets for nothing. The library outlives the brush.
+    pub alpha: Option<u32>,
+    /// Turn of the stamp, in radians.
+    pub alpha_angle: f32,
+    /// Turn the stamp to follow the direction of travel, which is what you want
+    /// for anything that reads as a scratch or a groove.
+    pub alpha_follow: bool,
 }
 
 impl Default for Brush {
@@ -348,6 +358,9 @@ impl Default for Brush {
             fill_scope: FillScope::Region,
             fill_angle: 35.0,
             smudge_pickup: 0.35,
+            alpha: None,
+            alpha_angle: 0.0,
+            alpha_follow: false,
         }
     }
 }
@@ -402,6 +415,10 @@ pub struct StrokeInput {
     pub drag: Vec3,
     /// Camera forward, pointing into the scene. Drives culling and Twist.
     pub view_dir: Vec3,
+    /// Camera right. Only an alpha reads it, to know which way is up on the
+    /// stamp: without it the same brush would print its image at a different
+    /// angle depending on where on the model it landed.
+    pub view_right: Vec3,
     /// Signed cursor rotation around the dab centre, in radians (Twist).
     pub twist: f32,
     /// Signed cursor motion along the screen X axis, normalised (Scale).
@@ -417,6 +434,7 @@ impl Default for StrokeInput {
             normal: Vec3::Y,
             drag: Vec3::ZERO,
             view_dir: -Vec3::Z,
+            view_right: Vec3::X,
             twist: 0.0,
             pinch: 0.0,
             pressure: 1.0,
@@ -484,6 +502,7 @@ impl StrokeInput {
             normal: axis.mirror_dir(self.normal),
             drag: axis.mirror_dir(self.drag),
             view_dir: axis.mirror_dir(self.view_dir),
+            view_right: axis.mirror_dir(self.view_right),
             // Mirroring flips handedness, so the rotation reverses.
             twist: -self.twist,
             pinch: self.pinch,
@@ -492,12 +511,36 @@ impl StrokeInput {
     }
 }
 
+/// The frame a stamp is printed in: two directions across the face of the dab.
+///
+/// Screen-aligned by default, so the image keeps the orientation it has in the
+/// brush palette wherever on the model it lands, and turned to the direction of
+/// travel when the brush is set to follow, which is what a scratch wants.
+fn stamp_basis(b: &Brush, input: &StrokeInput) -> (Vec3, Vec3) {
+    let n = input.normal.normalize_or(Vec3::Y);
+    let along = if b.alpha_follow && input.drag.length_squared() > 1e-12 {
+        input.drag
+    } else {
+        input.view_right
+    };
+    // Flatten the reference onto the surface. When it happens to point straight
+    // through it, any perpendicular will do: the stamp has to sit somewhere.
+    let flat = along - n * n.dot(along);
+    let t = flat.normalize_or(n.any_orthonormal_vector());
+    let t = Quat::from_axis_angle(n, b.alpha_angle) * t;
+    (t, n.cross(t))
+}
+
 /// Applies one brush dab. Returns the vertices it touched.
+///
+/// `alpha` is the image the brush is stamping through, if it has one. It is
+/// passed in rather than held by the brush so that a brush stays cheap to copy.
 pub fn apply(
     mesh: &mut Mesh,
     b: &Brush,
     input: &StrokeInput,
     state: &mut StrokeState,
+    alpha: Option<&crate::alpha::Alpha>,
 ) -> Vec<u32> {
     let pressure = input.pressure.clamp(0.05, 1.0);
     let radius = if b.pressure_radius { b.radius * pressure } else { b.radius };
@@ -515,18 +558,30 @@ pub fn apply(
     let inv_r = 1.0 / radius.max(1e-6);
     let amp = strength * radius * 0.25 * sign;
 
-    // Falloff, pre-multiplied by the protection mask.
+    // Falloff, pre-multiplied by the protection mask and by the stamp.
+    let stamp = alpha.map(|a| (a, stamp_basis(b, input)));
     let weights: Vec<f32> = verts
         .par_iter()
         .map(|&v| {
             let vx = &mesh.verts[v as usize];
-            let t = vx.pos.distance(input.point) * inv_r;
+            let d = vx.pos - input.point;
+            let t = d.length() * inv_r;
             let m = if b.kind == BrushKind::Mask {
                 1.0
             } else {
                 (1.0 - vx.mask).clamp(0.0, 1.0)
             };
-            b.falloff.eval(t) * m
+            let s = match &stamp {
+                // The dab spans the image, so a vertex one radius to the right
+                // of the centre reads the right edge.
+                Some((a, (right, up))) => {
+                    let u = 0.5 + d.dot(*right) * inv_r * 0.5;
+                    let v = 0.5 - d.dot(*up) * inv_r * 0.5;
+                    a.sample(u, v)
+                }
+                None => 1.0,
+            };
+            b.falloff.eval(t) * m * s
         })
         .collect();
 

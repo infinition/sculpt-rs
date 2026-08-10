@@ -393,6 +393,7 @@ impl State {
             normal,
             drag,
             view_dir: self.camera.forward(),
+            view_right: self.camera.right(),
             pressure,
             ..Default::default()
         }
@@ -672,6 +673,7 @@ impl State {
                 }
                 Action::SetView(p) => self.camera.set_preset(p),
                 Action::PickColorMode => self.ui.picking_color = !self.ui.picking_color,
+                Action::LoadAlpha => self.load_alpha(),
                 Action::ResetBrushes => {
                     self.sculptor.reset_brush_presets();
                     self.ui.say("brushes reset");
@@ -766,6 +768,52 @@ impl State {
             }
             Err(e) => self.ui.say(format!("could not open: {e}")),
         }
+    }
+
+    /// Loads an image as a brush alpha.
+    ///
+    /// Any channel layout is reduced to plain greys, and an image that carries
+    /// real transparency is read through its alpha channel instead: an alpha
+    /// pack is usually black on transparent, and reading its colour would give
+    /// a stamp that does nothing at all.
+    fn load_alpha(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Images", &["png", "jpg", "jpeg", "bmp", "tga"])
+            .pick_file()
+        else {
+            return;
+        };
+        let img = match image::open(&path) {
+            Ok(i) => i,
+            Err(e) => {
+                self.ui.say(format!("could not read the image: {e}"));
+                return;
+            }
+        };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let transparent = rgba.pixels().any(|p| p.0[3] < 250);
+        let data: Vec<f32> = rgba
+            .pixels()
+            .map(|p| {
+                let [r, g, b, a] = p.0;
+                if transparent {
+                    a as f32 / 255.0
+                } else {
+                    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0
+                }
+            })
+            .collect();
+        let name = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        self.sculptor
+            .alphas
+            .push(std::sync::Arc::new(sculpt_core::Alpha::new(name, w, h, data)));
+        self.sculptor.brush.alpha = Some((self.sculptor.alphas.len() - 1) as u32);
+        self.ui.say("alpha loaded");
     }
 
     fn save_scene(&mut self) {

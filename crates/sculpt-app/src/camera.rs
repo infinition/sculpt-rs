@@ -124,6 +124,13 @@ impl Camera {
         (self.live.target - self.eye()).normalize_or(-Vec3::Z)
     }
 
+    /// Screen right, in world space. A brush alpha is printed along it, so the
+    /// stamp keeps the orientation it has on screen.
+    pub fn right(&self) -> Vec3 {
+        let v = self.view();
+        Vec3::new(v.x_axis.x, v.y_axis.x, v.z_axis.x).normalize_or(Vec3::X)
+    }
+
     pub fn view(&self) -> Mat4 {
         glam::camera::rh::view::look_at_mat4(self.eye(), self.live.target, Vec3::Y)
     }
