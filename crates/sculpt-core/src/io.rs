@@ -1,5 +1,6 @@
 //! Mesh import/export: OBJ, PLY, STL and a native scene file.
 
+use crate::brush::{BlendMode, Brush, BrushKind, Falloff, FillScope};
 use crate::mesh::{Mesh, Vertex};
 use crate::primitives::weld;
 use crate::scene::{Object, Scene, Transform};
@@ -628,4 +629,174 @@ pub fn save(mesh: &Mesh, path: &Path) -> IoResult<()> {
         Some("sculpt") => write_scene(&Scene::with_object(Object::new("mesh", mesh.clone())), path),
         other => Err(format!("unsupported format: {}", other.unwrap_or("(none)"))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// brush presets
+// ---------------------------------------------------------------------------
+
+/// A brush someone set up and gave a name to.
+#[derive(Clone, Debug)]
+pub struct NamedBrush {
+    pub name: String,
+    pub brush: Brush,
+}
+
+/// Extension for a saved set of brushes.
+pub const BRUSH_EXTENSION: &str = "brushes";
+
+/// Writes a set of brushes as plain text, one `key value` line per setting.
+///
+/// Text rather than a packed format on purpose: a brush is a handful of
+/// numbers, the file is something an artist may well want to read, diff or fix
+/// by hand, and a format nobody can open is a format nobody trusts.
+///
+/// The alpha is stored by name. Indices mean nothing across sessions, since the
+/// library is rebuilt from whatever has been loaded this time.
+pub fn write_brushes(brushes: &[NamedBrush], alphas: &[String], path: &Path) -> IoResult<()> {
+    let f = File::create(path).map_err(err)?;
+    let mut w = BufWriter::new(f);
+    writeln!(w, "sculpt-brushes 1").map_err(err)?;
+    for nb in brushes {
+        let b = &nb.brush;
+        // Names run to the end of their line and are never quoted, so a newline
+        // in one would split the file. Nothing else can get in.
+        writeln!(w, "brush {}", nb.name.replace(['\n', '\r'], " ")).map_err(err)?;
+        writeln!(w, "  kind {}", b.kind.label()).map_err(err)?;
+        writeln!(w, "  radius {:.6}", b.radius).map_err(err)?;
+        writeln!(w, "  strength {:.6}", b.strength).map_err(err)?;
+        writeln!(w, "  negative {}", b.negative).map_err(err)?;
+        writeln!(w, "  falloff {}", b.falloff.label()).map_err(err)?;
+        writeln!(w, "  culling {}", b.culling).map_err(err)?;
+        writeln!(w, "  lock_plane {}", b.lock_plane).map_err(err)?;
+        writeln!(w, "  auto_smooth {:.6}", b.auto_smooth).map_err(err)?;
+        writeln!(w, "  pressure_radius {}", b.pressure_radius).map_err(err)?;
+        writeln!(w, "  pressure_strength {}", b.pressure_strength).map_err(err)?;
+        writeln!(
+            w,
+            "  color {:.6} {:.6} {:.6}",
+            b.paint_color.x, b.paint_color.y, b.paint_color.z
+        )
+        .map_err(err)?;
+        writeln!(w, "  rough {:.6}", b.paint_rough).map_err(err)?;
+        writeln!(w, "  metal {:.6}", b.paint_metal).map_err(err)?;
+        writeln!(w, "  paint_albedo {}", b.paint_albedo).map_err(err)?;
+        writeln!(w, "  paint_material {}", b.paint_material).map_err(err)?;
+        writeln!(w, "  blend {}", b.blend.label()).map_err(err)?;
+        writeln!(w, "  flow {:.6}", b.flow).map_err(err)?;
+        writeln!(w, "  fill_scope {}", b.fill_scope.label()).map_err(err)?;
+        writeln!(w, "  fill_angle {:.6}", b.fill_angle).map_err(err)?;
+        writeln!(w, "  smudge_pickup {:.6}", b.smudge_pickup).map_err(err)?;
+        writeln!(w, "  alpha_angle {:.6}", b.alpha_angle).map_err(err)?;
+        writeln!(w, "  alpha_follow {}", b.alpha_follow).map_err(err)?;
+        if let Some(name) = b.alpha.and_then(|i| alphas.get(i as usize)) {
+            writeln!(w, "  alpha {}", name.replace(['\n', '\r'], " ")).map_err(err)?;
+        }
+        writeln!(w, "end").map_err(err)?;
+    }
+    w.flush().map_err(err)?;
+    Ok(())
+}
+
+/// Reads a set of brushes back.
+///
+/// `alphas` is the current library, by name, so a brush finds its stamp again.
+/// A brush whose alpha is not loaded keeps everything else and comes back
+/// round: losing a whole brush because one image is missing would be worse than
+/// losing the image.
+///
+/// Unknown keys are skipped rather than refused, so a file written by a later
+/// version still opens with whatever this one understands.
+pub fn read_brushes(path: &Path, alphas: &[String]) -> IoResult<Vec<NamedBrush>> {
+    let f = File::open(path).map_err(err)?;
+    let reader = BufReader::new(f);
+    let mut out: Vec<NamedBrush> = Vec::new();
+    let mut current: Option<NamedBrush> = None;
+
+    for line in reader.lines() {
+        let line = line.map_err(err)?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, rest) = match line.split_once(char::is_whitespace) {
+            Some((k, r)) => (k, r.trim()),
+            None => (line, ""),
+        };
+        match key {
+            "sculpt-brushes" => continue,
+            "brush" => {
+                if let Some(nb) = current.take() {
+                    out.push(nb);
+                }
+                current = Some(NamedBrush {
+                    name: if rest.is_empty() { "Brush".to_string() } else { rest.to_string() },
+                    brush: Brush::default(),
+                });
+            }
+            "end" => {
+                if let Some(nb) = current.take() {
+                    out.push(nb);
+                }
+            }
+            _ => {
+                let Some(nb) = current.as_mut() else { continue };
+                let b = &mut nb.brush;
+                let num = || rest.parse::<f32>().ok();
+                let flag = || matches!(rest, "true" | "1" | "yes");
+                match key {
+                    "kind" => {
+                        if let Some(k) = BrushKind::from_label(rest) {
+                            b.kind = k;
+                        }
+                    }
+                    "radius" => b.radius = num().unwrap_or(b.radius),
+                    "strength" => b.strength = num().unwrap_or(b.strength),
+                    "negative" => b.negative = flag(),
+                    "falloff" => {
+                        if let Some(f) = Falloff::from_label(rest) {
+                            b.falloff = f;
+                        }
+                    }
+                    "culling" => b.culling = flag(),
+                    "lock_plane" => b.lock_plane = flag(),
+                    "auto_smooth" => b.auto_smooth = num().unwrap_or(b.auto_smooth),
+                    "pressure_radius" => b.pressure_radius = flag(),
+                    "pressure_strength" => b.pressure_strength = flag(),
+                    "color" => {
+                        let v: Vec<f32> =
+                            rest.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                        if v.len() == 3 {
+                            b.paint_color = Vec3::new(v[0], v[1], v[2]);
+                        }
+                    }
+                    "rough" => b.paint_rough = num().unwrap_or(b.paint_rough),
+                    "metal" => b.paint_metal = num().unwrap_or(b.paint_metal),
+                    "paint_albedo" => b.paint_albedo = flag(),
+                    "paint_material" => b.paint_material = flag(),
+                    "blend" => {
+                        if let Some(m) = BlendMode::from_label(rest) {
+                            b.blend = m;
+                        }
+                    }
+                    "flow" => b.flow = num().unwrap_or(b.flow),
+                    "fill_scope" => {
+                        if let Some(s) = FillScope::from_label(rest) {
+                            b.fill_scope = s;
+                        }
+                    }
+                    "fill_angle" => b.fill_angle = num().unwrap_or(b.fill_angle),
+                    "smudge_pickup" => b.smudge_pickup = num().unwrap_or(b.smudge_pickup),
+                    "alpha_angle" => b.alpha_angle = num().unwrap_or(b.alpha_angle),
+                    "alpha_follow" => b.alpha_follow = flag(),
+                    "alpha" => b.alpha = alphas.iter().position(|n| n == rest).map(|i| i as u32),
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(nb) = current.take() {
+        out.push(nb);
+    }
+    Ok(out)
 }

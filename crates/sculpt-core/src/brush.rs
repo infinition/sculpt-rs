@@ -803,3 +803,20 @@ pub fn signed_angle_2d(a: Vec2, b: Vec2) -> f32 {
     let det = a.x * b.y - a.y * b.x;
     det.atan2(dot)
 }
+
+/// Looks an enum up by the label it prints. Every one of these lists is short
+/// and read once per line of a file, so a scan is the right amount of work.
+macro_rules! from_label {
+    ($ty:ty) => {
+        impl $ty {
+            pub fn from_label(text: &str) -> Option<Self> {
+                Self::ALL.iter().copied().find(|v| v.label() == text)
+            }
+        }
+    };
+}
+
+from_label!(BrushKind);
+from_label!(Falloff);
+from_label!(BlendMode);
+from_label!(FillScope);

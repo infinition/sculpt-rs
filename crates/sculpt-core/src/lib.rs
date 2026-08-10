@@ -821,6 +821,57 @@ mod tests {
     }
 
     #[test]
+    fn brush_roundtrip_preserves_settings() {
+        let mut brush = Brush::defaults_for(BrushKind::Crease);
+        brush.radius = 0.123;
+        brush.strength = 0.77;
+        brush.falloff = brush::Falloff::Sharp;
+        brush.blend = BlendMode::Multiply;
+        brush.paint_color = Vec3::new(0.2, 0.4, 0.6);
+        brush.lock_plane = true;
+        brush.alpha_follow = true;
+        brush.alpha_angle = 0.5;
+        brush.alpha = Some(1);
+
+        let alphas = vec!["Ring".to_string(), "Cracks".to_string()];
+        let saved = vec![io::NamedBrush { name: "My chisel".into(), brush }];
+        let path = std::env::temp_dir().join("sculpt_rs_roundtrip.brushes");
+        io::write_brushes(&saved, &alphas, &path).unwrap();
+        let back = io::read_brushes(&path, &alphas).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].name, "My chisel");
+        let b = back[0].brush;
+        assert_eq!(b.kind, BrushKind::Crease);
+        assert!((b.radius - 0.123).abs() < 1e-5);
+        assert!((b.strength - 0.77).abs() < 1e-5);
+        assert_eq!(b.falloff, brush::Falloff::Sharp);
+        assert_eq!(b.blend, BlendMode::Multiply);
+        assert!((b.paint_color - Vec3::new(0.2, 0.4, 0.6)).length() < 1e-5);
+        assert!(b.lock_plane);
+        assert!(b.alpha_follow);
+        // The stamp is found again by name, wherever it now sits.
+        assert_eq!(b.alpha, Some(1));
+    }
+
+    /// A brush whose stamp is not loaded must still come back, without one.
+    #[test]
+    fn a_brush_survives_a_missing_alpha() {
+        let mut brush = Brush::default();
+        brush.alpha = Some(0);
+        brush.strength = 0.31;
+        let saved = vec![io::NamedBrush { name: "Stamper".into(), brush }];
+        let path = std::env::temp_dir().join("sculpt_rs_missing_alpha.brushes");
+        io::write_brushes(&saved, &["Scanned stone".to_string()], &path).unwrap();
+        let back = io::read_brushes(&path, &[]).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].brush.alpha, None);
+        assert!((back[0].brush.strength - 0.31).abs() < 1e-5);
+    }
+
+    #[test]
     fn subdivision_quadruples_faces() {
         let m = primitives::icosphere(1);
         let s = topology::subdivide(&m, true);

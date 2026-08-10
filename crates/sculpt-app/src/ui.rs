@@ -17,7 +17,7 @@ use crate::theme::{ColorPreset, Metrics, Palette, Side, UiTheme};
 use crate::wheel::{self, Wheel};
 use crate::widgets::{self, BigSlider};
 use egui::{Align2, Color32, CornerRadius, Frame, Margin, Sense, Stroke, Vec2};
-use sculpt_core::{Axis, BlendMode, BrushKind, Falloff, FillScope, RemeshOptions, Sculptor};
+use sculpt_core::{io, Axis, BlendMode, BrushKind, Falloff, FillScope, RemeshOptions, Sculptor};
 use winit::keyboard::KeyCode;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,6 +86,8 @@ pub enum Action {
     PickColorMode,
     LoadAlpha,
     LoadMatcap,
+    SaveBrushes,
+    LoadBrushes,
     ResetBrushes,
     ResetTheme,
 }
@@ -216,6 +218,10 @@ pub struct UiState {
     pub floating: Vec<Tab>,
     /// Scheme the colour panel shows alongside the colour in hand.
     pub harmony: Harmony,
+    /// Brushes the artist built and named.
+    pub brushes: Vec<io::NamedBrush>,
+    /// Name being typed for the next one kept.
+    pub brush_name: String,
 }
 
 /// Colour schemes built off the hue in hand.
@@ -356,6 +362,8 @@ impl Default for UiState {
             matcap_image: None,
             floating: Vec::new(),
             harmony: Harmony::Analogous,
+            brushes: Vec::new(),
+            brush_name: String::new(),
         }
     }
 }
@@ -1181,10 +1189,88 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
         mask_controls(ui, st, cx);
     }
 
+    saved_brushes(ui, s, st, cx);
+
     ui.add_space(8.0);
     if widgets::wide_button(ui, Icon::Reset, "Reset every tool", m.row, false).clicked() {
         cx.actions.push(Action::ResetBrushes);
     }
+}
+
+/// Brushes the artist built and named, kept apart from the per-tool defaults.
+///
+/// Switching tools already remembers what each one was set to. This is the
+/// other thing people mean by a custom brush: a particular tool with a
+/// particular size, falloff, alpha and colour, worth keeping and coming back
+/// to, and worth carrying between sessions.
+fn saved_brushes(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
+    widgets::section_title(ui, "MY BRUSHES");
+
+    let mut apply = None;
+    let mut remove = None;
+    for (i, nb) in st.brushes.iter().enumerate() {
+        ui.horizontal(|ui| {
+            // Highlighted when the brush in hand looks like this one. Comparing
+            // the settings that carry the feel of it is enough, and reads the
+            // way the eye does.
+            let live = s.brush.kind == nb.brush.kind
+                && (s.brush.radius - nb.brush.radius).abs() < 1e-4
+                && (s.brush.strength - nb.brush.strength).abs() < 1e-4
+                && s.brush.falloff == nb.brush.falloff
+                && s.brush.alpha == nb.brush.alpha;
+            if widgets::wide_button(ui, Icon::of_brush(nb.brush.kind), &nb.name, m.row, live)
+                .clicked()
+            {
+                apply = Some(i);
+            }
+            if widgets::icon_button(ui, Icon::Trash, m.row, false, "Drop this brush").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if st.brushes.is_empty() {
+        ui.label(
+            egui::RichText::new("Nothing kept yet. Set a tool up the way you like it, then keep it.")
+                .small()
+                .color(p.dim),
+        );
+    }
+    if let Some(i) = apply {
+        let nb = st.brushes[i].clone();
+        s.set_brush_kind(nb.brush.kind);
+        s.brush = nb.brush;
+        st.say(format!("{} ready", nb.name));
+    }
+    if let Some(i) = remove {
+        let gone = st.brushes.remove(i);
+        st.say(format!("{} dropped", gone.name));
+    }
+
+    ui.horizontal(|ui| {
+        let width = ui.available_width();
+        ui.add_sized(
+            [width * 0.6, m.row],
+            egui::TextEdit::singleline(&mut st.brush_name).hint_text("Name"),
+        );
+        if widgets::wide_button(ui, Icon::Plus, "Keep", m.row, false).clicked() {
+            let name = if st.brush_name.trim().is_empty() {
+                format!("{} {}", s.brush.kind.label(), st.brushes.len() + 1)
+            } else {
+                st.brush_name.trim().to_string()
+            };
+            st.brushes.push(io::NamedBrush { name, brush: s.brush });
+            st.brush_name.clear();
+        }
+    });
+    ui.horizontal(|ui| {
+        if widgets::wide_button(ui, Icon::Save, "Save set", m.row, false).clicked() {
+            cx.actions.push(Action::SaveBrushes);
+        }
+        if widgets::wide_button(ui, Icon::Open, "Load set", m.row, false).clicked() {
+            cx.actions.push(Action::LoadBrushes);
+        }
+    });
 }
 
 /// The colour panel: a square, a hue strip, harmonies and a palette.

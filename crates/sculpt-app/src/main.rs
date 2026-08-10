@@ -589,6 +589,8 @@ impl State {
                     }
                 }
                 Action::FrameView => self.frame_view(),
+                Action::SaveBrushes => self.save_brushes(),
+                Action::LoadBrushes => self.load_brushes(),
                 Action::MatcapChanged => self.rebuild_matcap(),
                 Action::LoadMatcap => self.load_matcap(),
                 Action::SampleCountChanged(n) => {
@@ -765,6 +767,50 @@ impl State {
                 self.ui.say("scene opened");
             }
             Err(e) => self.ui.say(format!("could not open: {e}")),
+        }
+    }
+
+    /// The alpha library by name, which is how a saved brush refers to its
+    /// stamp: an index would mean nothing in the next session.
+    fn alpha_names(&self) -> Vec<String> {
+        self.sculptor.alphas.iter().map(|a| a.name.clone()).collect()
+    }
+
+    fn save_brushes(&mut self) {
+        if self.ui.brushes.is_empty() {
+            self.ui.say("nothing kept to save");
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("sculpt-rs brushes", &[io::BRUSH_EXTENSION])
+            .set_file_name(format!("mine.{}", io::BRUSH_EXTENSION))
+            .save_file()
+        else {
+            return;
+        };
+        match io::write_brushes(&self.ui.brushes, &self.alpha_names(), &path) {
+            Ok(()) => self.ui.say(format!("{} brushes saved", self.ui.brushes.len())),
+            Err(e) => self.ui.say(format!("save failed: {e}")),
+        }
+    }
+
+    fn load_brushes(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("sculpt-rs brushes", &[io::BRUSH_EXTENSION])
+            .pick_file()
+        else {
+            return;
+        };
+        match io::read_brushes(&path, &self.alpha_names()) {
+            Ok(loaded) => {
+                let n = loaded.len();
+                // Added to what is already there rather than replacing it: a
+                // set that came from somewhere else is usually meant to join
+                // the collection, not to wipe it.
+                self.ui.brushes.extend(loaded);
+                self.ui.say(format!("{n} brushes loaded"));
+            }
+            Err(e) => self.ui.say(format!("could not load: {e}")),
         }
     }
 
