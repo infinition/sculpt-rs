@@ -27,6 +27,9 @@ pub enum Gesture {
 /// reflex, so rather than pick one, each device gets a job you can change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
+    /// Sculpt on the model, spin the view off it. Decided where the press
+    /// landed, once, and held for the rest of that press.
+    Auto,
     Sculpt,
     Orbit,
     Pan,
@@ -35,15 +38,51 @@ pub enum Role {
 }
 
 impl Role {
-    pub const ALL: [Role; 5] = [Role::Sculpt, Role::Orbit, Role::Pan, Role::Zoom, Role::Nothing];
+    pub const ALL: [Role; 6] = [
+        Role::Auto,
+        Role::Sculpt,
+        Role::Orbit,
+        Role::Pan,
+        Role::Zoom,
+        Role::Nothing,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
+            Role::Auto => "Auto",
             Role::Sculpt => "Sculpt",
             Role::Orbit => "Orbit",
             Role::Pan => "Pan",
             Role::Zoom => "Zoom",
             Role::Nothing => "Nothing",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Role::Auto => "Press on the model to sculpt it, press off it to spin the view.",
+            Role::Sculpt => "Always draws with the current tool.",
+            Role::Orbit => "Always spins the view.",
+            Role::Pan => "Always slides the view.",
+            Role::Zoom => "Drag up and down to move closer and further.",
+            Role::Nothing => "Ignored.",
+        }
+    }
+
+    /// What this role means for a press that landed where it did.
+    ///
+    /// Only `Auto` cares where. It is the binding most people want and few
+    /// would think to ask for: the model is the canvas and the space around it
+    /// is the turntable, which is how you would handle the real thing.
+    fn resolve(self, target: PressTarget) -> Role {
+        match (self, target) {
+            // A press the interface has taken belongs to the interface,
+            // whatever the device is otherwise for. Without this, dragging a
+            // slider would also spin the model behind it.
+            (_, PressTarget::Ui) => Role::Nothing,
+            (Role::Auto, PressTarget::Model) => Role::Sculpt,
+            (Role::Auto, PressTarget::Space) => Role::Orbit,
+            (other, _) => other,
         }
     }
 
@@ -54,9 +93,22 @@ impl Role {
             Role::Pan => Some(Gesture::Pan(delta)),
             // Vertical travel reads as zoom, as it does everywhere else here.
             Role::Zoom => Some(Gesture::Wheel(-delta.y * 0.04)),
-            Role::Sculpt | Role::Nothing => None,
+            // An unresolved `Auto` never reaches here: it is settled at the
+            // moment of contact, when there is something to ask about.
+            Role::Auto | Role::Sculpt | Role::Nothing => None,
         }
     }
+}
+
+/// Where a press landed, which is all the automatic binding needs to know.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PressTarget {
+    /// On the model, or close enough to it for the brush to reach.
+    Model,
+    /// On empty space in the viewport.
+    Space,
+    /// On the interface, which has already claimed it.
+    Ui,
 }
 
 /// What each device does. Pen and touch are separate because a stylus usually
@@ -75,12 +127,15 @@ pub struct Bindings {
 
 impl Default for Bindings {
     fn default() -> Self {
+        // The three that touch the model decide on contact. A press that misses
+        // the model was never going to leave a mark anyway, so spending it on
+        // the view costs nothing and saves reaching for a modifier.
         Self {
-            left: Role::Sculpt,
+            left: Role::Auto,
             middle: Role::Orbit,
             right: Role::Orbit,
-            touch: Role::Sculpt,
-            pen: Role::Sculpt,
+            touch: Role::Auto,
+            pen: Role::Auto,
         }
     }
 }
@@ -143,7 +198,16 @@ pub struct Input {
     pub shift: bool,
     pub ctrl: bool,
     pub alt: bool,
+    /// What the mouse button now down settled on, for the roles that are
+    /// decided by where the press landed rather than in the settings.
+    ///
+    /// Held for the whole press: a drag that starts on the model must keep
+    /// sculpting once it wanders off the silhouette, and a drag that starts in
+    /// space must not start carving the moment it crosses the model.
+    held: Option<Role>,
     fingers: Vec<Finger>,
+    /// The same, for the finger or pen currently down.
+    held_touch: Option<Role>,
     /// True once a stroke was handed to the sculptor from a single finger.
     finger_stroke: bool,
     /// Set when a multi-finger gesture starts, so lifting back to one finger
@@ -178,6 +242,11 @@ impl Input {
         } else {
             return None;
         };
+        // Whatever the press decided stands until it is let go.
+        let role = match role {
+            Role::Auto => self.held.unwrap_or(Role::Orbit),
+            other => other,
+        };
         let role = match (role, self.shift) {
             (Role::Orbit, true) => Role::Pan,
             (r, _) => r,
@@ -185,15 +254,46 @@ impl Input {
         role.gesture(delta)
     }
 
-    /// Whether a press of this button should start a stroke.
-    pub fn sculpts(&self, button: winit::event::MouseButton, b: &Bindings) -> bool {
+    /// Settles what a press of this button does and reports whether it draws.
+    ///
+    /// `target` says what the press landed on, which is the only thing the
+    /// automatic binding needs to make up its mind. Call it on the release too,
+    /// with whatever target: the release only reads back what the press decided.
+    pub fn sculpts(
+        &mut self,
+        button: winit::event::MouseButton,
+        b: &Bindings,
+        down: bool,
+        target: PressTarget,
+    ) -> bool {
         let role = match button {
             winit::event::MouseButton::Left => b.left,
             winit::event::MouseButton::Middle => b.middle,
             winit::event::MouseButton::Right => b.right,
             _ => Role::Nothing,
         };
+        let role = if down {
+            let settled = role.resolve(target);
+            self.held = Some(settled);
+            settled
+        } else {
+            let settled = self.held.take().unwrap_or(role);
+            // A button going up while another is still down leaves that other
+            // one without its decision, so put the raw role back for it.
+            if self.lmb || self.mmb || self.rmb {
+                self.held = Some(settled);
+            }
+            settled
+        };
         role == Role::Sculpt && !self.alt
+    }
+
+    /// Whether the pointer needs a pick before the next press can be decided.
+    ///
+    /// Picking is not free at five million triangles, so it happens only for
+    /// the bindings that actually ask a question.
+    pub fn needs_pick(b: &Bindings) -> bool {
+        [b.left, b.middle, b.right, b.touch, b.pen].contains(&Role::Auto)
     }
 
     pub fn touch_active(&self) -> bool {
@@ -201,7 +301,23 @@ impl Input {
     }
 
     /// Feeds one touch event through the gesture recogniser.
-    pub fn on_touch(&mut self, touch: &Touch, over_ui: bool, b: &Bindings) -> Option<TouchOutcome> {
+    ///
+    /// `on_model` is whether the model lies under this contact, and only the
+    /// automatic binding reads it.
+    pub fn on_touch(
+        &mut self,
+        touch: &Touch,
+        over_ui: bool,
+        b: &Bindings,
+        on_model: bool,
+    ) -> Option<TouchOutcome> {
+        let target = if over_ui {
+            PressTarget::Ui
+        } else if on_model {
+            PressTarget::Model
+        } else {
+            PressTarget::Space
+        };
         let pos = Vec2::new(touch.location.x as f32, touch.location.y as f32);
         // A digitiser reports pressure; a fingertip does not. That is the only
         // signal we get to tell a stylus from a finger, and it is good enough
@@ -217,7 +333,17 @@ impl Input {
             })
             .unwrap_or(1.0)
             .clamp(0.05, 1.0);
-        let role = if is_pen { b.pen } else { b.touch };
+        let raw = if is_pen { b.pen } else { b.touch };
+        // A finger that is already down keeps the job it landed with; a new one
+        // decides now.
+        let role = match touch.phase {
+            TouchPhase::Started => {
+                let settled = raw.resolve(target);
+                self.held_touch = Some(settled);
+                settled
+            }
+            _ => self.held_touch.unwrap_or(raw),
+        };
 
         match touch.phase {
             TouchPhase::Started => {
@@ -292,6 +418,7 @@ impl Input {
                 let was_stroking = self.finger_stroke;
                 self.finger_stroke = false;
                 self.gesture_lock = false;
+                self.held_touch = None;
 
                 // Every finger is off: the sequence is over, so decide whether
                 // it was a tap, and whether it was the second of a pair.
@@ -378,5 +505,72 @@ impl Input {
             out.push(Gesture::Orbit(delta * 0.5));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::event::MouseButton;
+
+    #[test]
+    fn auto_sculpts_on_the_model_and_orbits_off_it() {
+        assert_eq!(Role::Auto.resolve(PressTarget::Model), Role::Sculpt);
+        assert_eq!(Role::Auto.resolve(PressTarget::Space), Role::Orbit);
+    }
+
+    /// A fixed binding must not start meaning something else because of where
+    /// the press landed. Only `Auto` asks the question.
+    #[test]
+    fn a_fixed_binding_ignores_where_the_press_landed() {
+        for role in [Role::Sculpt, Role::Orbit, Role::Pan, Role::Zoom, Role::Nothing] {
+            assert_eq!(role.resolve(PressTarget::Model), role);
+            assert_eq!(role.resolve(PressTarget::Space), role);
+        }
+    }
+
+    /// Dragging a slider must never also move the camera behind it.
+    #[test]
+    fn a_press_the_interface_took_does_nothing_else() {
+        for role in Role::ALL {
+            assert_eq!(role.resolve(PressTarget::Ui), Role::Nothing);
+        }
+    }
+
+    /// The decision is made once, on contact. A stroke that starts on the model
+    /// and wanders off it has to keep sculpting, or every stroke over an edge
+    /// would end by spinning the view.
+    #[test]
+    fn the_press_decides_once_and_the_drag_keeps_it() {
+        let mut input = Input::default();
+        let b = Bindings::default();
+        input.lmb = true;
+        assert!(input.sculpts(MouseButton::Left, &b, true, PressTarget::Model));
+        // Off the silhouette now, but still the same press.
+        assert!(input.mouse_navigation(Vec2::new(10.0, 0.0), &b).is_none());
+
+        input.lmb = false;
+        input.sculpts(MouseButton::Left, &b, false, PressTarget::Space);
+        input.lmb = true;
+        assert!(!input.sculpts(MouseButton::Left, &b, true, PressTarget::Space));
+        assert!(matches!(
+            input.mouse_navigation(Vec2::new(10.0, 0.0), &b),
+            Some(Gesture::Orbit(_))
+        ));
+    }
+
+    /// Picking costs real time on a dense model, so it must not happen for
+    /// bindings that were never going to look at the answer.
+    #[test]
+    fn only_the_automatic_binding_asks_for_a_pick() {
+        let fixed = Bindings {
+            left: Role::Sculpt,
+            middle: Role::Orbit,
+            right: Role::Orbit,
+            touch: Role::Sculpt,
+            pen: Role::Sculpt,
+        };
+        assert!(!Input::needs_pick(&fixed));
+        assert!(Input::needs_pick(&Bindings::default()));
     }
 }

@@ -4,8 +4,9 @@
 //! reaching for a menu. The six axis balls are projected through the camera
 //! every frame, sorted back to front so the near ones cover the far ones, and
 //! any of them can be clicked to swing round to that view. Holding the widget
-//! down locks the view, which is what you want when a stroke keeps nudging the
-//! camera.
+//! down locks the angle, which is what you want when a stroke keeps nudging the
+//! camera. Only the angle: sliding the model across and moving closer to it are
+//! still wanted while working on a fixed view.
 
 use crate::camera::{Camera, Projection, ViewPreset};
 use crate::icons::Icon;
@@ -237,7 +238,7 @@ impl NavWidget {
 
 
         // One press, three possible meanings, resolved by what happens next:
-        // move and it spins the model, wait and it locks the view, do neither
+        // move and it spins the model, wait and it locks the angle, do neither
         // and let go on an axis to swing round to it.
         let now = ui.input(|i| i.time);
         if response.is_pointer_button_down_on() && self.pressed_at.is_none() {
@@ -285,7 +286,7 @@ impl NavWidget {
         }
         if response.hovered() && action.is_none() {
             response.on_hover_text(
-                "Drag to spin the view.\nClick an axis to swing round to it.\nHold to lock.",
+                "Drag to spin the view.\nClick an axis to swing round to it.\nHold to lock the angle: pan and zoom keep working.",
             );
         }
         action
@@ -300,7 +301,7 @@ impl NavWidget {
         let (preset, alignment) = nearest_view(camera);
         let aligned = alignment > 0.995;
         let text = if camera.locked {
-            format!("{}  ·  locked", preset.label())
+            format!("{}  ·  angle locked", preset.label())
         } else {
             preset.label().to_string()
         };
@@ -345,7 +346,7 @@ impl NavWidget {
                 if camera.locked { Icon::Lock } else { Icon::Unlock },
                 b,
                 camera.locked,
-                "Lock the view",
+                "Lock the angle",
             )
             .clicked()
             {

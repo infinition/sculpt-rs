@@ -17,7 +17,7 @@ use camera::{Camera, Projection, ViewPreset};
 use gizmo::Gizmo;
 use glam::{Vec2, Vec3};
 
-use input::{Gesture, Input, TouchOutcome};
+use input::{Gesture, Input, PressTarget, TouchOutcome};
 use renderer::Renderer;
 use sculpt_core::{io, primitives, BrushKind, Mesh, Object, Sculptor, StrokeInput};
 use std::sync::Arc;
@@ -1197,7 +1197,19 @@ impl ApplicationHandler for App {
                     MouseButton::Right => st.input.rmb = down,
                     _ => {}
                 }
-                let sculpts = st.input.sculpts(button, &st.ui.bindings);
+                // Only ask the mesh where it is when a binding is waiting on the
+                // answer, and only on the way down.
+                let target = if egui_captured || st.ui.wheel.open {
+                    PressTarget::Ui
+                } else if down
+                    && Input::needs_pick(&st.ui.bindings)
+                    && st.pick_for_brush(st.input.cursor).is_some()
+                {
+                    PressTarget::Model
+                } else {
+                    PressTarget::Space
+                };
+                let sculpts = st.input.sculpts(button, &st.ui.bindings, down, target);
                 if down {
                     // The radial menu owns the pointer while it is up, then the
                     // gizmo gets first refusal, then the brush.
@@ -1210,7 +1222,17 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Touch(touch) => {
-                if let Some(outcome) = st.input.on_touch(&touch, egui_captured, &st.ui.bindings) {
+                let on_model = touch.phase == winit::event::TouchPhase::Started
+                    && Input::needs_pick(&st.ui.bindings)
+                    && st
+                        .pick_for_brush(Vec2::new(
+                            touch.location.x as f32,
+                            touch.location.y as f32,
+                        ))
+                        .is_some();
+                if let Some(outcome) =
+                    st.input.on_touch(&touch, egui_captured, &st.ui.bindings, on_model)
+                {
                     match outcome {
                         TouchOutcome::StrokeStart { at, pressure } => {
                             st.input.cursor = at;

@@ -2,10 +2,15 @@
 //!
 //! It has two faces, and which one you get follows the tool in your hand. On a
 //! sculpting tool it shows the sculpting tools. On a painting one it turns into
-//! a painting menu: the paint tools on an inner ring, the blend modes on the
-//! outer one, and the colour wheel beside it. Picking a sculpting tool takes
-//! you back. Showing blend modes to someone holding Clay would be noise, and a
-//! colour wheel they cannot use even more so.
+//! a painting menu: the paint tools on an inner ring, the blend modes around
+//! them, and the hue wrapped right around the outside, so there is still one
+//! disc rather than two things to aim at. Picking a sculpting tool takes you
+//! back. Showing blend modes to someone holding Clay would be noise, and a
+//! colour ring they cannot use even more so.
+//!
+//! The middle stays the pad in both faces. Size and force are wanted just as
+//! often while painting, and moving them somewhere else in half the menu would
+//! cost more than the colour square gains by sitting there.
 //!
 //! Nothing responds to hover alone. Sweeping the pointer across the menu on the
 //! way somewhere else must not silently change the tool, the size or the
@@ -20,6 +25,11 @@ use sculpt_core::{BlendMode, BrushKind, Sculptor};
 const PAD_FRACTION: f32 = 0.30;
 /// Full-scale travel for a pad drag, in points.
 const PAD_TRAVEL: f32 = 260.0;
+/// Where the hue ring begins, as a fraction of the outer radius.
+const HUE_INNER: f32 = 0.86;
+/// Size of the saturation and value square hanging below the menu, in points.
+const SV_WIDTH: f32 = 148.0;
+const SV_HEIGHT: f32 = 92.0;
 
 /// Sculpting tools, in the order they sit on the ring.
 const SCULPT_TOOLS: [BrushKind; 12] = [
@@ -46,13 +56,25 @@ const PAINT_TOOLS: [BrushKind; 5] = [
     BrushKind::Mask,
 ];
 
+/// How many swatches the palette holds.
+pub const SWATCHES: usize = 10;
+
+/// What the painting menu asks the rest of the application for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WheelRequest {
+    /// Start picking a colour off the model.
+    PickColor,
+}
+
 /// What the pointer took hold of when the button went down.
 enum Grab {
     None,
     /// Dragging the centre pad, with the values it started from.
     Pad { origin: Pos2, radius: f32, strength: f32 },
-    /// Dragging inside the colour wheel.
+    /// Dragging inside the saturation and value square.
     Colour,
+    /// Dragging around the hue ring.
+    Hue,
 }
 
 /// One slot on a ring.
@@ -66,8 +88,12 @@ pub struct Wheel {
     pub open: bool,
     /// Outer radius of the menu, in points.
     pub size: f32,
-    /// Show the colour wheel when a painting tool is in hand.
+    /// Show the colour ring when a painting tool is in hand.
     pub show_colors: bool,
+    /// Drop the hue ring to a grey ramp, for value studies.
+    pub grayscale: bool,
+    /// Saved colours, kept across sessions of the menu.
+    pub swatches: Vec<[f32; 3]>,
     /// Where the menu was summoned.
     center: Pos2,
     grab: Grab,
@@ -99,6 +125,8 @@ impl Default for Wheel {
             open: false,
             size: 168.0,
             show_colors: true,
+            grayscale: false,
+            swatches: Vec::new(),
             center: Pos2::ZERO,
             grab: Grab::None,
             last_sculpt: BrushKind::Clay,
@@ -144,9 +172,9 @@ impl Wheel {
         viewport: egui::Rect,
         s: &mut Sculptor,
         p: &Palette,
-    ) {
+    ) -> Option<WheelRequest> {
         if !self.open {
-            return;
+            return None;
         }
         let painting = s.brush.kind.paints();
         let with_colors = painting && self.show_colors;
@@ -154,29 +182,22 @@ impl Wheel {
         // Dim the whole window, but keep the menu itself in the viewport.
         let window = ctx.viewport_rect();
         let screen = viewport;
-        // The two discs must not touch: this menu is this radius, the colour
-        // wheel is 0.92 of it, and they need air between them.
-        let colour_gap = self.size * 2.1;
-        let colour_reach = if with_colors { colour_gap + self.size } else { 0.0 };
-        let margin = self.size + 20.0;
-
-        // Put the colour wheel on whichever side has room for it.
-        let colours_right = !with_colors || screen.right() - self.center.x > colour_reach + 20.0;
-        let (left_need, right_need) = if colours_right {
-            (margin, margin + colour_reach)
-        } else {
-            (margin + colour_reach, margin)
-        };
+        // One disc, whatever is in it: the colours live on its outermost ring
+        // rather than in a second wheel beside it. The square and the swatches
+        // hang below, so the room needed underneath is not the same as around.
+        let margin = self.size + 34.0;
+        let below = if with_colors { margin + SV_HEIGHT + 46.0 } else { margin };
         let center = Pos2::new(
             self.center.x.clamp(
-                screen.left() + left_need,
-                (screen.right() - right_need).max(screen.left() + left_need),
+                screen.left() + margin,
+                (screen.right() - margin).max(screen.left() + margin),
             ),
             self.center.y.clamp(
                 screen.top() + margin,
-                (screen.bottom() - margin).max(screen.top() + margin),
+                (screen.bottom() - below).max(screen.top() + margin),
             ),
         );
+        let mut request = None;
 
         // A plain layer painter, not an `Area`.
         //
@@ -222,43 +243,46 @@ impl Wheel {
             self.grab = Grab::None;
         }
 
-        let colour_center = with_colors.then(|| {
-            let dx = if colours_right { colour_gap } else { -colour_gap };
-            Pos2::new(center.x + dx, center.y)
-        });
-
-        // Take hold of the pad or the colour wheel as soon as the pointer is
-        // down over either of them, whether that press happened here or was the
-        // one that opened the menu.
+        // Take hold of the centre or the hue ring as soon as the pointer is down
+        // over either, whether that press happened here or was the one that
+        // opened the menu.
+        let hue_inner = self.size * HUE_INNER;
+        let square = Self::sv_rect(center, self.size);
         if down && matches!(self.grab, Grab::None) {
+            let from_center = (pointer - center).length();
             let pad = self.size * PAD_FRACTION;
-            let on_colour =
-                colour_center.is_some_and(|c| (pointer - c).length() <= self.size * 0.95);
-            if (pointer - center).length() <= pad {
+            if from_center <= pad {
                 self.grab = Grab::Pad {
                     origin: pointer,
                     radius: s.brush.radius,
                     strength: s.brush.strength,
                 };
-            } else if on_colour {
+            } else if with_colors && square.contains(pointer) {
                 self.grab = Grab::Colour;
+            } else if with_colors && from_center >= hue_inner && from_center <= self.size {
+                self.grab = Grab::Hue;
             }
         }
 
         painter.circle_filled(center, self.size, p.panel.gamma_multiply(0.96));
         painter.circle_stroke(center, self.size, Stroke::new(1.0, p.line));
 
+        if with_colors {
+            self.draw_hue_ring(&painter, center, pointer, hue_inner, s, p);
+        }
         if painting {
-            self.draw_paint_page(&painter, center, pointer, choose, s, p);
+            if let Some(r) = self.draw_paint_page(&painter, center, pointer, choose, s, p) {
+                request = Some(r);
+            }
         } else {
             self.draw_sculpt_page(&painter, center, pointer, choose, s, p);
         }
         self.draw_pad(&painter, center, pointer, s, p);
-        self.draw_gauges(&painter, center, s, p);
-
-        if let Some(c) = colour_center {
-            self.draw_colors(&painter, c, pointer, s, p);
+        if with_colors {
+            self.draw_sv_square(&painter, square, s, pointer, p);
+            self.draw_swatches(&painter, center, square, pointer, choose, s, p);
         }
+        self.draw_gauges(&painter, center, s, p);
 
         // Opened by holding a button, the menu belongs to that finger: it lives
         // until the finger lifts, and the lift is also the choice. The
@@ -268,6 +292,7 @@ impl Wheel {
             self.grab = Grab::None;
         }
         let _ = released;
+        request
     }
 
     // ---- pages ---------------------------------------------------------------
@@ -311,8 +336,16 @@ impl Wheel {
         pressed: bool,
         s: &mut Sculptor,
         p: &Palette,
-    ) {
+    ) -> Option<WheelRequest> {
         // Outer ring: how the colour combines with what is already there.
+        // The hue ring takes the outside when it is shown, so the tool rings
+        // move in to sit under it rather than through it.
+        let (blend_in, blend_out, tool_in, tool_out) = if self.show_colors {
+            (0.60, HUE_INNER - 0.02, 0.33, 0.58)
+        } else {
+            (0.74, 1.0, 0.40, 0.70)
+        };
+
         let blends: Vec<Slot> = BlendMode::ALL
             .iter()
             .map(|b| Slot {
@@ -321,11 +354,13 @@ impl Wheel {
                 selected: s.brush.blend == *b,
             })
             .collect();
-        if let Some(i) = self.ring(painter, center, pointer, pressed, 0.74, 1.0, &blends, p) {
+        if let Some(i) = self.ring(painter, center, pointer, pressed, blend_in, blend_out, &blends, p)
+        {
             s.brush.blend = BlendMode::ALL[i];
         }
 
-        // Inner ring: the painting tools, and the way back to sculpting.
+        // Inner ring: the painting tools, the two colour controls, and the way
+        // back to sculpting.
         let mut tools: Vec<Slot> = PAINT_TOOLS
             .iter()
             .map(|k| Slot {
@@ -334,19 +369,32 @@ impl Wheel {
                 selected: s.brush.kind == *k,
             })
             .collect();
+        tools.push(Slot { icon: Some(Icon::Palette), label: "Pick", selected: false });
+        tools.push(Slot {
+            icon: Some(Icon::Mask),
+            label: "Greys",
+            selected: self.grayscale,
+        });
         tools.push(Slot {
             icon: Some(Icon::of_brush(self.last_sculpt)),
             label: "Sculpt",
             selected: false,
         });
 
-        if let Some(i) = self.ring(painter, center, pointer, pressed, 0.40, 0.70, &tools, p) {
-            if i < PAINT_TOOLS.len() {
+        let mut request = None;
+        if let Some(i) = self.ring(painter, center, pointer, pressed, tool_in, tool_out, &tools, p) {
+            let paints = PAINT_TOOLS.len();
+            if i < paints {
                 s.set_brush_kind(PAINT_TOOLS[i]);
+            } else if i == paints {
+                request = Some(WheelRequest::PickColor);
+            } else if i == paints + 1 {
+                self.grayscale = !self.grayscale;
             } else {
                 s.set_brush_kind(self.last_sculpt);
             }
         }
+        request
     }
 
     /// Draws one ring of slots and reports the index a press landed on.
@@ -531,46 +579,117 @@ impl Wheel {
         arc(-PI * 0.38, -PI * 0.38 + PI * 0.76 * strength_t, r, 3.0, p.accent);
     }
 
-    // ---- colour wheel --------------------------------------------------------
+    // ---- colour --------------------------------------------------------------
 
-    fn draw_colors(
+    /// The outermost ring: hue, or a grey ramp when the value mode is on.
+    fn draw_hue_ring(
         &self,
         painter: &Painter,
         center: Pos2,
         pointer: Pos2,
+        inner: f32,
         s: &mut Sculptor,
         p: &Palette,
     ) {
-        let outer = self.size * 0.92;
-        let inner = outer * 0.78;
+        let outer = self.size;
         let current = s.brush.paint_color;
-        let (mut hue, mut sat, mut val) = rgb_to_hsv(current.x, current.y, current.z);
+        let (mut hue, sat, val) = rgb_to_hsv(current.x, current.y, current.z);
 
-        // Hue ring, drawn as a fan of coloured wedges.
-        let steps = 96;
+        let steps = 120;
         for i in 0..steps {
             let a0 = i as f32 / steps as f32 * std::f32::consts::TAU;
             let a1 = (i + 1) as f32 / steps as f32 * std::f32::consts::TAU;
-            let (r, g, b) = hsv_to_rgb(i as f32 / steps as f32, 1.0, 1.0);
-            let colour =
-                Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
-            let quad = vec![
-                Pos2::new(center.x + inner * a0.cos(), center.y + inner * a0.sin()),
-                Pos2::new(center.x + outer * a0.cos(), center.y + outer * a0.sin()),
-                Pos2::new(center.x + outer * a1.cos(), center.y + outer * a1.sin()),
-                Pos2::new(center.x + inner * a1.cos(), center.y + inner * a1.sin()),
-            ];
-            painter.add(Shape::convex_polygon(quad, colour, Stroke::NONE));
+            let t = i as f32 / steps as f32;
+            let (r, g, b) = if self.grayscale {
+                // A ramp that runs black to white and back, so both ends of the
+                // value scale are reachable without crossing the whole ring.
+                let v = 1.0 - (t * 2.0 - 1.0).abs();
+                (v, v, v)
+            } else {
+                hsv_to_rgb(t, 1.0, 1.0)
+            };
+            let colour = Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
+            painter.add(Shape::convex_polygon(
+                vec![
+                    Pos2::new(center.x + inner * a0.cos(), center.y + inner * a0.sin()),
+                    Pos2::new(center.x + outer * a0.cos(), center.y + outer * a0.sin()),
+                    Pos2::new(center.x + outer * a1.cos(), center.y + outer * a1.sin()),
+                    Pos2::new(center.x + inner * a1.cos(), center.y + inner * a1.sin()),
+                ],
+                colour,
+                Stroke::NONE,
+            ));
         }
 
-        // The saturation and value square, inscribed in the ring.
-        //
-        // One quad with four corner colours is exactly right here: value times
-        // the white-to-hue ramp is bilinear in the two axes, so the hardware
-        // interpolator draws the whole square for free.
-        let half = inner * 0.68;
-        let square = Rect::from_center_size(center, Vec2::splat(half * 2.0));
-        let (hr, hg, hb) = hsv_to_rgb(hue, 1.0, 1.0);
+        if matches!(self.grab, Grab::Hue) {
+            let offset = pointer - center;
+            let t = (offset.y.atan2(offset.x) / std::f32::consts::TAU).rem_euclid(1.0);
+            let (r, g, b) = if self.grayscale {
+                let v = 1.0 - (t * 2.0 - 1.0).abs();
+                (v, v, v)
+            } else {
+                hue = t;
+                hsv_to_rgb(hue, sat.max(0.05), val.max(0.05))
+            };
+            s.brush.paint_color = glam::Vec3::new(r, g, b);
+        }
+
+        // Marker on the ring, at the current hue.
+        let angle = if self.grayscale {
+            // Value maps onto the same folded ramp the ring was drawn with.
+            let v = 0.299 * current.x + 0.587 * current.y + 0.114 * current.z;
+            (v * 0.5) * std::f32::consts::TAU
+        } else {
+            hue * std::f32::consts::TAU
+        };
+        let mid = (inner + outer) * 0.5;
+        painter.circle_stroke(
+            Pos2::new(center.x + mid * angle.cos(), center.y + mid * angle.sin()),
+            (outer - inner) * 0.44,
+            Stroke::new(2.0, p.text),
+        );
+    }
+
+    /// Where the saturation and value square sits: under the disc, so the pad
+    /// keeps the middle and size and force stay reachable while painting.
+    fn sv_rect(center: Pos2, size: f32) -> Rect {
+        Rect::from_min_size(
+            Pos2::new(center.x - SV_WIDTH * 0.5, center.y + size + 18.0),
+            Vec2::new(SV_WIDTH, SV_HEIGHT),
+        )
+    }
+
+    /// Saturation across, value up, for the hue the ring is holding.
+    fn draw_sv_square(
+        &self,
+        painter: &Painter,
+        square: Rect,
+        s: &mut Sculptor,
+        pointer: Pos2,
+        p: &Palette,
+    ) {
+        let current = s.brush.paint_color;
+        let (hue, mut sat, mut val) = rgb_to_hsv(current.x, current.y, current.z);
+
+        if matches!(self.grab, Grab::Colour) {
+            sat = ((pointer.x - square.left()) / square.width()).clamp(0.0, 1.0);
+            val = ((square.bottom() - pointer.y) / square.height()).clamp(0.0, 1.0);
+            let (r, g, b) = if self.grayscale {
+                (val, val, val)
+            } else {
+                hsv_to_rgb(hue, sat, val)
+            };
+            s.brush.paint_color = glam::Vec3::new(r, g, b);
+        }
+
+        // One quad with four corner colours is exactly right: value times the
+        // white-to-hue ramp is bilinear in the two axes, so the interpolator
+        // draws the whole square for free.
+        let (hr, hg, hb) = if self.grayscale {
+            (1.0, 1.0, 1.0)
+        } else {
+            hsv_to_rgb(hue, 1.0, 1.0)
+        };
         let hue_colour =
             Color32::from_rgb((hr * 255.0) as u8, (hg * 255.0) as u8, (hb * 255.0) as u8);
         let mut mesh = Mesh::default();
@@ -583,35 +702,9 @@ impl Wheel {
         painter.add(Shape::mesh(mesh));
         painter.rect_stroke(
             square,
-            egui::CornerRadius::same(2),
+            egui::CornerRadius::same(3),
             Stroke::new(1.0, p.line),
             egui::StrokeKind::Outside,
-        );
-
-        // Colour follows the pointer only while it is being dragged here, so
-        // crossing the wheel on the way past leaves the colour alone.
-        let offset = pointer - center;
-        if matches!(self.grab, Grab::Colour) {
-            if offset.length() > inner * 0.9 {
-                hue = (offset.y.atan2(offset.x) / std::f32::consts::TAU).rem_euclid(1.0);
-            } else {
-                sat = ((pointer.x - square.left()) / square.width()).clamp(0.0, 1.0);
-                val = ((square.bottom() - pointer.y) / square.height()).clamp(0.0, 1.0);
-            }
-            let (r, g, b) = hsv_to_rgb(hue, sat, val);
-            s.brush.paint_color = glam::Vec3::new(r, g, b);
-        }
-
-        // Markers for where the current colour sits.
-        let hue_angle = hue * std::f32::consts::TAU;
-        let ring_mid = (inner + outer) * 0.5;
-        painter.circle_stroke(
-            Pos2::new(
-                center.x + ring_mid * hue_angle.cos(),
-                center.y + ring_mid * hue_angle.sin(),
-            ),
-            (outer - inner) * 0.42,
-            Stroke::new(2.0, p.text),
         );
         painter.circle_stroke(
             Pos2::new(
@@ -622,19 +715,88 @@ impl Wheel {
             Stroke::new(1.6, if val > 0.55 { Color32::BLACK } else { Color32::WHITE }),
         );
 
-        let (r, g, b) = hsv_to_rgb(hue, sat, val);
+        let c = s.brush.paint_color;
         painter.text(
-            Pos2::new(center.x, center.y + outer + 14.0),
+            Pos2::new(square.center().x, square.bottom() + 11.0),
             Align2::CENTER_CENTER,
             format!(
                 "#{:02X}{:02X}{:02X}",
-                (r * 255.0) as u8,
-                (g * 255.0) as u8,
-                (b * 255.0) as u8
+                (c.x.clamp(0.0, 1.0) * 255.0) as u8,
+                (c.y.clamp(0.0, 1.0) * 255.0) as u8,
+                (c.z.clamp(0.0, 1.0) * 255.0) as u8
             ),
-            FontId::monospace(12.0),
+            FontId::monospace(11.0),
             p.text,
         );
+    }
+
+    /// A row of saved colours under the square, with a slot for adding one.
+    ///
+    /// A press adds or picks; a press on a saved colour while the value mode is
+    /// on drops it to its own grey, which is how a value study is set up.
+    fn draw_swatches(
+        &mut self,
+        painter: &Painter,
+        center: Pos2,
+        square: Rect,
+        pointer: Pos2,
+        choose: bool,
+        s: &mut Sculptor,
+        p: &Palette,
+    ) {
+        let cell = 22.0;
+        let gap = 5.0;
+        let count = self.swatches.len().min(SWATCHES) + 1; // the last one adds
+        let width = count as f32 * cell + (count - 1) as f32 * gap;
+        let top = square.bottom() + 20.0;
+        let left = center.x - width * 0.5;
+
+        for i in 0..count {
+            let rect = Rect::from_min_size(
+                Pos2::new(left + i as f32 * (cell + gap), top),
+                Vec2::splat(cell),
+            );
+            let over = rect.contains(pointer);
+            let adding = i == count - 1;
+            if adding {
+                painter.rect(
+                    rect,
+                    egui::CornerRadius::same(6),
+                    p.panel,
+                    Stroke::new(1.0, if over { p.accent } else { p.line }),
+                    egui::StrokeKind::Inside,
+                );
+                icons::paint(
+                    painter,
+                    icons::centered_rect(rect, cell * 0.6),
+                    Icon::Plus,
+                    if over { p.accent } else { p.dim },
+                );
+                if choose && over {
+                    let c = s.brush.paint_color;
+                    self.swatches.push([c.x, c.y, c.z]);
+                    if self.swatches.len() > SWATCHES {
+                        self.swatches.remove(0);
+                    }
+                }
+            } else {
+                let c = self.swatches[i];
+                painter.rect(
+                    rect,
+                    egui::CornerRadius::same(6),
+                    Color32::from_rgb(
+                        (c[0].clamp(0.0, 1.0) * 255.0) as u8,
+                        (c[1].clamp(0.0, 1.0) * 255.0) as u8,
+                        (c[2].clamp(0.0, 1.0) * 255.0) as u8,
+                    ),
+                    Stroke::new(if over { 2.0 } else { 1.0 }, if over { p.accent } else { p.line }),
+                    egui::StrokeKind::Inside,
+                );
+                if choose && over {
+                    s.brush.paint_color = glam::Vec3::from_array(c);
+                }
+            }
+        }
     }
 }
 

@@ -79,9 +79,13 @@ pub struct Camera {
     /// Radians of orbit per pixel of drag.
     pub orbit_speed: f32,
     pub invert_orbit_y: bool,
-    /// Blocks navigation input. Explicit commands, like snapping to a named
-    /// view, still go through: the lock is there to stop a stroke nudging the
-    /// camera, not to freeze the whole application.
+    /// Holds the viewing angle still. Panning and zooming keep working, and so
+    /// do explicit commands like snapping to a named view.
+    ///
+    /// The lock is there for the moment you have found the angle you want and
+    /// are painting or sculpting on it, where every stray drag costs you the
+    /// view. In that moment you still need to slide the model across and get
+    /// closer to it, so only the rotation is held.
     pub locked: bool,
 }
 
@@ -173,9 +177,6 @@ impl Camera {
     }
 
     pub fn pan(&mut self, dx: f32, dy: f32, viewport_h: f32) {
-        if self.locked {
-            return;
-        }
         // Scale so a pixel of drag moves the same amount of surface regardless
         // of zoom level.
         let half = match self.projection {
@@ -190,17 +191,11 @@ impl Camera {
     }
 
     pub fn zoom(&mut self, scroll: f32) {
-        if self.locked {
-            return;
-        }
         self.goal.distance = (self.goal.distance * (1.0 - scroll * 0.12)).clamp(0.02, 200.0);
     }
 
     /// Multiplicative zoom, for pinch gestures.
     pub fn zoom_by(&mut self, factor: f32) {
-        if self.locked {
-            return;
-        }
         self.goal.distance = (self.goal.distance / factor.max(1e-3)).clamp(0.02, 200.0);
     }
 

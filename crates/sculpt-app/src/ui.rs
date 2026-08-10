@@ -305,7 +305,11 @@ pub fn draw(
                 }
                 NavAction::ToggleLock => {
                     cam.locked = !cam.locked;
-                    st.say(if cam.locked { "view locked" } else { "view unlocked" });
+                    st.say(if cam.locked {
+                        "angle locked, pan and zoom still free"
+                    } else {
+                        "angle unlocked"
+                    });
                 }
                 NavAction::Orbit(d) => cam.orbit(d.x, d.y),
             }
@@ -358,7 +362,11 @@ pub fn draw(
     let _ = cursor;
 
     // Last, so it covers everything else while it is up.
-    st.wheel.show(root.ctx(), viewport, s, &p);
+    if let Some(crate::wheel::WheelRequest::PickColor) = st.wheel.show(root.ctx(), viewport, s, &p) {
+        st.picking_color = true;
+        st.wheel.close();
+        st.say("pick a colour from the model");
+    }
 
     actions
 }
@@ -708,10 +716,17 @@ fn settings_dock(
     cx: &mut Ctx,
 ) {
     let (p, m) = (cx.p, cx.m);
+    // Fixed width, set by the slider in the UI tab rather than by dragging the
+    // edge.
+    //
+    // A resizable panel remembers the size its content reported last frame, so
+    // one widget overflowing by a few points makes the panel wider, and a wider
+    // panel gives that widget more room to overflow into. That loop is what
+    // walked the dock out to its maximum in the tabs carrying the most
+    // controls. Taking the width from our own state breaks it outright.
     dock("panel", st.theme.panel_side)
-        .default_size(m.panel_width)
-        .size_range(200.0..=680.0)
-        .resizable(true)
+        .exact_size(m.panel_width)
+        .resizable(false)
         .frame(
             Frame::new()
                 .fill(p.panel)
@@ -1524,7 +1539,15 @@ fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
         if let Some(i) = widgets::segmented(ui, &labels, current, m.row) {
             *role = Role::ALL[i];
         }
+        ui.label(egui::RichText::new(role.hint()).small().color(p.faint));
     }
+    ui.label(
+        egui::RichText::new(
+            "Auto asks the model: a press that lands on it draws, a press that lands off it spins the view, and the answer holds for the whole drag. The brush reach counts as on the model, so the silhouette is still grabbable.",
+        )
+        .small()
+        .color(p.dim),
+    );
     ui.label(
         egui::RichText::new(
             "Alt with the left button always orbits, whatever the buttons are set to, and shift turns an orbit into a pan.",
@@ -1635,7 +1658,9 @@ fn viewport_overlay(
         }
     }
 
-    let rect = ctx.content_rect();
+    // The statistics belong to the viewport, not the window: measured against
+    // the window they slide under the tool rail.
+    let rect = st.viewport;
 
     if st.show_stats {
         let text = format!(
