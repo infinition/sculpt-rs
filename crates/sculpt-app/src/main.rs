@@ -891,7 +891,7 @@ impl State {
                         self.ui.say("voxel off: the surface is now a mesh");
                     } else {
                         let n = self.sculptor.mesh().face_count();
-                        self.sculptor.voxelize_active_res(200);
+                        self.sculptor.voxelize_active_res(128);
                         let out = self.sculptor.mesh().face_count();
                         self.ui.say(format!(
                             "voxel on: {n} triangles -> field -> {out} triangles"
