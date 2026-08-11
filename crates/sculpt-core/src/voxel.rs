@@ -98,11 +98,12 @@ impl VoxelField {
         let idx = |i: usize, j: usize, k: usize| (k * ny + j) * nx + i;
 
         // Unsigned distance inside a narrow band around every triangle. The
-        // minimum is an atomic op because triangles overlap in the band.
+        // minimum is an atomic op because triangles overlap in the band. A
+        // voxel no triangle reaches keeps the far sentinel, so the sparse
+        // field below only receives the voxels actually near the surface.
+        let far = (h * 1000.0).to_bits();
         let mut field: Vec<f32> = {
-            let cells: Vec<AtomicU32> = (0..total)
-                .map(|_| AtomicU32::new(band.to_bits()))
-                .collect();
+            let cells: Vec<AtomicU32> = (0..total).map(|_| AtomicU32::new(far)).collect();
             mesh.faces.par_iter().for_each(|tri| {
                 let a = mesh.pos[tri[0] as usize];
                 let b = mesh.pos[tri[1] as usize];
@@ -260,6 +261,7 @@ impl VoxelField {
             .entry((cx, cy, cz))
             .or_insert_with(|| Box::new([OUTSIDE; CHUNK * CHUNK * CHUNK]));
         chunk[flat(li, lj, lk)] = v;
+        self.dirty.insert((cx, cy, cz));
     }
 
     /// The value at a voxel, or far outside when its chunk does not exist.

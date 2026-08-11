@@ -90,6 +90,9 @@ pub enum Action {
     LoadBrushes,
     ResetBrushes,
     ResetTheme,
+    /// Toggle voxel sculpting: the brush stamps a voxel field instead of the
+    /// mesh, so the cost of a dab stops depending on the polygon count.
+    ToggleVoxel,
 }
 
 /// Where things that pop up should appear.

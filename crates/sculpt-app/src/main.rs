@@ -885,6 +885,20 @@ impl State {
                     let n = self.sculptor.mesh().face_count();
                     self.ui.say(format!("remeshed to {n} triangles"));
                 }
+                Action::ToggleVoxel => {
+                    if self.sculptor.voxel_mode() {
+                        self.sculptor.exit_voxel();
+                        self.ui.say("voxel off: the surface is now a mesh");
+                    } else {
+                        let n = self.sculptor.mesh().face_count();
+                        self.sculptor.voxelize_active_res(200);
+                        let out = self.sculptor.mesh().face_count();
+                        self.ui.say(format!(
+                            "voxel on: {n} triangles -> field -> {out} triangles"
+                        ));
+                    }
+                    self.full_resync = true;
+                }
                 Action::CloseHoles => {
                     let n = self.sculptor.close_holes();
                     self.full_resync = true;
@@ -1211,6 +1225,7 @@ impl State {
             }
             KeyCode::KeyG => self.ui.settings.grid = !self.ui.settings.grid,
             KeyCode::KeyF => actions.push(Action::FrameView),
+            KeyCode::KeyV => actions.push(Action::ToggleVoxel),
             KeyCode::KeyH => self.ui.show_help = !self.ui.show_help,
             KeyCode::KeyT => self.gizmo.mode = ui::next_gizmo_mode(self.gizmo.mode),
             KeyCode::Tab => self.ui.show_panel = !self.ui.show_panel,
@@ -1303,6 +1318,11 @@ impl State {
         self.ui.draw_calls = active_ranges.map(|r| r.len() as u32).unwrap_or(0);
         let object = self.sculptor.scene.active;
         let changed = self.sculptor.verts_dirty || self.sculptor.topology_dirty;
+        // In voxel mode the surface is a new mesh every dab, so the sparse
+        // update has nothing to build on: the whole small surface goes in full.
+        if self.sculptor.voxel_mode() && changed {
+            self.full_resync = true;
+        }
         let sparse_ok = self.ui.settings.gpu_scatter
             && !self.full_resync
             && !fully_dirty

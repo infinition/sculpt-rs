@@ -30,6 +30,7 @@ pub use mesh::{Mesh, Vertex};
 pub use query::Hit;
 pub use scene::{Object, Scene, Transform};
 pub use topology::RemeshOptions;
+pub use voxel::VoxelField;
 
 use glam::Vec3;
 
@@ -67,6 +68,11 @@ pub struct Sculptor {
     /// no graphics dependency, so it is told rather than asking, and `None`
     /// simply means no check.
     pub max_gpu_verts: Option<usize>,
+    /// When set, the active object sculpts through the voxel field rather than
+    /// the mesh: a dab stamps the field and the surface is extracted back into
+    /// the mesh. The cost stops depending on the polygon count.
+    pub voxel_field: Option<VoxelField>,
+    pub voxel_mode: bool,
     stroking: bool,
     stroke_state: brush::StrokeState,
 }
@@ -93,6 +99,8 @@ impl Sculptor {
             verts_dirty: true,
             topology_dirty: true,
             max_gpu_verts: None,
+            voxel_field: None,
+            voxel_mode: false,
             stroking: false,
             stroke_state: brush::StrokeState::default(),
             scene,
@@ -171,6 +179,60 @@ impl Sculptor {
         self.topology_dirty = true;
     }
 
+    // ---- voxel sculpting ----------------------------------------------------
+
+    pub fn voxel_mode(&self) -> bool {
+        self.voxel_mode
+    }
+
+    /// Voxelises the active mesh into a field at `h` voxels a side of world
+    /// units, and replaces the mesh with the extracted surface. After this the
+    /// brush stamps the field and the surface is re-extracted, so the cost of
+    /// a dab depends on the voxel size, not the mesh it came from.
+    pub fn voxelize_active(&mut self, h: f32) {
+        let mesh = self.mesh();
+        if mesh.faces.is_empty() {
+            return;
+        }
+        let mut field = VoxelField::from_mesh(mesh, h);
+        let surface = field.extract();
+        self.voxel_field = Some(field);
+        self.voxel_mode = true;
+        if let Some(o) = self.scene.active_mut() {
+            o.mesh = surface;
+        }
+        self.mark_all_dirty();
+    }
+
+    /// Voxelises at a resolution in voxels across the model's largest side.
+    pub fn voxelize_active_res(&mut self, res: usize) {
+        let (lo, hi) = self.mesh().bounds();
+        let extent = (hi - lo).max_element().max(1e-6);
+        self.voxelize_active(extent / res.max(16) as f32);
+    }
+
+    /// One voxel dab: stamps the field and extracts the surface back into the
+    /// active mesh. Returns false when no field is live.
+    pub fn voxel_dab(&mut self, point: Vec3, radius: f32, amount: f32) -> bool {
+        let Some(field) = &mut self.voxel_field else {
+            return false;
+        };
+        field.stamp(point, radius, amount);
+        let surface = field.extract_modified();
+        let active = self.scene.active;
+        if let Some(o) = self.scene.objects.get_mut(active) {
+            o.mesh = surface;
+        }
+        self.mark_all_dirty();
+        true
+    }
+
+    /// Leaves voxel mode, keeping the extracted surface as the object's mesh.
+    pub fn exit_voxel(&mut self) {
+        self.voxel_field = None;
+        self.voxel_mode = false;
+    }
+
     // ---- strokes ------------------------------------------------------------
 
     /// Opens a stroke.
@@ -247,6 +309,20 @@ impl Sculptor {
     }
 
     fn dab(&mut self, input: &StrokeInput) {
+        if self.voxel_mode {
+            // The mesh is not deformed in voxel mode: the brush stamps the
+            // field, and the extracted surface becomes the mesh. The cost of
+            // the dab depends on the voxel size, not the polygon count.
+            let radius = self.local_radius();
+            let sign = if self.brush.negative && self.brush.kind.has_negative() {
+                -1.0
+            } else {
+                1.0
+            };
+            let amount = sign * self.brush.strength * 0.6;
+            self.voxel_dab(input.point, radius, amount);
+            return;
+        }
         let deforms = self.brush.kind.deforms();
         let radius = self.local_radius();
         let brush = Brush { radius, ..self.brush };
@@ -673,6 +749,26 @@ impl ExtractExt for Mesh {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Voxel mode sculpts a mesh by stamping the field, and the surface it
+    /// extracts is a closed mesh that a stamp grows.
+    #[test]
+    fn voxel_mode_sculpts_the_field_and_grows_the_surface() {
+        let mut s = Sculptor::new(primitives::icosphere(4));
+        s.voxelize_active_res(160);
+        let before = s.mesh().face_count();
+        assert!(before > 500, "voxelised shell too small: {before}");
+        assert!(s.voxel_mode());
+        let (lo, hi) = s.mesh().bounds();
+        let top = Vec3::new(0.0, hi.y, 0.0);
+        for _ in 0..10 {
+            assert!(s.voxel_dab(top, (hi.y - lo.y) * 0.08, 0.4));
+        }
+        assert!(s.mesh().face_count() > before, "stamps did not grow the shell");
+        s.exit_voxel();
+        assert!(!s.voxel_mode());
+        assert!(s.voxel_field.is_none());
+    }
 
     /// Checks that adjacency agrees with the face array in both directions.
     fn validate(m: &Mesh) {
