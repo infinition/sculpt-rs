@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon.png" alt="sculpt-rs" width="128">
+</p>
+
 # sculpt-rs
 
 A real-time 3D sculpting tool written in Rust, with dynamic topology and a
