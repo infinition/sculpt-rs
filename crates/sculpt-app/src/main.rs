@@ -1318,10 +1318,12 @@ impl State {
         self.ui.draw_calls = active_ranges.map(|r| r.len() as u32).unwrap_or(0);
         let object = self.sculptor.scene.active;
         let changed = self.sculptor.verts_dirty || self.sculptor.topology_dirty;
-        // In voxel mode the surface is a new mesh every dab, so the sparse
-        // update has nothing to build on: the whole small surface goes in full.
+        // In voxel mode the surface mutates only in the written chunks, and
+        // the field records exactly which vertices and faces moved, so the
+        // sparse upload sends just those. The active object is the one being
+        // sculpted, so it is the one whose slots are dirty.
         if self.sculptor.voxel_mode() && changed {
-            self.full_resync = true;
+            self.dirty_object = Some(object);
         }
         let sparse_ok = self.ui.settings.gpu_scatter
             && !self.full_resync
