@@ -446,7 +446,19 @@ only the cells the surface touches reaches 2048 a side inside 200 MB.
 **Done when.** A remesh at 1024 completes where 400 currently refuses, memory
 stays under 200 MB, and the watertight test still passes.
 
-**Effort.** 1 week.
+**Effort.** 1 week. **The field now exists as the sculptable truth, in
+`voxel.rs`.** A scalar implicit function stored sparsely in 16-cubed chunks
+that only exist near the surface, with surface-nets extraction, a brush stamp
+whose cost is a fixed number of voxels, and a voxelisation of a triangle mesh.
+The surface is extracted incrementally: the field caches the vertex and
+triangles of every cell, and a dab re-extracts only the chunks it wrote and
+their halo, so a dab costs about 3 to 5 ms whatever the model. `voxel_bench`
+shows the point: voxelising a 1.5-million and a 5.2-million icosphere pays the
+triangle count once, then sculpting both costs the same across 3.5x the
+triangles. What remains is the work of making it the live surface rather than
+a proof: the application sculpting it instead of the mesh, which the extracted
+mesh slots into the existing renderer unchanged. The corner solve stays under
+T3.
 
 ### T3. The corner solve
 
