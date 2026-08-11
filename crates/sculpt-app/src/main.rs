@@ -81,6 +81,12 @@ struct State {
     /// Whether the interface asked to be drawn again soon, which it does while
     /// a panel is sliding, a tooltip is fading or a text cursor is blinking.
     egui_animating: bool,
+    /// What one dab of the current brush costs, in milliseconds, smoothed.
+    ///
+    /// What decides how finely a pointer movement is cut up. Measured rather
+    /// than guessed, because the same brush costs a thousand times more on a
+    /// dense mesh than on a light one and no fixed number suits both.
+    dab_ms: f32,
 }
 
 impl State {
@@ -250,6 +256,7 @@ impl State {
             partitions: Vec::new(),
             partition_fresh: false,
             egui_animating: true,
+            dab_ms: 0.0,
         }
     }
 
@@ -650,8 +657,28 @@ impl State {
         let from = self.stroke.last_hit.unwrap_or(to);
 
         // Space the dabs so a fast drag does not leave a dotted trail.
+        //
+        // How many is not a fixed number. A dab on a light mesh costs
+        // microseconds and thirty-two of them are free; on ten million
+        // triangles with live topology one costs the better part of twenty
+        // milliseconds, and thirty-two is half a second with the pen down and
+        // nothing on screen, which is exactly what a stroke there felt like.
+        //
+        // So the count is whatever fits in a frame's worth of time, measured
+        // from what the last dabs actually cost. On a heavy mesh a fast drag
+        // leaves its dabs a little further apart, which is a far better trade
+        // than the application stopping to catch up.
+        const BUDGET_MS: f32 = 10.0;
         let spacing = (self.sculptor.brush.radius * 0.25).max(1e-4);
-        let steps = ((from.0.distance(to.0) / spacing).ceil() as usize).clamp(1, 32);
+        let affordable = if self.dab_ms > 0.05 {
+            (BUDGET_MS / self.dab_ms) as usize
+        } else {
+            32
+        };
+        let wanted = (from.0.distance(to.0) / spacing).ceil() as usize;
+        let steps = wanted.clamp(1, affordable.clamp(1, 32));
+
+        let started = Instant::now();
         for i in 1..=steps {
             let t = i as f32 / steps as f32;
             let input = self.stroke_input(
@@ -662,6 +689,9 @@ impl State {
             );
             self.sculptor.stroke(&input);
         }
+        let each = started.elapsed().as_secs_f32() * 1000.0 / steps as f32;
+        self.dab_ms = if self.dab_ms <= 0.0 { each } else { self.dab_ms * 0.8 + each * 0.2 };
+
         self.stroke.last_hit = Some(to);
         self.stroke.prev_screen = cursor;
         self.dirty_object = Some(self.sculptor.scene.active);

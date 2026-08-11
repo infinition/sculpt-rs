@@ -548,6 +548,14 @@ brush say which it uses. **Effort.** 2 days.
 Fixed at a quarter of the radius. Expose it, default lower.
 **Effort.** half a day.
 
+**Half of it is done.** How many dabs a pointer movement is cut into is no
+longer a fixed thirty-two: it is whatever fits in ten milliseconds, measured
+from what the last dabs actually cost. A dab on a light mesh costs microseconds
+and thirty-two are free; on ten million triangles with live topology one costs
+most of twenty milliseconds, and thirty-two was half a second of frozen window
+for one movement of the pen. On a heavy mesh the dabs now land a little further
+apart instead. What is left of this item is exposing the spacing itself.
+
 ### S5. An editable falloff
 
 Five fixed curves today. A curve with movable points and a hardness exponent,
