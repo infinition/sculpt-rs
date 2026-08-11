@@ -640,33 +640,43 @@ impl VoxelField {
         let bi = i.div_euclid(CHUNK_I32);
         let bj = j.div_euclid(CHUNK_I32);
         let bk = k.div_euclid(CHUNK_I32);
-        let mut local: HashMap<(i32, i32, i32), &Chunk> = HashMap::with_capacity(27);
-        for ci in (bi - 1)..=(bi + 1) {
-            for cj in (bj - 1)..=(bj + 1) {
-                for ck in (bk - 1)..=(bk + 1) {
-                    if let Some(c) = self.chunks.get(&(ci, cj, ck)) {
-                        local.insert((ci, cj, ck), &**c);
+        // Three chunks a side, held in a fixed array so a cell allocates
+        // nothing: a hash map per cell was the cost of a dab on a dense field.
+        let mut local: [Option<&Chunk>; 27] = [None; 27];
+        for rel_ci in 0..3 {
+            for rel_cj in 0..3 {
+                for rel_ck in 0..3 {
+                    let key = (
+                        bi - 1 + rel_ci,
+                        bj - 1 + rel_cj,
+                        bk - 1 + rel_ck,
+                    );
+                    if let Some(c) = self.chunks.get(&key) {
+                        local[((rel_ci * 3 + rel_cj) * 3 + rel_ck) as usize] = Some(&**c);
                     }
                 }
             }
         }
         let read = |x: i32, y: i32, z: i32| -> f32 {
-            let key = (
-                x.div_euclid(CHUNK_I32),
-                y.div_euclid(CHUNK_I32),
-                z.div_euclid(CHUNK_I32),
-            );
+            let ci = x.div_euclid(CHUNK_I32);
+            let cj = y.div_euclid(CHUNK_I32);
+            let ck = z.div_euclid(CHUNK_I32);
+            let (ri, rj, rk) = ((ci - bi + 1) as i32, (cj - bj + 1) as i32, (ck - bk + 1) as i32);
+            if ri < 0 || ri > 2 || rj < 0 || rj > 2 || rk < 0 || rk > 2 {
+                return OUTSIDE;
+            }
             let lx = x.rem_euclid(CHUNK_I32) as usize;
             let ly = y.rem_euclid(CHUNK_I32) as usize;
             let lz = z.rem_euclid(CHUNK_I32) as usize;
-            local.get(&key).map_or(OUTSIDE, |c| c[flat(lx, ly, lz)])
+            local[((ri * 3 + rj) * 3 + rk) as usize].map_or(OUTSIDE, |c| c[flat(lx, ly, lz)])
         };
         let stored = |x: i32, y: i32, z: i32| -> bool {
-            local.contains_key(&(
-                x.div_euclid(CHUNK_I32),
-                y.div_euclid(CHUNK_I32),
-                z.div_euclid(CHUNK_I32),
-            ))
+            let ci = x.div_euclid(CHUNK_I32);
+            let cj = y.div_euclid(CHUNK_I32);
+            let ck = z.div_euclid(CHUNK_I32);
+            let (ri, rj, rk) = ((ci - bi + 1) as i32, (cj - bj + 1) as i32, (ck - bk + 1) as i32);
+            ri >= 0 && ri <= 2 && rj >= 0 && rj <= 2 && rk >= 0 && rk <= 2
+                && local[((ri * 3 + rj) * 3 + rk) as usize].is_some()
         };
 
         // The quadratic error function: sum over the crossing planes of the
