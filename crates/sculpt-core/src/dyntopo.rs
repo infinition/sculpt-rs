@@ -168,40 +168,32 @@ impl Plan {
     }
 }
 
-/// Works out what a dab here would change, without changing it.
+/// Classifies the edges around `verts` as too long or too short.
 ///
-/// One pass over the neighbourhood, classifying each edge as too long or too
-/// short as it goes. It used to be two passes, each building a hash set of
-/// sixty thousand edges to remove duplicates, which cost six milliseconds of
-/// every dab on a dense mesh: more than the rest of the dab put together.
+/// [`plan`] feeds it the whole brush sphere, and the later refinement passes
+/// call it again through a fresh [`plan`] because splitting makes new edges.
 ///
-/// Duplicates are left in instead of being hashed away. Taking an edge from its
-/// lower-numbered vertex only cuts them from six to two, and the two are
-/// harmless: a split revalidates through `faces_around_edge`, which is empty
-/// the second time round, and a collapse revalidates its candidates anyway.
-/// Two length comparisons are far cheaper than a hash table.
-pub fn plan(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> Plan {
-    let can_split = p.subdivide && mesh.vert_count() < p.max_verts;
-    if !can_split && !p.decimate {
-        return Plan::default();
-    }
-    // Work slightly wider than the brush so the detail gradient is not sliced
-    // off exactly at the falloff boundary.
-    let max_len = p.detail * SPLIT_FACTOR;
-    let min_len = p.detail * COLLAPSE_FACTOR;
-    let verts = query::verts_in_sphere(mesh, center, radius * 1.15);
-
-    // Measuring an edge is two random reads into an array far too large for
-    // cache, and a dab on a dense mesh measures half a million of them, three
-    // times over, since the later refinement passes have to look again. It is
-    // the largest single thing a dab does, and every edge is independent of
-    // every other, so it is done a slice of vertices at a time across the
-    // cores.
-    //
-    // The slices come back in the order they went out, and both lists are then
-    // put in a total order below, so what a plan says is settled by the mesh
-    // and by nothing else. That is worth insisting on: the cutting follows this
-    // list, and a list in a different order is a different mesh.
+/// Measuring an edge is two random reads into an array far too large for
+/// cache, and every edge is independent of every other, so it is done a slice
+/// of vertices at a time across the cores.
+///
+/// The slices come back in the order they went out, and both lists are then
+/// put in a total order below, so what a plan says is settled by the mesh
+/// and by nothing else. That is worth insisting on: the cutting follows this
+/// list, and a list in a different order is a different mesh.
+fn classify_edges(
+    mesh: &Mesh,
+    verts: &[u32],
+    can_split: bool,
+    decimate: bool,
+    max_len: f32,
+    min_len: f32,
+) -> (Vec<(f32, (u32, u32))>, Vec<(u32, u32)>) {
+    // Duplicates are left in instead of being hashed away. Taking an edge from
+    // its lower-numbered vertex only cuts them from six to two, and the two are
+    // harmless: a split revalidates through `faces_around_edge`, which is empty
+    // the second time round, and a collapse revalidates its candidates anyway.
+    // Two length comparisons are far cheaper than a hash table.
     let classify = |chunk: &[u32]| {
         let mut long: Vec<(f32, (u32, u32))> = Vec::new();
         let mut short: Vec<(u32, u32)> = Vec::new();
@@ -218,7 +210,7 @@ pub fn plan(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> Plan {
                     let len = mesh.edge_len(a, b);
                     if can_split && len > max_len {
                         long.push((len, (a, b)));
-                    } else if p.decimate && len < min_len {
+                    } else if decimate && len < min_len {
                         short.push((a, b));
                     }
                 }
@@ -228,7 +220,7 @@ pub fn plan(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> Plan {
     };
 
     let parts: Vec<(Vec<(f32, (u32, u32))>, Vec<(u32, u32)>)> = if verts.len() < CHUNK * 2 {
-        vec![classify(&verts)]
+        vec![classify(verts)]
     } else {
         verts.par_chunks(CHUNK).map(classify).collect()
     };
@@ -263,6 +255,26 @@ pub fn plan(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> Plan {
     // the work was divided, and it is not this.
     long.sort_unstable_by_key(|(len, e)| (std::cmp::Reverse(len.to_bits()), *e));
     short.sort_unstable();
+    (long, short)
+}
+
+/// Works out what a dab here would change, without changing it.
+///
+/// One pass over the neighbourhood, classifying each edge as too long or too
+/// short as it goes. It used to be two passes, each building a hash set of
+/// sixty thousand edges to remove duplicates, which cost six milliseconds of
+/// every dab on a dense mesh: more than the rest of the dab put together.
+pub fn plan(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> Plan {
+    let can_split = p.subdivide && mesh.vert_count() < p.max_verts;
+    if !can_split && !p.decimate {
+        return Plan::default();
+    }
+    // Work slightly wider than the brush so the detail gradient is not sliced
+    // off exactly at the falloff boundary.
+    let max_len = p.detail * SPLIT_FACTOR;
+    let min_len = p.detail * COLLAPSE_FACTOR;
+    let verts = query::verts_in_sphere(mesh, center, radius * 1.15);
+    let (long, short) = classify_edges(mesh, &verts, can_split, p.decimate, max_len, min_len);
     Plan { long, short }
 }
 
@@ -296,16 +308,28 @@ pub fn apply(mesh: &mut Mesh, todo: Plan, center: Vec3, radius: f32, p: &Dyntopo
             if long.is_empty() {
                 break;
             }
-            // Vertex indices stay stable across splits (vertices are only
-            // appended), so the whole batch can be applied in one go.
-            for (_, (a, b)) in long {
+            // The length was measured when the plan was made, and a split never
+            // moves its two endpoints, so it is still true when the edge is
+            // reached. Re-measuring would be two random reads per candidate for
+            // the same answer.
+            let mut split_any = false;
+            for (len, (a, b)) in long {
                 if mesh.vert_count() >= p.max_verts {
                     break;
                 }
-                if mesh.edge_len(a, b) > max_len {
-                    mesh.split_edge(a, b);
-                    changed = true;
+                if len > max_len {
+                    if mesh.split_edge(a, b).is_some() {
+                        split_any = true;
+                        changed = true;
+                    }
                 }
+            }
+            // Splitting is what makes the new edges a later pass would find. If
+            // a pass cut nothing, the region is at its target density and the
+            // next pass would replan and cut nothing again, so it is skipped
+            // rather than paying for a classification it cannot use.
+            if !split_any {
+                break;
             }
         }
     }

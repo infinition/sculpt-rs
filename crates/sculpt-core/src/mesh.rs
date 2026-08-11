@@ -171,6 +171,17 @@ const DEFAULT_COL: [u8; 3] = [217, 217, 217];
 /// Default roughness, the same 0.6 the shading has always assumed.
 const DEFAULT_ROUGH: u8 = 153;
 
+/// Deduplication scratch for the normals ring, held once per thread and grown
+/// to the largest mesh seen. Stamped rather than cleared: a generation number
+/// written beside each vertex means a fresh round costs one increment, and the
+/// array is only written when a vertex is met for the first time. Kept off the
+/// mesh so a clone does not carry it, and shared across meshes, since only one
+/// stroke runs at a time.
+thread_local! {
+    static NORMALS_MARK: std::cell::RefCell<(Vec<u32>, u32)> =
+        const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+
 #[derive(Clone, Default)]
 pub struct Mesh {
     /// Where every vertex is. Always present, always full precision, because
@@ -960,32 +971,57 @@ impl Mesh {
         if touched.is_empty() {
             return Vec::new();
         }
-        // The ring around what moved. Duplicates are pushed and sorted out once
-        // at the end: a neighbourhood that deduplicates as it goes tests every
-        // candidate against everything it already holds, which is quadratic in
-        // the valence and done once per vertex, where this is one sort.
+        // The ring around what moved: every face's vertices plus the vertex
+        // itself. On a dense mesh a dab touches tens of thousands of vertices
+        // and the ring is several times that before duplicates are removed,
+        // yet the unique set is barely larger than what moved, because
+        // neighbours of what moved mostly moved too.
+        //
+        // The old code built the whole multiset and sorted it, which was the
+        // largest single cost of the pass: a dab produced half a million
+        // entries to arrive at a set of a few tens of thousands. A scratch
+        // below stamps each vertex as it is met, so each is pushed once and
+        // the sort is over the small set, not the multiset.
+        //
+        // The scratch is stamped rather than cleared: each round is one more
+        // generation, and a vertex is pushed only when its stored generation
+        // differs, which is the first time it was met. The sort is kept, not
+        // dropped: sorting the multiset then deduplicating and deduplicating
+        // then sorting give the same list, so this changes neither the normals
+        // nor the order they land in `dirty_verts`.
         let (vfaces, faces) = (&self.vfaces, &self.faces);
-        let ring = |v: u32| {
-            vfaces[v as usize]
-                .iter()
-                .flat_map(|&f| faces[f as usize])
-                .chain(std::iter::once(v))
-        };
-        let mut set: Vec<u32> = if touched.len() < PARALLEL_MIN {
-            let mut s = Vec::with_capacity(touched.len() * 7);
-            for &v in touched {
-                s.extend(ring(v));
+        let mut set: Vec<u32> = Vec::new();
+        NORMALS_MARK.with(|c| {
+            let (mark, generation) = &mut *c.borrow_mut();
+            let g = generation.wrapping_add(1);
+            *generation = g;
+            if g == 0 {
+                // The generation wrapped around, so a stale stamp could read
+                // as fresh. Clearing the array makes the test below sound
+                // again; the sweep is once per four billion rounds.
+                mark.fill(0);
+                *generation = 1;
+            } else if mark.len() < self.pos.len() {
+                mark.resize(self.pos.len(), 0);
             }
-            s
-        } else {
-            touched.par_iter().flat_map_iter(|&v| ring(v)).collect()
-        };
-        if set.len() < PARALLEL_MIN {
-            set.sort_unstable();
-        } else {
-            set.par_sort_unstable();
-        }
-        set.dedup();
+            for &v in touched {
+                for &f in &vfaces[v as usize] {
+                    for &x in &faces[f as usize] {
+                        let xi = x as usize;
+                        if mark[xi] != g {
+                            mark[xi] = g;
+                            set.push(x);
+                        }
+                    }
+                }
+                let vi = v as usize;
+                if mark[vi] != g {
+                    mark[vi] = g;
+                    set.push(v);
+                }
+            }
+        });
+        set.sort_unstable();
 
         // Collected, then written back. A parallel loop cannot write into the
         // vertices while another reads them, and the write is a cheap scatter
