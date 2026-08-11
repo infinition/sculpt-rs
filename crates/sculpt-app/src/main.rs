@@ -1720,10 +1720,18 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Touch(touch) => {
                 let where_ = Vec2::new(touch.location.x as f32, touch.location.y as f32);
-                let ppp = st.egui_ctx.pixels_per_point().max(1e-3);
-                // A pen and a finger have no hover, so egui has never seen the
-                // pointer where it lands and cannot say whether the interface
-                // wants it. The geometry can.
+                // A stylus hovering over the tablet, not touching it, arrives
+                // as a touch with no force and no Started phase. It is a cursor
+                // move: move the brush ring and the hover colour, and start no
+                // stroke. A finger never hovers, so this cannot be one.
+                if touch.phase == winit::event::TouchPhase::Moved && touch.force.is_none() {
+                    st.input.cursor = where_;
+                    st.update_hover_color();
+                } else {
+                    let ppp = st.egui_ctx.pixels_per_point().max(1e-3);
+                // A pen touching down and a finger have no hover before they
+                // land, so egui has never seen the pointer where it touches and
+                // cannot say whether the interface wants it. The geometry can.
                 // The radial menu owns the pointer while it is up. The
                 // mouse path already said so; a pen or a finger goes through
                 // here, and without this a press meant for the size pad landed
@@ -1779,6 +1787,7 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
