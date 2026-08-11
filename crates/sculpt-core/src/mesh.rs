@@ -912,7 +912,14 @@ impl Mesh {
                 continue;
             }
             let tri = self.faces[f as usize];
-            let before = self.face_normal(f);
+            // Only the sign of the dot product decides, and scaling a vector
+            // never changes a sign, so the normal is left unnormalised and the
+            // inverse square root is saved on every face a collapse looks at.
+            let before = {
+                let [x, y, z] = tri;
+                (self.pos[y as usize] - self.pos[x as usize])
+                    .cross(self.pos[z as usize] - self.pos[x as usize])
+            };
             let p: [Vec3; 3] = std::array::from_fn(|k| {
                 let v = tri[k];
                 if v == a || v == b { mid } else { self.pos[v as usize] }
