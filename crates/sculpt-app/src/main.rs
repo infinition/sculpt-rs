@@ -164,7 +164,11 @@ impl State {
         config.format = format;
         config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
         config.present_mode = wgpu::PresentMode::AutoVsync;
-        config.desired_maximum_frame_latency = 2;
+        // Two frames in flight meant the CPU waited on the GPU whenever the
+        // submission queue drained, which on a heavy mesh pinned the frame to
+        // the card's latency. Three keeps the queue fed so a slow frame does
+        // not become a stall.
+        config.desired_maximum_frame_latency = 3;
         surface.configure(&device, &config);
 
         // A sample count is only usable when the colour format and the depth

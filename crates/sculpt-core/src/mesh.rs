@@ -171,12 +171,12 @@ const DEFAULT_COL: [u8; 3] = [217, 217, 217];
 /// Default roughness, the same 0.6 the shading has always assumed.
 const DEFAULT_ROUGH: u8 = 153;
 
-/// Deduplication scratch for the normals ring, held once per thread and grown
-/// to the largest mesh seen. Stamped rather than cleared: a generation number
-/// written beside each vertex means a fresh round costs one increment, and the
-/// array is only written when a vertex is met for the first time. Kept off the
-/// mesh so a clone does not carry it, and shared across meshes, since only one
-/// stroke runs at a time.
+// Deduplication scratch for the normals ring, held once per thread and grown
+// to the largest mesh seen. Stamped rather than cleared: a generation number
+// written beside each vertex means a fresh round costs one increment, and the
+// array is only written when a vertex is met for the first time. Kept off the
+// mesh so a clone does not carry it, and shared across meshes, since only one
+// stroke runs at a time.
 thread_local! {
     static NORMALS_MARK: std::cell::RefCell<(Vec<u32>, u32)> =
         const { std::cell::RefCell::new((Vec::new(), 0)) };

@@ -180,10 +180,15 @@ struct ObjectData {
 
 /// Vertex and index buffers are also storage buffers so the scatter passes can
 /// write them.
-const VERTEX_USAGE: wgpu::BufferUsages =
-    wgpu::BufferUsages::VERTEX.union(wgpu::BufferUsages::STORAGE);
-const INDEX_USAGE: wgpu::BufferUsages =
-    wgpu::BufferUsages::INDEX.union(wgpu::BufferUsages::STORAGE);
+// COPY_SRC is so a buffer that outgrows itself can be grown in place by
+// copying what it already held, instead of giving up on the sparse path and
+// re-encoding the whole mesh.
+const VERTEX_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::VERTEX
+    .union(wgpu::BufferUsages::STORAGE)
+    .union(wgpu::BufferUsages::COPY_SRC);
+const INDEX_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::INDEX
+    .union(wgpu::BufferUsages::STORAGE)
+    .union(wgpu::BufferUsages::COPY_SRC);
 
 /// Indices per triangle, which is the third scatter channel's stride.
 const FACE_WORDS: usize = 3;
@@ -254,6 +259,52 @@ impl MeshBuffers {
         }
         self.index_count = (mesh.faces.len() * 3) as u32;
         (hot_data.len() + cold_data.len() + idata.len()) as u64
+    }
+
+    /// Grows any buffer that can no longer hold the mesh, copying what it held.
+    ///
+    /// A dyntopo stroke grows the mesh a little at a time, and giving up on the
+    /// sparse path to re-encode the whole mesh is the pause the sparse path
+    /// exists to avoid. The copy keeps the untouched vertices, and the scatter
+    /// writes the touched ones over them.
+    fn grow_to_fit(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        vcount: usize,
+        fcount: usize,
+    ) {
+        let mut grew = false;
+        grew |= grow_buffer(
+            device,
+            encoder,
+            (vcount * HOT_BYTES) as u64,
+            &mut self.hot,
+            &mut self.hot_cap,
+            "vertices, hot",
+            VERTEX_USAGE,
+        );
+        grew |= grow_buffer(
+            device,
+            encoder,
+            (vcount * COLD_BYTES) as u64,
+            &mut self.cold,
+            &mut self.cold_cap,
+            "vertices, cold",
+            VERTEX_USAGE,
+        );
+        grew |= grow_buffer(
+            device,
+            encoder,
+            (fcount * std::mem::size_of::<[u32; 3]>()) as u64,
+            &mut self.ibuf,
+            &mut self.icap,
+            "indices",
+            INDEX_USAGE,
+        );
+        if grew {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 }
 
@@ -958,14 +1009,11 @@ impl Renderer {
             return true;
         }
 
-        // A buffer that has to grow cannot be patched in place.
-        let buffers = &self.meshes[object];
-        let needed_i = (fcount * std::mem::size_of::<[u32; 3]>()) as u64;
-        if (vcount * HOT_BYTES) as u64 > buffers.hot_cap
-            || (vcount * COLD_BYTES) as u64 > buffers.cold_cap
-            || needed_i > buffers.icap
+        // A buffer that has to grow grows in place, old contents copied, so the
+        // sparse path keeps going instead of re-encoding the whole mesh.
         {
-            return false;
+            let buffers = &mut self.meshes[object];
+            buffers.grow_to_fit(device, encoder, vcount, fcount);
         }
 
         prune(dirty_verts, vcount);
@@ -1268,6 +1316,30 @@ fn sized_buffer(
         usage: usage | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
+}
+
+/// Grows one buffer past `needed`, copying what it already held. Returns true
+/// when it grew. The copy is queued before the scatter's encoder is submitted,
+/// so the untouched slots are in place before the compute pass scatters over
+/// them.
+fn grow_buffer(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    needed: u64,
+    buffer: &mut wgpu::Buffer,
+    cap: &mut u64,
+    label: &str,
+    usage: wgpu::BufferUsages,
+) -> bool {
+    if needed <= *cap {
+        return false;
+    }
+    *cap = (needed * 3 / 2).next_power_of_two();
+    let old = std::mem::replace(buffer, sized_buffer(device, label, *cap, usage));
+    // Encoded before the scatter's compute pass, so the untouched slots are in
+    // place before the pass scatters over them.
+    encoder.copy_buffer_to_buffer(&old, 0, buffer, 0, old.size());
+    true
 }
 
 fn make_global_bind(
