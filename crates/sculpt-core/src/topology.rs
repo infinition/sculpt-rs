@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// Splits every triangle into four. `smooth` switches from plain midpoint
 /// insertion to the Loop scheme, which also relaxes the original vertices.
 pub fn subdivide(mesh: &Mesh, smooth: bool) -> Mesh {
-    let n0 = mesh.verts.len();
-    let mut verts: Vec<Vertex> = mesh.verts.clone();
+    let n0 = mesh.pos.len();
+    let mut verts: Vec<Vertex> = mesh.vertices().collect();
     let mut faces: Vec<[u32; 3]> = Vec::with_capacity(mesh.faces.len() * 4);
     let mut edge_pt: FxHashMap<(u32, u32), u32> = FxHashMap::default();
 
@@ -34,8 +34,8 @@ pub fn subdivide(mesh: &Mesh, smooth: bool) -> Mesh {
                 Some(&id) => id,
                 None => {
                     let mut v = Vertex::lerp_attrs(
-                        &mesh.verts[a as usize],
-                        &mesh.verts[b as usize],
+                        &mesh.vertex(a),
+                        &mesh.vertex(b),
                         0.5,
                     );
                     if smooth {
@@ -43,10 +43,10 @@ pub fn subdivide(mesh: &Mesh, smooth: bool) -> Mesh {
                         // vertices opposite the edge.
                         let opp = opposite_vertices(mesh, a, b);
                         if opp.len() == 2 {
-                            let pa = mesh.verts[a as usize].pos;
-                            let pb = mesh.verts[b as usize].pos;
-                            let pc = mesh.verts[opp[0] as usize].pos;
-                            let pd = mesh.verts[opp[1] as usize].pos;
+                            let pa = mesh.pos[a as usize];
+                            let pb = mesh.pos[b as usize];
+                            let pc = mesh.pos[opp[0] as usize];
+                            let pd = mesh.pos[opp[1] as usize];
                             v.pos = (pa + pb) * 0.375 + (pc + pd) * 0.125;
                         }
                     }
@@ -72,15 +72,15 @@ pub fn subdivide(mesh: &Mesh, smooth: bool) -> Mesh {
                 let nb = mesh.neighbors(v);
                 let n = nb.len();
                 if n < 3 || mesh.is_boundary_vertex(v) {
-                    return mesh.verts[i].pos;
+                    return mesh.pos[i];
                 }
                 let nf = n as f32;
                 let beta = (5.0 / 8.0 - (3.0 / 8.0 + 0.25 * (std::f32::consts::TAU / nf).cos()).powi(2)) / nf;
                 let mut sum = Vec3::ZERO;
                 for &j in &nb {
-                    sum += mesh.verts[j as usize].pos;
+                    sum += mesh.pos[j as usize];
                 }
-                mesh.verts[i].pos * (1.0 - nf * beta) + sum * beta
+                mesh.pos[i] * (1.0 - nf * beta) + sum * beta
             })
             .collect();
         for (i, p) in moved.into_iter().enumerate() {
@@ -106,13 +106,13 @@ fn opposite_vertices(mesh: &Mesh, a: u32, b: u32) -> smallvec::SmallVec<[u32; 2]
 
 /// Builds a mesh from ready-made vertex and face arrays.
 fn finish(verts: Vec<Vertex>, faces: Vec<[u32; 3]>) -> Mesh {
-    let mut m = Mesh {
-        vfaces: vec![Default::default(); verts.len()],
-        verts,
-        faces,
-        ..Default::default()
-    };
-    m.rebuild_adjacency();
+    let positions: Vec<Vec3> = verts.iter().map(|v| v.pos).collect();
+    let mut m = Mesh::from_soup(&positions, &faces);
+    // `from_soup` took the positions; the rest of each vertex goes in after,
+    // which is what wakes only the channels this mesh actually carries.
+    for (i, v) in verts.iter().enumerate() {
+        m.write_vertex(i as u32, v);
+    }
     m.recompute_normals();
     m
 }
@@ -149,7 +149,7 @@ pub fn decimate(mesh: &mut Mesh, ratio: f32) -> usize {
         // as it does; the endpoints settle the ties into a total order, so the
         // result does not depend on how the work was divided.
         let m: &Mesh = mesh;
-        let mut edges: Vec<(f32, u32, u32)> = (0..m.verts.len() as u32)
+        let mut edges: Vec<(f32, u32, u32)> = (0..m.pos.len() as u32)
             .into_par_iter()
             .flat_map_iter(|v| {
                 m.neighbors(v)
@@ -248,9 +248,9 @@ pub fn voxel_remesh(mesh: &Mesh, opts: &RemeshOptions) -> Mesh {
             .map(|_| AtomicU32::new(band.to_bits()))
             .collect();
         mesh.faces.par_iter().for_each(|tri| {
-            let a = mesh.verts[tri[0] as usize].pos;
-            let b = mesh.verts[tri[1] as usize].pos;
-            let c = mesh.verts[tri[2] as usize].pos;
+            let a = mesh.pos[tri[0] as usize];
+            let b = mesh.pos[tri[1] as usize];
+            let c = mesh.pos[tri[2] as usize];
             let tlo = a.min(b).min(c) - Vec3::splat(band);
             let thi = a.max(b).max(c) + Vec3::splat(band);
             let i0 = (((tlo.x - origin.x) / h).floor().max(0.0) as usize).min(nx - 1);
@@ -289,9 +289,9 @@ pub fn voxel_remesh(mesh: &Mesh, opts: &RemeshOptions) -> Mesh {
             let first = part * per_part;
             let last = first + mine.len();
             for tri in &mesh.faces {
-                let a = mesh.verts[tri[0] as usize].pos;
-                let b = mesh.verts[tri[1] as usize].pos;
-                let c = mesh.verts[tri[2] as usize].pos;
+                let a = mesh.pos[tri[0] as usize];
+                let b = mesh.pos[tri[1] as usize];
+                let c = mesh.pos[tri[2] as usize];
                 let ylo = a.y.min(b.y).min(c.y);
                 let yhi = a.y.max(b.y).max(c.y);
                 let zlo = a.z.min(b.z).min(c.z);
@@ -516,11 +516,11 @@ pub fn voxel_remesh(mesh: &Mesh, opts: &RemeshOptions) -> Mesh {
                     .unwrap_or_default();
                 let best = near
                     .into_iter()
-                    .map(|i| (i, mesh.verts[i as usize].pos.distance_squared(v.pos)))
+                    .map(|i| (i, mesh.pos[i as usize].distance_squared(v.pos)))
                     .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 match best {
                     Some((i, _)) => {
-                        let s = &mesh.verts[i as usize];
+                        let s = mesh.vertex(i);
                         (s.col, s.mask, s.rough, s.metal)
                     }
                     None => (Vec3::splat(0.85), 0.0, 0.6, 0.0),
@@ -545,7 +545,7 @@ pub fn voxel_remesh(mesh: &Mesh, opts: &RemeshOptions) -> Mesh {
 
 /// One global Laplacian pass, keeping boundary vertices pinned.
 pub fn laplacian_smooth(mesh: &mut Mesh, amount: f32) {
-    let deltas: Vec<Vec3> = (0..mesh.verts.len())
+    let deltas: Vec<Vec3> = (0..mesh.pos.len())
         .into_par_iter()
         .map(|i| {
             let v = i as u32;
@@ -555,14 +555,14 @@ pub fn laplacian_smooth(mesh: &mut Mesh, amount: f32) {
             }
             let mut mean = Vec3::ZERO;
             for &n in &nb {
-                mean += mesh.verts[n as usize].pos;
+                mean += mesh.pos[n as usize];
             }
             mean /= nb.len() as f32;
-            (mean - mesh.verts[i].pos) * amount
+            (mean - mesh.pos[i]) * amount
         })
         .collect();
-    for (v, d) in mesh.verts.iter_mut().zip(deltas) {
-        v.pos += d;
+    for (p, d) in mesh.pos.iter_mut().zip(deltas) {
+        *p += d;
     }
     mesh.invalidate_accel();
 }
@@ -624,8 +624,8 @@ pub fn close_holes(mesh: &mut Mesh) -> usize {
         let mut center = Vec3::ZERO;
         let mut col = Vec3::ZERO;
         for &v in chain {
-            center += mesh.verts[v as usize].pos;
-            col += mesh.verts[v as usize].col;
+            center += mesh.pos[v as usize];
+            col += mesh.col(v);
         }
         let n = chain.len() as f32;
         let mut cv = Vertex::new(center / n);
@@ -649,34 +649,40 @@ pub fn close_holes(mesh: &mut Mesh) -> usize {
 // ---------------------------------------------------------------------------
 
 pub fn clear_mask(mesh: &mut Mesh) {
-    mesh.verts.par_iter_mut().for_each(|v| v.mask = 0.0);
+    for v in 0..mesh.vert_count() as u32 {
+        mesh.set_mask(v, 0.0);
+    }
+    mesh.compact_mask();
 }
 
 pub fn invert_mask(mesh: &mut Mesh) {
-    mesh.verts.par_iter_mut().for_each(|v| v.mask = 1.0 - v.mask);
+    for v in 0..mesh.vert_count() as u32 {
+        mesh.set_mask(v, 1.0 - mesh.mask(v));
+    }
 }
 
 /// Blurs (`amount > 0`) or sharpens (`amount < 0`) the mask.
 pub fn filter_mask(mesh: &mut Mesh, amount: f32) {
-    let vals: Vec<f32> = (0..mesh.verts.len())
+    let vals: Vec<f32> = (0..mesh.pos.len())
         .into_par_iter()
         .map(|i| {
             let nb = mesh.neighbors(i as u32);
             if nb.is_empty() {
-                return mesh.verts[i].mask;
+                return mesh.mask(i as u32);
             }
             let mut mean = 0.0;
             for &n in &nb {
-                mean += mesh.verts[n as usize].mask;
+                mean += mesh.mask(n);
             }
             mean /= nb.len() as f32;
-            let m = mesh.verts[i].mask;
+            let m = mesh.mask(i as u32);
             (m + (mean - m) * amount).clamp(0.0, 1.0)
         })
         .collect();
-    for (v, m) in mesh.verts.iter_mut().zip(vals) {
-        v.mask = m;
+    for (v, m) in vals.into_iter().enumerate() {
+        mesh.set_mask(v as u32, m);
     }
+    mesh.compact_mask();
 }
 
 /// Lifts the masked region into a separate closed shell of `thickness`.
@@ -690,7 +696,7 @@ pub fn extract_masked(mesh: &Mesh, thickness: f32) -> Option<Mesh> {
         .iter()
         .enumerate()
         .filter(|(_, tri)| {
-            tri.iter().all(|&v| mesh.verts[v as usize].mask > 0.5)
+            tri.iter().all(|&v| mesh.mask(v) > 0.5)
         })
         .map(|(i, _)| i)
         .collect();
@@ -708,7 +714,7 @@ pub fn extract_masked(mesh: &Mesh, thickness: f32) -> Option<Mesh> {
         for k in 0..3 {
             let src = tri[k];
             out[k] = *remap.entry(src).or_insert_with(|| {
-                let mut v = mesh.verts[src as usize];
+                let mut v = mesh.vertex(src);
                 v.mask = 0.0;
                 verts.push(v);
                 (verts.len() - 1) as u32
@@ -718,13 +724,13 @@ pub fn extract_masked(mesh: &Mesh, thickness: f32) -> Option<Mesh> {
     }
 
     let patch = finish(verts, faces);
-    let n = patch.verts.len() as u32;
+    let n = patch.pos.len() as u32;
 
     // Outer shell, then the inner shell offset along the normals and flipped.
-    let mut verts = patch.verts.clone();
+    let mut verts: Vec<Vertex> = patch.vertices().collect();
     let mut faces = patch.faces.clone();
     for i in 0..n {
-        let mut v = patch.verts[i as usize];
+        let mut v = patch.vertex(i);
         v.pos -= v.nrm * thickness;
         verts.push(v);
     }
@@ -807,10 +813,10 @@ pub fn fill(
     touched.dedup();
 
     for &v in &touched {
-        let vx = &mut mesh.verts[v as usize];
-        let t = (amount * (1.0 - vx.mask)).clamp(0.0, 1.0);
-        let blended = blend.apply(vx.col, color);
-        vx.col = vx.col.lerp(blended, t);
+        let t = (amount * (1.0 - mesh.mask(v))).clamp(0.0, 1.0);
+        let here = mesh.col(v);
+        let blended = blend.apply(here, color);
+        mesh.set_col(v, here.lerp(blended, t));
     }
     touched.len()
 }
@@ -822,10 +828,10 @@ pub fn fill(
 /// Mirrors the whole mesh across a plane through the origin.
 pub fn mirror(mesh: &mut Mesh, axis: crate::brush::Axis) {
     let i = axis.index();
-    mesh.verts.par_iter_mut().for_each(|v| {
-        v.pos[i] = -v.pos[i];
-        v.nrm[i] = -v.nrm[i];
-    });
+    rayon::join(
+        || mesh.pos.par_iter_mut().for_each(|p| p[i] = -p[i]),
+        || mesh.nrm.par_iter_mut().for_each(|n| n[i] = -n[i]),
+    );
     mesh.faces.par_iter_mut().for_each(|t| t.swap(1, 2));
     mesh.rebuild_adjacency();
     mesh.recompute_normals();
@@ -837,7 +843,7 @@ pub fn symmetrize(mesh: &Mesh, axis: crate::brush::Axis, keep_positive: bool) ->
     let i = axis.index();
     let side = |p: Vec3| if keep_positive { p[i] } else { -p[i] };
 
-    let mut verts: Vec<Vertex> = Vec::with_capacity(mesh.verts.len());
+    let mut verts: Vec<Vertex> = Vec::with_capacity(mesh.pos.len());
     let mut faces: Vec<[u32; 3]> = Vec::with_capacity(mesh.faces.len());
     let push = |v: Vertex, verts: &mut Vec<Vertex>| {
         verts.push(v);
@@ -846,9 +852,9 @@ pub fn symmetrize(mesh: &Mesh, axis: crate::brush::Axis, keep_positive: bool) ->
 
     for tri in &mesh.faces {
         let p: [Vertex; 3] = [
-            mesh.verts[tri[0] as usize],
-            mesh.verts[tri[1] as usize],
-            mesh.verts[tri[2] as usize],
+            mesh.vertex(tri[0]),
+            mesh.vertex(tri[1]),
+            mesh.vertex(tri[2]),
         ];
         let d = [side(p[0].pos), side(p[1].pos), side(p[2].pos)];
         let inside = d.iter().filter(|x| **x >= 0.0).count();

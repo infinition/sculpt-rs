@@ -189,7 +189,7 @@ impl MeshBuffers {
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &sculpt_core::Mesh) -> u64 {
         // Packing several million vertices is arithmetic on independent
         // elements, which is to say it runs on every core.
-        let (hot, cold) = gpu_vertex::pack_all(&mesh.verts);
+        let (hot, cold) = gpu_vertex::pack_all(mesh);
         let hot_data: &[u8] = bytemuck::cast_slice(&hot);
         let cold_data: &[u8] = bytemuck::cast_slice(&cold);
 
@@ -816,7 +816,7 @@ impl Renderer {
             self.meshes.push(MeshBuffers::new(device));
         }
         let mesh = &obj.mesh;
-        let (vcount, fcount) = (mesh.verts.len(), mesh.faces.len());
+        let (vcount, fcount) = (mesh.pos.len(), mesh.faces.len());
         if vcount == 0 {
             self.last_upload_bytes = 0;
             return true;
@@ -850,9 +850,15 @@ impl Renderer {
             s.hot_data.reserve(dirty_verts.len() * HOT_WORDS);
             s.cold_data.reserve(dirty_verts.len() * COLD_WORDS);
             for &v in dirty_verts.iter() {
-                let vx = &mesh.verts[v as usize];
-                s.hot_data.extend_from_slice(&gpu_vertex::hot(vx));
-                s.cold_data.extend_from_slice(&gpu_vertex::cold(vx));
+                let i = v as usize;
+                s.hot_data
+                    .extend_from_slice(&gpu_vertex::hot_from(mesh.pos[i], mesh.nrm[i]));
+                s.cold_data.extend_from_slice(&gpu_vertex::cold_from(
+                    mesh.col(v),
+                    mesh.mask(v),
+                    mesh.rough(v),
+                    mesh.metal(v),
+                ));
             }
             let hot: &[u8] = bytemuck::cast_slice(&s.hot_data);
             let cold: &[u8] = bytemuck::cast_slice(&s.cold_data);

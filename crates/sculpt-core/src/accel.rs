@@ -66,7 +66,7 @@ fn hash_cell(x: i32, y: i32, z: i32, mask: u32) -> u32 {
 impl Grid {
     /// Fills a grid sized for `mesh` with cells of `cell` world units.
     pub fn build(mesh: &Mesh, cell: f32) -> Self {
-        let n = mesh.verts.len().max(mesh.faces.len()).max(64);
+        let n = mesh.pos.len().max(mesh.faces.len()).max(64);
         // Roughly four elements a cell, and a firm ceiling.
         //
         // One element a cell sounds better and is not: the table is written
@@ -92,7 +92,7 @@ impl Grid {
 
         // Which cell everything falls in, vertices and faces at the same time.
         let (vslot, spheres) = rayon::join(
-            || mesh.verts.par_iter().map(|v| g.slot(v.pos)).collect::<Vec<u32>>(),
+            || mesh.pos.par_iter().map(|p| g.slot(*p)).collect::<Vec<u32>>(),
             || {
                 (0..mesh.faces.len())
                     .into_par_iter()
@@ -113,7 +113,7 @@ impl Grid {
             || fill(&mut g.fbuckets, &g.fslot),
         );
 
-        if mesh.verts.is_empty() {
+        if mesh.pos.is_empty() {
             g.lo = Vec3::ZERO;
             g.hi = Vec3::ZERO;
         }
@@ -286,7 +286,7 @@ impl Grid {
         let mut out = Vec::new();
         for s in slots {
             for &v in &self.vbuckets[s as usize] {
-                if mesh.verts[v as usize].pos.distance_squared(c) <= r2 {
+                if mesh.pos[v as usize].distance_squared(c) <= r2 {
                     out.push(v);
                 }
             }
@@ -433,9 +433,9 @@ fn remove_from(b: &mut Bucket, x: u32) {
 #[inline]
 fn face_sphere(mesh: &Mesh, f: u32) -> (Vec3, f32) {
     let [a, b, c] = mesh.faces[f as usize];
-    let pa = mesh.verts[a as usize].pos;
-    let pb = mesh.verts[b as usize].pos;
-    let pc = mesh.verts[c as usize].pos;
+    let pa = mesh.pos[a as usize];
+    let pb = mesh.pos[b as usize];
+    let pc = mesh.pos[c as usize];
     let mid = (pa + pb + pc) / 3.0;
     let r = pa
         .distance(mid)

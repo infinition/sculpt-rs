@@ -561,7 +561,7 @@ pub fn apply(
 
     let mut verts = query::verts_in_sphere(mesh, input.point, radius);
     if b.culling {
-        verts.retain(|&v| mesh.verts[v as usize].nrm.dot(input.view_dir) < 0.0);
+        verts.retain(|&v| mesh.nrm[v as usize].dot(input.view_dir) < 0.0);
     }
     if verts.is_empty() {
         return verts;
@@ -577,16 +577,19 @@ pub fn apply(
 
     // Falloff, pre-multiplied by the protection mask and by the stamp.
     let stamp = alpha.map(|a| (a, stamp_basis(b, input)));
+    let masked_none = mesh.mask_is_clear();
     let weights: Vec<f32> = verts
         .par_iter()
         .map(|&v| {
-            let vx = &mesh.verts[v as usize];
-            let d = vx.pos - input.point;
+            let d = mesh.pos[v as usize] - input.point;
             let t = d.length() * inv_r;
-            let m = if b.kind == BrushKind::Mask {
+            // A mesh nobody has masked answers zero for every vertex, so the
+            // whole test goes away rather than reading a channel that is not
+            // there.
+            let m = if b.kind == BrushKind::Mask || masked_none {
                 1.0
             } else {
-                (1.0 - vx.mask).clamp(0.0, 1.0)
+                (1.0 - mesh.mask(v)).clamp(0.0, 1.0)
             };
             let s = match &stamp {
                 // The dab spans the image, so a vertex one radius to the right
@@ -606,15 +609,16 @@ pub fn apply(
         BrushKind::Paint => {
             let flow = b.flow.clamp(0.0, 1.0);
             for (&v, &w) in verts.iter().zip(&weights) {
-                let vx = &mut mesh.verts[v as usize];
                 let t = (w * strength * flow).clamp(0.0, 1.0);
                 if b.paint_albedo {
-                    let blended = b.blend.apply(vx.col, b.paint_color);
-                    vx.col = vx.col.lerp(blended, t);
+                    let col = mesh.col(v);
+                    let blended = b.blend.apply(col, b.paint_color);
+                    mesh.set_col(v, col.lerp(blended, t));
                 }
                 if b.paint_material {
-                    vx.rough += (b.paint_rough - vx.rough) * t;
-                    vx.metal += (b.paint_metal - vx.metal) * t;
+                    let (r, m) = (mesh.rough(v), mesh.metal(v));
+                    mesh.set_rough(v, r + (b.paint_rough - r) * t);
+                    mesh.set_metal(v, m + (b.paint_metal - m) * t);
                 }
             }
             return verts;
@@ -626,9 +630,8 @@ pub fn apply(
             let carried = state.pickup.unwrap_or(local);
             let pickup = b.smudge_pickup.clamp(0.0, 1.0);
             for (&v, &w) in verts.iter().zip(&weights) {
-                let vx = &mut mesh.verts[v as usize];
                 let t = (w * strength).clamp(0.0, 1.0);
-                vx.col = vx.col.lerp(carried, t);
+                mesh.set_col(v, mesh.col(v).lerp(carried, t));
             }
             state.pickup = Some(carried.lerp(local, pickup * strength));
             return verts;
@@ -639,22 +642,22 @@ pub fn apply(
                 .zip(weights.par_iter())
                 .map(|(&v, &w)| {
                     let nb = mesh.neighbors(v);
-                    let vx = &mesh.verts[v as usize];
                     if nb.is_empty() || w <= 0.0 {
-                        return vx.col;
+                        return mesh.col(v);
                     }
                     let mut mean = Vec3::ZERO;
                     for &n in &nb {
-                        mean += mesh.verts[n as usize].col;
+                        mean += mesh.col(n);
                     }
                     mean /= nb.len() as f32;
                     // Inverted, this sharpens instead.
-                    let target = if b.negative { vx.col * 2.0 - mean } else { mean };
-                    vx.col.lerp(target.clamp(Vec3::ZERO, Vec3::ONE), (w * strength).clamp(0.0, 1.0))
+                    let here = mesh.col(v);
+                    let target = if b.negative { here * 2.0 - mean } else { mean };
+                    here.lerp(target.clamp(Vec3::ZERO, Vec3::ONE), (w * strength).clamp(0.0, 1.0))
                 })
                 .collect();
             for (&v, c) in verts.iter().zip(blurred) {
-                mesh.verts[v as usize].col = c;
+                mesh.set_col(v, c);
             }
             return verts;
         }
@@ -664,10 +667,11 @@ pub fn apply(
         }
         BrushKind::Mask => {
             for (&v, &w) in verts.iter().zip(&weights) {
-                let vx = &mut mesh.verts[v as usize];
                 let d = w * strength * 0.5 * sign;
-                vx.mask = (vx.mask + d).clamp(0.0, 1.0);
+                mesh.set_mask(v, (mesh.mask(v) + d).clamp(0.0, 1.0));
             }
+            // Clearing a mask back to nothing should give the memory back.
+            mesh.compact_mask();
             return verts;
         }
         _ => {}
@@ -679,10 +683,9 @@ pub fn apply(
         let mut sp = Vec3::ZERO;
         let mut sn = Vec3::ZERO;
         for (&v, &w) in verts.iter().zip(&weights) {
-            let vx = &mesh.verts[v as usize];
             sw += w;
-            sp += vx.pos * w;
-            sn += vx.nrm * w;
+            sp += mesh.pos[v as usize] * w;
+            sn += mesh.nrm[v as usize] * w;
         }
         if sw > 1e-6 {
             (sp / sw, sn.normalize_or(input.normal))
@@ -705,11 +708,10 @@ pub fn apply(
             if w <= 0.0 {
                 return Vec3::ZERO;
             }
-            let vx = &mesh.verts[v as usize];
-            let p = vx.pos;
+            let p = mesh.pos[v as usize];
             match b.kind {
                 BrushKind::Draw => input.normal * (amp * w),
-                BrushKind::Inflate => vx.nrm * (amp * w),
+                BrushKind::Inflate => mesh.nrm[v as usize] * (amp * w),
                 BrushKind::Move | BrushKind::Drag => input.drag * (w * strength),
                 BrushKind::Smooth => {
                     let nb = mesh.neighbors(v);
@@ -718,7 +720,7 @@ pub fn apply(
                     }
                     let mut mean = Vec3::ZERO;
                     for &n in &nb {
-                        mean += mesh.verts[n as usize].pos;
+                        mean += mesh.pos[n as usize];
                     }
                     mean /= nb.len() as f32;
                     let mut delta = mean - p;
@@ -765,7 +767,7 @@ pub fn apply(
         .collect();
 
     for (&v, d) in verts.iter().zip(displacements) {
-        mesh.verts[v as usize].pos += d;
+        mesh.pos[v as usize] += d;
     }
 
     if b.auto_smooth > 0.0 {
@@ -781,7 +783,7 @@ fn weighted_mean_color(mesh: &Mesh, verts: &[u32], weights: &[f32]) -> Vec3 {
     let mut sum = Vec3::ZERO;
     let mut total = 0.0;
     for (&v, &w) in verts.iter().zip(weights) {
-        sum += mesh.verts[v as usize].col * w;
+        sum += mesh.col(v) * w;
         total += w;
     }
     if total > 1e-6 {
@@ -803,14 +805,14 @@ pub fn relax(mesh: &mut Mesh, verts: &[u32], weights: &[f32], amount: f32) {
             }
             let mut mean = Vec3::ZERO;
             for &n in &nb {
-                mean += mesh.verts[n as usize].pos;
+                mean += mesh.pos[n as usize];
             }
             mean /= nb.len() as f32;
-            (mean - mesh.verts[v as usize].pos) * (w * amount).clamp(0.0, 1.0)
+            (mean - mesh.pos[v as usize]) * (w * amount).clamp(0.0, 1.0)
         })
         .collect();
     for (&v, d) in verts.iter().zip(deltas) {
-        mesh.verts[v as usize].pos += d;
+        mesh.pos[v as usize] += d;
     }
 }
 

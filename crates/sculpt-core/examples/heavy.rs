@@ -19,9 +19,9 @@ fn ms<T>(label: &str, f: impl FnOnce() -> T) -> T {
 
 /// Ce que le maillage occupe, poste par poste.
 fn footprint(m: &Mesh) {
-    let v = m.verts.len();
+    let v = m.pos.len();
     let f = m.faces.len();
-    let verts = v * std::mem::size_of::<sculpt_core::Vertex>();
+    let verts = m.vertex_bytes();
     let faces = f * 12;
     // Une liste de faces garde huit indices en ligne, qu'ils servent ou non.
     let adj = v * std::mem::size_of::<sculpt_core::mesh::FaceList>();
@@ -31,6 +31,19 @@ fn footprint(m: &Mesh) {
         faces as f64 / 1e6,
         adj as f64 / 1e6,
         (verts + faces + adj) as f64 / 1e6
+    );
+    // Ce qu'un sommet coûte vraiment, et pourquoi: les canaux qu'on n'a pas
+    // touchés ne sont pas alloués du tout.
+    let awake: Vec<&str> = m
+        .awake_channels()
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| *name)
+        .collect();
+    println!(
+        "  {:.0} octets par sommet, contre 48 en entrelacé; canaux réveillés: {}",
+        verts as f64 / v.max(1) as f64,
+        if awake.is_empty() { "aucun".to_string() } else { awake.join(", ") }
     );
 }
 
@@ -155,7 +168,7 @@ fn main() {
     println!(
         "  historique du trait: {:>5.0} Mo, contre {:.0} Mo pour une copie du maillage",
         s.history.used_bytes() as f64 / 1e6,
-        (s.mesh().verts.len() * std::mem::size_of::<sculpt_core::Vertex>()
+        (s.mesh().pos.len() * std::mem::size_of::<sculpt_core::Vertex>()
             + s.mesh().faces.len() * 12) as f64
             / 1e6
     );
@@ -187,9 +200,9 @@ fn main() {
     footprint(&fine);
     println!(
         "  pic pendant l'opération: l'ancien et le nouveau existent en même temps, donc environ {:.0} Mo",
-        ((m.verts.len() + fine.verts.len()) * std::mem::size_of::<sculpt_core::Vertex>()
+        ((m.vertex_bytes() + fine.vertex_bytes())
             + (m.faces.len() + fine.faces.len()) * 12
-            + (m.verts.len() + fine.verts.len())
+            + (m.pos.len() + fine.pos.len())
                 * std::mem::size_of::<sculpt_core::mesh::FaceList>()) as f64
             / 1e6
     );

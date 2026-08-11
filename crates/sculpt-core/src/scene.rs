@@ -153,8 +153,11 @@ impl Scene {
         for &i in &visible {
             let mut o = self.objects[i].clone();
             o.apply_transform();
-            let base = merged.verts.len() as u32;
-            merged.verts.extend_from_slice(&o.mesh.verts);
+            let base = merged.vert_count() as u32;
+            merged.resize_verts((base as usize) + o.mesh.vert_count());
+            for v in 0..o.mesh.vert_count() as u32 {
+                merged.write_vertex(base + v, &o.mesh.vertex(v));
+            }
             merged
                 .faces
                 .extend(o.mesh.faces.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));

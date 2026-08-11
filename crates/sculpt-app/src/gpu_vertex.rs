@@ -25,7 +25,7 @@
 
 use glam::{Vec2, Vec3};
 use rayon::prelude::*;
-use sculpt_core::Vertex;
+use sculpt_core::{Mesh, Vertex};
 
 /// Words in the hot stream: three of position, one of packed normal.
 pub const HOT_WORDS: usize = 4;
@@ -63,32 +63,55 @@ fn unorm8(v: f32) -> u32 {
 
 /// The four words the card reads to place and shade a vertex.
 #[inline]
+pub fn hot_from(pos: Vec3, nrm: Vec3) -> [u32; HOT_WORDS] {
+    [pos.x.to_bits(), pos.y.to_bits(), pos.z.to_bits(), oct_encode(nrm)]
+}
+
+#[inline]
 pub fn hot(v: &Vertex) -> [u32; HOT_WORDS] {
-    [
-        v.pos.x.to_bits(),
-        v.pos.y.to_bits(),
-        v.pos.z.to_bits(),
-        oct_encode(v.nrm),
-    ]
+    hot_from(v.pos, v.nrm)
 }
 
 /// The two words that only painting writes to.
 #[inline]
-pub fn cold(v: &Vertex) -> [u32; COLD_WORDS] {
+pub fn cold_from(col: Vec3, mask: f32, rough: f32, metal: f32) -> [u32; COLD_WORDS] {
     [
-        unorm8(v.col.x) | (unorm8(v.col.y) << 8) | (unorm8(v.col.z) << 16) | (unorm8(v.mask) << 24),
-        unorm8(v.rough) | (unorm8(v.metal) << 8),
+        unorm8(col.x) | (unorm8(col.y) << 8) | (unorm8(col.z) << 16) | (unorm8(mask) << 24),
+        unorm8(rough) | (unorm8(metal) << 8),
     ]
+}
+
+#[inline]
+pub fn cold(v: &Vertex) -> [u32; COLD_WORDS] {
+    cold_from(v.col, v.mask, v.rough, v.metal)
 }
 
 /// Packs a whole mesh, both streams at once and across every core.
 ///
 /// Called when a mesh arrives or is rewritten from end to end, which on a large
 /// model means several million vertices at a stroke.
-pub fn pack_all(verts: &[Vertex]) -> (Vec<u32>, Vec<u32>) {
+///
+/// The hot stream reads the two arrays the engine always holds. The cold one
+/// asks the mesh for each vertex, and on a model nobody has painted every one
+/// of those answers is the channel default, which costs no memory to store and
+/// nothing to read.
+pub fn pack_all(mesh: &Mesh) -> (Vec<u32>, Vec<u32>) {
     rayon::join(
-        || verts.par_iter().flat_map_iter(|v| hot(v)).collect(),
-        || verts.par_iter().flat_map_iter(|v| cold(v)).collect(),
+        || {
+            mesh.pos
+                .par_iter()
+                .zip(mesh.nrm.par_iter())
+                .flat_map_iter(|(p, n)| hot_from(*p, *n))
+                .collect()
+        },
+        || {
+            (0..mesh.vert_count() as u32)
+                .into_par_iter()
+                .flat_map_iter(|v| {
+                    cold_from(mesh.col(v), mesh.mask(v), mesh.rough(v), mesh.metal(v))
+                })
+                .collect()
+        },
     )
 }
 

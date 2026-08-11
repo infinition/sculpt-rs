@@ -7,6 +7,7 @@
 pub mod accel;
 pub mod alpha;
 pub mod brush;
+pub mod channel;
 pub mod cluster;
 pub mod dyntopo;
 pub mod history;
@@ -19,6 +20,7 @@ pub mod topology;
 
 pub use accel::Grid;
 pub use alpha::{Alpha, Shape as AlphaShape};
+pub use channel::Channel;
 pub use cluster::{Cluster, Partition};
 pub use brush::{Axis, BlendMode, Brush, BrushKind, Falloff, FillScope, StrokeInput};
 pub use dyntopo::{DetailMode, Dyntopo};
@@ -203,7 +205,7 @@ impl Sculptor {
     /// Roughly what the active mesh occupies, for sizing the history against it.
     fn mesh_bytes(&self) -> usize {
         let m = self.mesh();
-        m.verts.len() * std::mem::size_of::<Vertex>() + m.faces.len() * 12
+        m.pos.len() * std::mem::size_of::<Vertex>() + m.faces.len() * 12
     }
 
     pub fn is_stroking(&self) -> bool {
@@ -605,7 +607,7 @@ impl Sculptor {
         }
         let mut best: Option<SceneHit> = None;
         for (i, o) in self.scene.objects.iter().enumerate() {
-            if !o.visible || o.mesh.verts.is_empty() {
+            if !o.visible || o.mesh.pos.is_empty() {
                 continue;
             }
             let identity = o.transform.is_identity();
@@ -647,12 +649,12 @@ impl Sculptor {
         let tri = *mesh.faces.get(hit.local.face as usize)?;
         let mut best = (f32::MAX, tri[0]);
         for &v in &tri {
-            let d = mesh.verts[v as usize].pos.distance_squared(hit.local.point);
+            let d = mesh.pos[v as usize].distance_squared(hit.local.point);
             if d < best.0 {
                 best = (d, v);
             }
         }
-        Some(mesh.verts[best.1 as usize].col)
+        Some(mesh.col(best.1))
     }
 }
 
@@ -673,10 +675,10 @@ mod tests {
 
     /// Checks that adjacency agrees with the face array in both directions.
     fn validate(m: &Mesh) {
-        assert_eq!(m.verts.len(), m.vfaces.len(), "adjacency length mismatch");
+        assert_eq!(m.pos.len(), m.vfaces.len(), "adjacency length mismatch");
         for (fi, tri) in m.faces.iter().enumerate() {
             for &v in tri {
-                assert!((v as usize) < m.verts.len(), "face references dead vertex");
+                assert!((v as usize) < m.pos.len(), "face references dead vertex");
                 assert!(
                     m.vfaces[v as usize].contains(&(fi as u32)),
                     "face {fi} missing from vfaces[{v}]"
@@ -698,7 +700,7 @@ mod tests {
     fn validate_accel(m: &Mesh) {
         let Some(g) = &m.accel else { return };
         let r = m.mean_edge_len() * 3.0;
-        for (i, v) in m.verts.iter().enumerate().step_by(7) {
+        for (i, v) in m.vertices().enumerate().step_by(7) {
             let found = g.verts_in_sphere(m, v.pos, r).expect("grid query");
             assert!(
                 found.contains(&(i as u32)),
@@ -785,7 +787,7 @@ mod tests {
         // Keep the vertex list still, so a vertex can be compared with itself.
         s.dyntopo_enabled = false;
 
-        let before: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+        let before: Vec<Vec3> = s.mesh().pos.clone();
         s.begin_stroke();
         s.stroke(&StrokeInput {
             point: Vec3::new(0.0, 1.0, 0.0),
@@ -796,7 +798,7 @@ mod tests {
         s.end_stroke();
 
         let mut moved_right = 0;
-        for (i, v) in s.mesh().verts.iter().enumerate() {
+        for (i, v) in s.mesh().vertices().enumerate() {
             let d = (v.pos - before[i]).length();
             // The dab centre is above +Y, and the image runs along +X.
             if before[i].x > 0.2 && before[i].y > 0.7 {
@@ -872,7 +874,7 @@ mod tests {
     #[test]
     fn undo_restores_the_previous_state() {
         let mut s = Sculptor::new(primitives::icosphere(2));
-        let before = s.mesh().verts[0].pos;
+        let before = s.mesh().pos[0];
         s.begin_stroke();
         s.stroke(&StrokeInput {
             point: before,
@@ -880,10 +882,10 @@ mod tests {
             ..Default::default()
         });
         s.end_stroke();
-        assert_ne!(s.mesh().verts[0].pos, before);
+        assert_ne!(s.mesh().pos[0], before);
         s.undo();
         validate(s.mesh());
-        assert_eq!(s.mesh().verts[0].pos, before);
+        assert_eq!(s.mesh().pos[0], before);
     }
 
     #[test]
@@ -908,13 +910,13 @@ mod tests {
     #[test]
     fn ply_roundtrip_preserves_colors() {
         let mut m = primitives::icosphere(2);
-        m.verts[3].col = Vec3::new(1.0, 0.0, 0.0);
+        m.set_col(3, Vec3::new(1.0, 0.0, 0.0));
         let path = std::env::temp_dir().join("sculpt_rs_roundtrip.ply");
         io::write_ply(&m, &path).unwrap();
         let back = io::read_ply(&path).unwrap();
         assert_eq!(m.vert_count(), back.vert_count());
         assert_eq!(m.face_count(), back.face_count());
-        assert!(back.verts[3].col.x > 0.9 && back.verts[3].col.y < 0.1);
+        assert!(back.col(3).x > 0.9 && back.col(3).y < 0.1);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -944,7 +946,7 @@ mod tests {
         s.brush.radius = 0.3;
         s.brush.strength = 1.0;
 
-        let before: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+        let before: Vec<Vec3> = s.mesh().pos.clone();
         let geometry_bytes = before.len() * std::mem::size_of::<Vertex>();
 
         s.begin_stroke();
@@ -956,7 +958,7 @@ mod tests {
             });
         }
         s.end_stroke();
-        assert!(s.mesh().verts[0].pos.distance(before[0]) >= 0.0);
+        assert!(s.mesh().pos[0].distance(before[0]) >= 0.0);
 
         // La trace doit être une fraction de la géométrie, pas une copie.
         let kept = s.history.used_bytes();
@@ -966,7 +968,7 @@ mod tests {
         );
 
         s.undo();
-        for (i, v) in s.mesh().verts.iter().enumerate() {
+        for (i, v) in s.mesh().vertices().enumerate() {
             assert!(
                 v.pos.distance(before[i]) < 1e-6,
                 "le sommet {i} n'est pas revenu à sa place"
@@ -987,7 +989,7 @@ mod tests {
         s.brush.strength = 0.8;
 
         let faces_before = s.mesh().faces.clone();
-        let verts_before: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+        let verts_before: Vec<Vec3> = s.mesh().pos.clone();
         let mesh_bytes = s.mesh_bytes();
 
         s.begin_stroke();
@@ -1000,7 +1002,7 @@ mod tests {
         }
         s.end_stroke();
         assert!(s.mesh().face_count() > faces_before.len(), "rien n'a été raffiné");
-        let after: Vec<Vec3> = s.mesh().verts.iter().map(|v| v.pos).collect();
+        let after: Vec<Vec3> = s.mesh().pos.clone();
 
         // Ce que le trait a coûté à l'historique doit suivre ce qu'il a touché,
         // pas la taille du modèle: c'est toute la raison du journal.
@@ -1013,7 +1015,7 @@ mod tests {
         s.undo();
         assert_eq!(s.mesh().faces, faces_before, "les faces ne sont pas revenues");
         assert_eq!(s.mesh().vert_count(), verts_before.len());
-        for (i, v) in s.mesh().verts.iter().enumerate() {
+        for (i, v) in s.mesh().vertices().enumerate() {
             assert!(v.pos.distance(verts_before[i]) < 1e-6, "sommet {i}");
         }
         validate(s.mesh());
@@ -1021,7 +1023,7 @@ mod tests {
         // Et refaire doit rendre exactement ce que l'annulation a repris.
         s.redo();
         assert_eq!(s.mesh().vert_count(), after.len(), "le refait a perdu des sommets");
-        for (i, v) in s.mesh().verts.iter().enumerate() {
+        for (i, v) in s.mesh().vertices().enumerate() {
             assert!(v.pos.distance(after[i]) < 1e-6, "sommet {i} refait");
         }
         validate(s.mesh());
@@ -1038,7 +1040,7 @@ mod tests {
         s.brush.radius = 0.3;
         s.brush.strength = 0.7;
 
-        let before: Vec<Vertex> = s.mesh().verts.clone();
+        let before: Vec<Vertex> = s.mesh().vertices().collect();
         let faces = s.mesh().faces.clone();
 
         s.begin_stroke();
@@ -1048,13 +1050,13 @@ mod tests {
         }
         s.end_stroke();
         assert!(
-            s.mesh().verts.iter().zip(&before).any(|(a, b)| a.pos != b.pos),
+            s.mesh().vertices().zip(&before).any(|(a, b)| a.pos != b.pos),
             "le trait n'a rien déplacé"
         );
 
         s.undo();
         assert_eq!(s.mesh().faces, faces, "la topologie a bougé alors qu'elle ne devait pas");
-        for (i, (now, was)) in s.mesh().verts.iter().zip(&before).enumerate() {
+        for (i, (now, was)) in s.mesh().vertices().zip(&before).enumerate() {
             assert!(now.pos.distance(was.pos) < 1e-6, "sommet {i}");
             assert!(now.nrm.distance(was.nrm) < 1e-4, "normale {i}");
         }
@@ -1159,13 +1161,13 @@ mod tests {
         s.stroke(&StrokeInput { point: p, normal: p, ..Default::default() });
         s.end_stroke();
 
-        let far_right = s.mesh().verts.iter().map(|v| v.pos.length()).fold(0.0f32, f32::max);
+        let far_right = s.mesh().pos.iter().map(|p| p.length()).fold(0.0f32, f32::max);
         let left_max = s
             .mesh()
-            .verts
+            .pos
             .iter()
-            .filter(|v| v.pos.x < -0.5)
-            .map(|v| v.pos.length())
+            .filter(|p| p.x < -0.5)
+            .map(|p| p.length())
             .fold(0.0f32, f32::max);
         assert!(left_max > 1.0, "the mirrored side should have moved too");
         assert!((far_right - left_max).abs() < 1e-3, "both sides should match");
@@ -1214,19 +1216,19 @@ mod tests {
         );
         // One side of a 4x4 subdivided cube has five by five vertices.
         assert_eq!(touched, 25, "the fill should stop at the cube's edges");
-        let red = m.verts.iter().filter(|v| v.col.x > 0.9 && v.col.y < 0.1).count();
+        let red = m.vertices().filter(|v| v.col.x > 0.9 && v.col.y < 0.1).count();
         assert_eq!(red, 25);
     }
 
     #[test]
     fn masked_vertices_resist_a_fill() {
         let mut m = primitives::cube(4);
-        for v in m.verts.iter_mut() {
-            v.mask = 1.0;
+        for v in 0..m.vert_count() as u32 {
+            m.set_mask(v, 1.0);
         }
-        let before = m.verts[0].col;
+        let before = m.col(0);
         topology::fill(&mut m, 0, FillScope::Object, Vec3::X, BlendMode::Normal, 1.0, 35.0);
-        assert_eq!(m.verts[0].col, before);
+        assert_eq!(m.col(0), before);
     }
 
     #[test]

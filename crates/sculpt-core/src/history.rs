@@ -8,7 +8,7 @@
 
 use crate::mesh::{Mesh, TopoLog, Vertex};
 use crate::scene::{Object, Scene, Transform};
-use glam::Vec3;
+
 use std::collections::VecDeque;
 
 pub enum Step {
@@ -48,7 +48,7 @@ impl Step {
         let o = scene.objects.get(index)?;
         Some(Step::Geometry {
             index,
-            verts: o.mesh.verts.clone(),
+            verts: (0..o.mesh.vert_count() as u32).map(|v| o.mesh.vertex(v)).collect(),
             faces: o.mesh.faces.clone(),
         })
     }
@@ -67,7 +67,7 @@ impl Step {
             Step::Scene { objects, .. } => objects
                 .iter()
                 .map(|o| {
-                    o.mesh.verts.len() * std::mem::size_of::<Vertex>()
+                    o.mesh.pos.len() * std::mem::size_of::<Vertex>()
                         + o.mesh.faces.len() * std::mem::size_of::<[u32; 3]>()
                 })
                 .sum(),
@@ -81,7 +81,10 @@ impl Step {
             Step::Geometry { index, verts, faces } => {
                 let current = Step::geometry_of(scene, index);
                 if let Some(o) = scene.objects.get_mut(index) {
-                    o.mesh.verts = verts;
+                    o.mesh.resize_verts(verts.len());
+                    for (i, v) in verts.iter().enumerate() {
+                        o.mesh.write_vertex(i as u32, v);
+                    }
                     o.mesh.faces = faces;
                     o.mesh.rebuild_adjacency();
                 }
@@ -92,13 +95,13 @@ impl Step {
                     return Step::Placement { index, transform: Transform::default() };
                 };
                 let m = &mut o.mesh;
-                let (now_vlen, now_flen) = (m.verts.len(), m.faces.len());
+                let (now_vlen, now_flen) = (m.pos.len(), m.faces.len());
 
                 // What putting this back is about to overwrite is exactly what
                 // the opposite step will have to put back in turn: the slots
                 // named here, plus whatever falls off the end when the arrays
                 // go back to their old length.
-                let now_verts = capture(&verts, vlen, now_vlen, |i| m.verts[i]);
+                let now_verts = capture(&verts, vlen, now_vlen, |i| m.vertex(i as u32));
                 let now_faces = capture(&faces, flen, now_flen, |i| m.faces[i]);
 
                 // A stroke that only moved vertices leaves the arrays the shape
@@ -107,10 +110,10 @@ impl Step {
                 // at once and one that stops for a tenth of a second.
                 let structural = !faces.is_empty() || vlen != now_vlen || flen != now_flen;
 
-                m.verts.resize(vlen, Vertex::new(Vec3::ZERO));
+                m.resize_verts(vlen);
                 m.faces.resize(flen, [0, 0, 0]);
                 for (i, v) in &verts {
-                    m.verts[*i as usize] = *v;
+                    m.write_vertex(*i, v);
                 }
                 for (i, t) in &faces {
                     m.faces[*i as usize] = *t;
@@ -119,7 +122,7 @@ impl Step {
                 let touched: Vec<u32> = verts
                     .iter()
                     .map(|(v, _)| *v)
-                    .filter(|v| (*v as usize) < m.verts.len())
+                    .filter(|v| (*v as usize) < m.pos.len())
                     .collect();
                 if structural {
                     m.rebuild_adjacency();
@@ -322,5 +325,8 @@ impl History {
 
 /// Convenience for tests and callers that only ever hold one mesh.
 pub fn snapshot_mesh(mesh: &Mesh) -> (Vec<Vertex>, Vec<[u32; 3]>) {
-    (mesh.verts.clone(), mesh.faces.clone())
+    (
+        (0..mesh.vert_count() as u32).map(|v| mesh.vertex(v)).collect(),
+        mesh.faces.clone(),
+    )
 }

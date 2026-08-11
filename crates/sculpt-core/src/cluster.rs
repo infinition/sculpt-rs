@@ -286,9 +286,9 @@ pub fn build(mesh: &mut Mesh, target: usize) -> Partition {
         .par_iter()
         .enumerate()
         .map(|(i, tri)| {
-            let c = (mesh.verts[tri[0] as usize].pos
-                + mesh.verts[tri[1] as usize].pos
-                + mesh.verts[tri[2] as usize].pos)
+            let c = (mesh.pos[tri[0] as usize]
+                + mesh.pos[tri[1] as usize]
+                + mesh.pos[tri[2] as usize])
                 / 3.0;
             (morton((c - lo) / span), i as u32)
         })
@@ -339,7 +339,7 @@ fn extent(mesh: &Mesh, first: usize, count: usize) -> (Vec3, Vec3, Vec3, f32) {
     let mut sum = Vec3::ZERO;
     for tri in &mesh.faces[first..first + count] {
         for &v in tri {
-            let p = mesh.verts[v as usize].pos;
+            let p = mesh.pos[v as usize];
             lo = lo.min(p);
             hi = hi.max(p);
         }
@@ -356,9 +356,9 @@ fn extent(mesh: &Mesh, first: usize, count: usize) -> (Vec3, Vec3, Vec3, f32) {
 }
 
 fn face_normal(mesh: &Mesh, tri: &[u32; 3]) -> Vec3 {
-    let a = mesh.verts[tri[0] as usize].pos;
-    let b = mesh.verts[tri[1] as usize].pos;
-    let c = mesh.verts[tri[2] as usize].pos;
+    let a = mesh.pos[tri[0] as usize];
+    let b = mesh.pos[tri[1] as usize];
+    let c = mesh.pos[tri[2] as usize];
     (b - a).cross(c - a).normalize_or(Vec3::Y)
 }
 
@@ -453,7 +453,7 @@ mod tests {
         for c in &p.clusters {
             for tri in &m.faces[c.first as usize..(c.first + c.count) as usize] {
                 for &v in tri {
-                    let q = m.verts[v as usize].pos;
+                    let q = m.pos[v as usize];
                     assert!(
                         q.cmpge(c.lo - Vec3::splat(1e-5)).all()
                             && q.cmple(c.hi + Vec3::splat(1e-5)).all(),
@@ -572,7 +572,7 @@ mod tests {
                 }
                 for tri in &m.faces[c.first as usize..(c.first + c.count) as usize] {
                     let n = face_normal(&m, tri);
-                    let a = m.verts[tri[0] as usize].pos;
+                    let a = m.pos[tri[0] as usize];
                     assert!(
                         n.dot((a - eye).normalize()) > 0.0,
                         "une face de face a été écartée"
@@ -635,7 +635,7 @@ mod tests {
             next += c.count;
             for tri in &m.faces[c.first as usize..(c.first + c.count) as usize] {
                 for &v in tri {
-                    let q = m.verts[v as usize].pos;
+                    let q = m.pos[v as usize];
                     assert!(
                         q.cmpge(c.lo - Vec3::splat(1e-4)).all()
                             && q.cmple(c.hi + Vec3::splat(1e-4)).all(),
@@ -654,7 +654,7 @@ mod tests {
 
         // Pousse un sommet du premier paquet très loin.
         let v = m.faces[0][0] as usize;
-        m.verts[v].pos += Vec3::new(0.0, 5.0, 0.0);
+        m.pos[v] += Vec3::new(0.0, 5.0, 0.0);
         remeasure(&m, &mut p.clusters, &[0], 256);
 
         assert!(p.clusters[0].hi.y > before.hi.y + 1.0, "la boîte n'a pas suivi");

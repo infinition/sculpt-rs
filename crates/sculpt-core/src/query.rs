@@ -18,10 +18,10 @@ pub fn verts_in_sphere(mesh: &Mesh, center: Vec3, radius: f32) -> Vec<u32> {
         }
     }
     let r2 = radius * radius;
-    mesh.verts
+    mesh.pos
         .par_iter()
         .enumerate()
-        .filter_map(|(i, v)| (v.pos.distance_squared(center) <= r2).then_some(i as u32))
+        .filter_map(|(i, p)| (p.distance_squared(center) <= r2).then_some(i as u32))
         .collect()
 }
 
@@ -49,7 +49,7 @@ pub fn faces_in_sphere(mesh: &Mesh, center: Vec3, radius: f32) -> Vec<u32> {
         .filter_map(|(i, tri)| {
             let hit = tri
                 .iter()
-                .any(|&v| mesh.verts[v as usize].pos.distance_squared(center) <= r2);
+                .any(|&v| mesh.pos[v as usize].distance_squared(center) <= r2);
             hit.then_some(i as u32)
         })
         .collect()
@@ -69,9 +69,9 @@ const EPS: f32 = 1e-7;
 #[inline]
 pub fn ray_face(mesh: &Mesh, fi: u32, origin: Vec3, dir: Vec3) -> Option<Hit> {
     let [a, b, c] = mesh.faces[fi as usize];
-    let pa = mesh.verts[a as usize].pos;
-    let pb = mesh.verts[b as usize].pos;
-    let pc = mesh.verts[c as usize].pos;
+    let pa = mesh.pos[a as usize];
+    let pb = mesh.pos[b as usize];
+    let pc = mesh.pos[c as usize];
 
     let e1 = pb - pa;
     let e2 = pc - pa;
@@ -130,7 +130,7 @@ pub fn raycast(mesh: &Mesh, origin: Vec3, dir: Vec3) -> Option<Hit> {
 /// over every vertex, sixty times a second, is what made half a million
 /// triangles crawl.
 pub fn nearest_to_ray(mesh: &Mesh, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<Hit> {
-    if mesh.verts.is_empty() || max_dist <= 0.0 {
+    if mesh.pos.is_empty() || max_dist <= 0.0 {
         return None;
     }
     let d = dir.normalize_or(-Vec3::Z);
@@ -149,7 +149,7 @@ pub fn nearest_to_ray(mesh: &Mesh, origin: Vec3, dir: Vec3, max_dist: f32) -> Op
         let mut budget = 64;
         loop {
             for v in verts_in_sphere(mesh, origin + d * t, max_dist) {
-                let to = mesh.verts[v as usize].pos - origin;
+                let to = mesh.pos[v as usize] - origin;
                 let along = to.dot(d);
                 if along <= 0.0 {
                     continue;
@@ -178,11 +178,11 @@ pub fn nearest_to_ray(mesh: &Mesh, origin: Vec3, dir: Vec3, max_dist: f32) -> Op
     // No grid, or a walk too long to be worth it.
     let limit = max_dist * max_dist;
     let best = mesh
-        .verts
+        .pos
         .par_iter()
         .enumerate()
-        .filter_map(|(i, v)| {
-            let to = v.pos - origin;
+        .filter_map(|(i, p)| {
+            let to = *p - origin;
             let along = to.dot(d);
             if along <= 0.0 {
                 return None; // behind the camera
@@ -201,16 +201,16 @@ pub fn nearest_to_ray(mesh: &Mesh, origin: Vec3, dir: Vec3, max_dist: f32) -> Op
 }
 
 fn hit_at_vertex(mesh: &Mesh, index: u32, along: f32) -> Hit {
-    let v = &mesh.verts[index as usize];
+    let p = mesh.pos[index as usize];
     let face = mesh.vfaces[index as usize].first().copied().unwrap_or(0);
-    Hit { face, point: v.pos, normal: v.nrm, t: along }
+    Hit { face, point: p, normal: mesh.nrm[index as usize], t: along }
 }
 
 /// Nearest vertex to a point within `radius`, for colour picking and snapping.
 pub fn nearest_vertex(mesh: &Mesh, p: Vec3, radius: f32) -> Option<u32> {
     verts_in_sphere(mesh, p, radius)
         .into_iter()
-        .map(|v| (v, mesh.verts[v as usize].pos.distance_squared(p)))
+        .map(|v| (v, mesh.pos[v as usize].distance_squared(p)))
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(v, _)| v)
 }

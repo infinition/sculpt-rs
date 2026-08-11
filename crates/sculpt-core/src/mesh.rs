@@ -9,6 +9,7 @@
 //! rewrites the arrays wholesale drops it and lets the next query rebuild.
 
 use crate::accel::Grid;
+use crate::channel::{from_unorm16, from_unorm8, to_unorm16, to_unorm8, Channel};
 use glam::Vec3;
 use rayon::prelude::*;
 use smallvec::SmallVec;
@@ -61,6 +62,12 @@ fn fill_adjacency(vfaces: &mut [FaceList], faces: &[[u32; 3]]) {
         });
 }
 
+/// Everything about one vertex, gathered into a value.
+///
+/// This is not how a mesh stores its vertices; see [`crate::channel`] for that.
+/// It is what a caller gets when it asks for one and what it hands back, and
+/// what the undo log and the file formats keep, because all three want a whole
+/// vertex at a time rather than one attribute across the whole mesh.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
@@ -159,9 +166,26 @@ impl TopoLog {
     }
 }
 
+/// Default colour of a vertex nobody has painted: a light clay grey.
+const DEFAULT_COL: [u8; 3] = [217, 217, 217];
+/// Default roughness, the same 0.6 the shading has always assumed.
+const DEFAULT_ROUGH: u8 = 153;
+
 #[derive(Clone, Default)]
 pub struct Mesh {
-    pub verts: Vec<Vertex>,
+    /// Where every vertex is. Always present, always full precision, because
+    /// everything else is measured against it.
+    pub pos: Vec<Vec3>,
+    /// Which way the surface faces at every vertex. Derived, but kept, because
+    /// a dab reads it to decide what to cull before it moves anything.
+    pub nrm: Vec<Vec3>,
+    /// Painted colour, a byte a component, dormant until something paints.
+    col: Channel<[u8; 3]>,
+    /// How protected a vertex is, two bytes because brushes read and write it
+    /// over and over and a colour's precision would drift.
+    mask: Channel<u16>,
+    rough: Channel<u8>,
+    metal: Channel<u8>,
     pub faces: Vec<[u32; 3]>,
     /// `vfaces[v]` lists every face index referencing `v`.
     pub vfaces: Vec<FaceList>,
@@ -195,10 +219,16 @@ impl Mesh {
 
     /// Builds a mesh from a raw triangle soup and derives adjacency + normals.
     pub fn from_soup(positions: &[Vec3], faces: &[[u32; 3]]) -> Self {
+        let n = positions.len();
         let mut m = Self {
-            verts: positions.iter().map(|p| Vertex::new(*p)).collect(),
+            pos: positions.to_vec(),
+            nrm: vec![Vec3::Y; n],
+            col: Channel::with_len(DEFAULT_COL, n),
+            mask: Channel::with_len(0, n),
+            rough: Channel::with_len(DEFAULT_ROUGH, n),
+            metal: Channel::with_len(0, n),
             faces: faces.to_vec(),
-            vfaces: vec![FaceList::new(); positions.len()],
+            vfaces: vec![FaceList::new(); n],
             ..Default::default()
         };
         m.rebuild_adjacency();
@@ -207,7 +237,152 @@ impl Mesh {
     }
 
     pub fn vert_count(&self) -> usize {
-        self.verts.len()
+        self.pos.len()
+    }
+
+    // ---- vertex attributes --------------------------------------------------
+
+    /// Everything about one vertex, gathered.
+    ///
+    /// Reads every channel, so it is the wrong thing to call in a loop over the
+    /// whole mesh. The undo log and the file formats want it; a brush wants one
+    /// attribute at a time.
+    #[inline]
+    pub fn vertex(&self, v: u32) -> Vertex {
+        let i = v as usize;
+        Vertex {
+            pos: self.pos[i],
+            nrm: self.nrm[i],
+            col: unpack_col(self.col.get(i)),
+            mask: from_unorm16(self.mask.get(i)),
+            rough: from_unorm8(self.rough.get(i)),
+            metal: from_unorm8(self.metal.get(i)),
+        }
+    }
+
+    /// Every vertex, gathered one at a time.
+    ///
+    /// For the file formats, which write a whole vertex per record. Nothing
+    /// inside the engine should walk a mesh this way: it reads every channel
+    /// for every vertex, which is the cost the channels exist to avoid.
+    pub fn vertices(&self) -> impl Iterator<Item = Vertex> + '_ {
+        (0..self.vert_count() as u32).map(|v| self.vertex(v))
+    }
+
+    /// Writes a whole vertex back, waking whichever channels it disturbs.
+    #[inline]
+    pub fn write_vertex(&mut self, v: u32, x: &Vertex) {
+        let i = v as usize;
+        self.pos[i] = x.pos;
+        self.nrm[i] = x.nrm;
+        self.col.set(i, pack_col(x.col));
+        self.mask.set(i, to_unorm16(x.mask));
+        self.rough.set(i, to_unorm8(x.rough));
+        self.metal.set(i, to_unorm8(x.metal));
+    }
+
+    /// Appends a vertex to every channel at once.
+    fn append_vertex(&mut self, x: &Vertex) {
+        self.pos.push(x.pos);
+        self.nrm.push(x.nrm);
+        self.col.push(pack_col(x.col));
+        self.mask.push(to_unorm16(x.mask));
+        self.rough.push(to_unorm8(x.rough));
+        self.metal.push(to_unorm8(x.metal));
+    }
+
+    /// Drops the last vertex from every channel, or moves the last into a hole.
+    fn swap_remove_vertex_data(&mut self, i: usize) {
+        self.pos.swap_remove(i);
+        self.nrm.swap_remove(i);
+        self.col.swap_remove(i);
+        self.mask.swap_remove(i);
+        self.rough.swap_remove(i);
+        self.metal.swap_remove(i);
+    }
+
+    /// Sets every channel's length, growing with defaults.
+    ///
+    /// What an undo needs when it puts an array back to the length it had.
+    pub fn resize_verts(&mut self, n: usize) {
+        self.pos.resize(n, Vec3::ZERO);
+        self.nrm.resize(n, Vec3::Y);
+        self.col.resize(n);
+        self.mask.resize(n);
+        self.rough.resize(n);
+        self.metal.resize(n);
+    }
+
+    #[inline]
+    pub fn col(&self, v: u32) -> Vec3 {
+        unpack_col(self.col.get(v as usize))
+    }
+
+    #[inline]
+    pub fn set_col(&mut self, v: u32, c: Vec3) {
+        self.col.set(v as usize, pack_col(c));
+    }
+
+    #[inline]
+    pub fn mask(&self, v: u32) -> f32 {
+        from_unorm16(self.mask.get(v as usize))
+    }
+
+    #[inline]
+    pub fn set_mask(&mut self, v: u32, m: f32) {
+        self.mask.set(v as usize, to_unorm16(m));
+    }
+
+    #[inline]
+    pub fn rough(&self, v: u32) -> f32 {
+        from_unorm8(self.rough.get(v as usize))
+    }
+
+    #[inline]
+    pub fn set_rough(&mut self, v: u32, r: f32) {
+        self.rough.set(v as usize, to_unorm8(r));
+    }
+
+    #[inline]
+    pub fn metal(&self, v: u32) -> f32 {
+        from_unorm8(self.metal.get(v as usize))
+    }
+
+    #[inline]
+    pub fn set_metal(&mut self, v: u32, m: f32) {
+        self.metal.set(v as usize, to_unorm8(m));
+    }
+
+    /// True while no vertex carries a mask, which lets a brush skip the test
+    /// entirely rather than reading a zero for every vertex it touches.
+    #[inline]
+    pub fn mask_is_clear(&self) -> bool {
+        self.mask.is_dormant()
+    }
+
+    /// Gives the mask its memory back once it holds nothing.
+    pub fn compact_mask(&mut self) {
+        self.mask.sleep_if_uniform();
+    }
+
+    /// What the vertex data occupies, channel by channel, for the statistics.
+    pub fn vertex_bytes(&self) -> usize {
+        self.pos.len() * 12
+            + self.nrm.len() * 12
+            + self.col.bytes()
+            + self.mask.bytes()
+            + self.rough.bytes()
+            + self.metal.bytes()
+    }
+
+    /// Which channels are awake, for the statistics readout.
+    pub fn awake_channels(&self) -> [(&'static str, bool); 4] {
+        [
+            ("colour", !self.col.is_dormant()),
+            ("mask", !self.mask.is_dormant()),
+            ("roughness", !self.rough.is_dormant()),
+            ("metalness", !self.metal.is_dormant()),
+        ]
     }
 
     pub fn face_count(&self) -> usize {
@@ -216,7 +391,7 @@ impl Mesh {
 
     pub fn rebuild_adjacency(&mut self) {
         self.vfaces.clear();
-        self.vfaces.resize(self.verts.len(), FaceList::new());
+        self.vfaces.resize(self.pos.len(), FaceList::new());
         fill_adjacency(&mut self.vfaces, &self.faces);
         self.accel = None;
         self.mark_fully_dirty();
@@ -241,7 +416,7 @@ impl Mesh {
 
     /// Starts recording what it would take to undo what comes next.
     pub fn begin_log(&mut self) {
-        self.log = Some(TopoLog::new(self.verts.len(), self.faces.len()));
+        self.log = Some(TopoLog::new(self.pos.len(), self.faces.len()));
     }
 
     /// Hands the recording over and stops recording.
@@ -261,9 +436,13 @@ impl Mesh {
     #[inline]
     fn log_vert(&mut self, v: u32) {
         let Some(log) = &mut self.log else { return };
-        if (v as usize) < log.vlen && (v as usize) < self.verts.len() && log.vseen.insert(v) {
-            log.verts.push((v, self.verts[v as usize]));
+        if (v as usize) >= log.vlen || (v as usize) >= self.pos.len() || !log.vseen.insert(v) {
+            return;
         }
+        // Gathered rather than copied, because there is no longer one place a
+        // vertex lives. The log is per stroke and small; this is not a hot path.
+        let x = self.vertex(v);
+        self.log.as_mut().expect("checked above").verts.push((v, x));
     }
 
     #[inline]
@@ -343,9 +522,9 @@ impl Mesh {
     #[inline]
     pub fn face_sphere(&self, f: u32) -> (Vec3, f32) {
         let [a, b, c] = self.faces[f as usize];
-        let pa = self.verts[a as usize].pos;
-        let pb = self.verts[b as usize].pos;
-        let pc = self.verts[c as usize].pos;
+        let pa = self.pos[a as usize];
+        let pb = self.pos[b as usize];
+        let pc = self.pos[c as usize];
         let mid = (pa + pb + pc) / 3.0;
         (mid, pa.distance(mid).max(pb.distance(mid)).max(pc.distance(mid)))
     }
@@ -363,7 +542,7 @@ impl Mesh {
         if self.accel.is_none() {
             return;
         }
-        let p = self.verts[v as usize].pos;
+        let p = self.pos[v as usize];
         let moved = self.accel.as_mut().map(|g| g.move_vertex(v, p)).unwrap_or(false);
         if !moved {
             return;
@@ -404,7 +583,7 @@ impl Mesh {
     /// Moves one vertex, keeping the spatial index correct.
     pub fn set_pos(&mut self, v: u32, p: Vec3) {
         self.log_vert(v);
-        self.verts[v as usize].pos = p;
+        self.pos[v as usize] = p;
         self.refile(v);
     }
 
@@ -434,11 +613,11 @@ impl Mesh {
     // ---- topology -----------------------------------------------------------
 
     pub fn add_vertex(&mut self, v: Vertex) -> u32 {
-        let id = self.verts.len() as u32;
+        let id = self.pos.len() as u32;
         if let Some(g) = &mut self.accel {
             g.push_vertex(id, v.pos);
         }
-        self.verts.push(v);
+        self.append_vertex(&v);
         self.vfaces.push(FaceList::new());
         self.touch_vert(id);
         id
@@ -498,7 +677,7 @@ impl Mesh {
     pub fn remove_vertex(&mut self, v: u32) {
         let vi = v as usize;
         debug_assert!(self.vfaces[vi].is_empty(), "remove_vertex on a used vertex");
-        let last = self.verts.len() - 1;
+        let last = self.pos.len() - 1;
         self.log_vert(v);
         self.log_vert(last as u32);
         if vi != last {
@@ -517,9 +696,9 @@ impl Mesh {
         if let Some(g) = &mut self.accel {
             g.swap_remove_vertex(v);
         }
-        self.verts.swap_remove(vi);
+        self.swap_remove_vertex_data(vi);
         self.vfaces.swap_remove(vi);
-        if vi < self.verts.len() {
+        if vi < self.pos.len() {
             self.touch_vert(v);
         }
     }
@@ -560,14 +739,14 @@ impl Mesh {
     }
 
     pub fn edge_len(&self, a: u32, b: u32) -> f32 {
-        self.verts[a as usize].pos.distance(self.verts[b as usize].pos)
+        self.pos[a as usize].distance(self.pos[b as usize])
     }
 
     pub fn face_normal(&self, f: u32) -> Vec3 {
         let [a, b, c] = self.faces[f as usize];
-        let pa = self.verts[a as usize].pos;
-        let pb = self.verts[b as usize].pos;
-        let pc = self.verts[c as usize].pos;
+        let pa = self.pos[a as usize];
+        let pb = self.pos[b as usize];
+        let pc = self.pos[c as usize];
         (pb - pa).cross(pc - pa)
     }
 
@@ -612,7 +791,7 @@ impl Mesh {
         if fs.is_empty() {
             return None;
         }
-        let mid = Vertex::lerp_attrs(&self.verts[a as usize], &self.verts[b as usize], 0.5);
+        let mid = Vertex::lerp_attrs(&self.vertex(a), &self.vertex(b), 0.5);
         let m = self.add_vertex(mid);
 
         // Face indices stay put: rewriting keeps them, and adding only appends.
@@ -659,7 +838,7 @@ impl Mesh {
             return false;
         }
 
-        let mid = (self.verts[a as usize].pos + self.verts[b as usize].pos) * 0.5;
+        let mid = (self.pos[a as usize] + self.pos[b as usize]) * 0.5;
 
         // Reject if any surviving face would flip.
         for &f in self.vfaces[a as usize].iter().chain(self.vfaces[b as usize].iter()) {
@@ -670,7 +849,7 @@ impl Mesh {
             let before = self.face_normal(f);
             let p: [Vec3; 3] = std::array::from_fn(|k| {
                 let v = tri[k];
-                if v == a || v == b { mid } else { self.verts[v as usize].pos }
+                if v == a || v == b { mid } else { self.pos[v as usize] }
             });
             let after = (p[1] - p[0]).cross(p[2] - p[0]);
             if before.dot(after) <= 0.0 {
@@ -678,9 +857,9 @@ impl Mesh {
             }
         }
 
-        let merged = Vertex::lerp_attrs(&self.verts[a as usize], &self.verts[b as usize], 0.5);
+        let merged = Vertex::lerp_attrs(&self.vertex(a), &self.vertex(b), 0.5);
         self.log_vert(a);
-        self.verts[a as usize] = merged;
+        self.write_vertex(a, &merged);
         self.touch_vert(a);
 
         let mut doomed: SmallVec<[u32; 2]> = fs;
@@ -720,7 +899,7 @@ impl Mesh {
     /// Area-weighted normals over the whole mesh.
     pub fn recompute_normals(&mut self) {
         let faces = &self.faces;
-        let verts = &self.verts;
+        let pos = &self.pos;
         let normals: Vec<Vec3> = self
             .vfaces
             .par_iter()
@@ -728,18 +907,13 @@ impl Mesh {
                 let mut n = Vec3::ZERO;
                 for &f in fl {
                     let [a, b, c] = faces[f as usize];
-                    let pa = verts[a as usize].pos;
-                    let pb = verts[b as usize].pos;
-                    let pc = verts[c as usize].pos;
-                    n += (pb - pa).cross(pc - pa);
+                    n += (pos[b as usize] - pos[a as usize])
+                        .cross(pos[c as usize] - pos[a as usize]);
                 }
                 n.normalize_or(Vec3::Y)
             })
             .collect();
-        self.verts
-            .par_iter_mut()
-            .zip(normals)
-            .for_each(|(v, n)| v.nrm = n);
+        self.nrm.par_iter_mut().zip(normals).for_each(|(d, n)| *d = n);
         self.mark_fully_dirty();
     }
 
@@ -786,7 +960,10 @@ impl Mesh {
         // Collected, then written back. A parallel loop cannot write into the
         // vertices while another reads them, and the write is a cheap scatter
         // next to the cross products it carries.
-        let verts = &self.verts;
+        // Positions in, normals out, and nothing else read. Before the
+        // channels this loop pulled forty-eight bytes a vertex through the
+        // cache to use twelve of them.
+        let pos = &self.pos;
         let normals: Vec<Vec3> = set
             .par_iter()
             .with_min_len(512)
@@ -794,16 +971,14 @@ impl Mesh {
                 let mut n = Vec3::ZERO;
                 for &f in &vfaces[v as usize] {
                     let [a, b, c] = faces[f as usize];
-                    let pa = verts[a as usize].pos;
-                    let pb = verts[b as usize].pos;
-                    let pc = verts[c as usize].pos;
-                    n += (pb - pa).cross(pc - pa);
+                    n += (pos[b as usize] - pos[a as usize])
+                        .cross(pos[c as usize] - pos[a as usize]);
                 }
                 n.normalize_or(Vec3::Y)
             })
             .collect();
         for (&v, n) in set.iter().zip(&normals) {
-            self.verts[v as usize].nrm = *n;
+            self.nrm[v as usize] = *n;
         }
 
         if !self.fully_dirty {
@@ -813,13 +988,13 @@ impl Mesh {
     }
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
-        if self.verts.is_empty() {
+        if self.pos.is_empty() {
             return (Vec3::ZERO, Vec3::ZERO);
         }
         let (lo, hi) = self
-            .verts
+            .pos
             .par_iter()
-            .map(|v| (v.pos, v.pos))
+            .map(|p| (*p, *p))
             .reduce(
                 || (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)),
                 |a, b| (a.0.min(b.0), a.1.max(b.1)),
@@ -841,7 +1016,7 @@ impl Mesh {
             return;
         }
         let s = 1.0 / r;
-        self.verts.par_iter_mut().for_each(|v| v.pos = (v.pos - c) * s);
+        self.pos.par_iter_mut().for_each(|p| *p = (*p - c) * s);
         self.invalidate_accel();
         self.mark_fully_dirty();
     }
@@ -849,10 +1024,14 @@ impl Mesh {
     /// Applies an arbitrary affine transform, fixing up normals and winding.
     pub fn apply_transform(&mut self, m: glam::Mat4) {
         let normal_mat = glam::Mat3::from_mat4(m).inverse().transpose();
-        self.verts.par_iter_mut().for_each(|v| {
-            v.pos = m.transform_point3(v.pos);
-            v.nrm = (normal_mat * v.nrm).normalize_or(Vec3::Y);
-        });
+        rayon::join(
+            || self.pos.par_iter_mut().for_each(|p| *p = m.transform_point3(*p)),
+            || {
+                self.nrm
+                    .par_iter_mut()
+                    .for_each(|n| *n = (normal_mat * *n).normalize_or(Vec3::Y))
+            },
+        );
         if glam::Mat3::from_mat4(m).determinant() < 0.0 {
             self.faces.par_iter_mut().for_each(|t| t.swap(1, 2));
             self.rebuild_adjacency();
@@ -870,9 +1049,9 @@ impl Mesh {
             .faces
             .par_iter()
             .map(|&[a, b, c]| {
-                let pa = self.verts[a as usize].pos;
-                let pb = self.verts[b as usize].pos;
-                let pc = self.verts[c as usize].pos;
+                let pa = self.pos[a as usize];
+                let pb = self.pos[b as usize];
+                let pc = self.pos[c as usize];
                 pa.distance(pb) + pb.distance(pc) + pc.distance(pa)
             })
             .sum();
@@ -935,5 +1114,93 @@ impl Mesh {
         }
         loops.sort_by_key(|l| std::cmp::Reverse(l.len()));
         loops
+    }
+}
+
+/// A colour in zero to one, as three bytes.
+#[inline]
+fn pack_col(c: Vec3) -> [u8; 3] {
+    [to_unorm8(c.x), to_unorm8(c.y), to_unorm8(c.z)]
+}
+
+#[inline]
+fn unpack_col(c: [u8; 3]) -> Vec3 {
+    Vec3::new(from_unorm8(c[0]), from_unorm8(c[1]), from_unorm8(c[2]))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::primitives;
+    use glam::Vec3;
+
+    /// Un maillage neuf ne doit rien allouer pour ce que personne n'a peint.
+    /// C'est toute la raison des canaux, et c'est ce qui décide si le modèle
+    /// tient sur une tablette.
+    #[test]
+    fn a_fresh_mesh_carries_no_paint() {
+        let m = primitives::icosphere(4);
+        for (name, awake) in m.awake_channels() {
+            assert!(!awake, "le canal {name} est alloué alors que rien ne l'a touché");
+        }
+        // Position et normale seulement: douze octets chacune.
+        assert_eq!(m.vertex_bytes(), m.vert_count() * 24);
+        // Et il répond quand même la bonne valeur par défaut.
+        assert_eq!(m.rough(0), 153.0 / 255.0);
+        assert_eq!(m.mask(0), 0.0);
+        assert!(m.col(0).x > 0.8);
+    }
+
+    /// Peindre réveille la couleur et rien d'autre.
+    #[test]
+    fn painting_wakes_only_what_it_touches() {
+        let mut m = primitives::icosphere(3);
+        m.set_col(5, Vec3::new(1.0, 0.0, 0.0));
+        let awake: Vec<&str> = m
+            .awake_channels()
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(awake, vec!["colour"], "un autre canal s'est réveillé");
+        assert!((m.col(5).x - 1.0).abs() < 0.01);
+        assert!(m.col(6).x > 0.8, "les autres sommets ont perdu leur défaut");
+    }
+
+    /// Un aller-retour par la valeur doit rendre ce qu'on a mis, à la précision
+    /// que chaque canal annonce.
+    #[test]
+    fn a_vertex_survives_the_round_trip() {
+        let mut m = primitives::icosphere(2);
+        let mut v = m.vertex(3);
+        v.pos = Vec3::new(1.5, -2.0, 0.25);
+        v.col = Vec3::new(0.2, 0.4, 0.6);
+        v.mask = 0.33;
+        v.rough = 0.9;
+        v.metal = 0.1;
+        m.write_vertex(3, &v);
+
+        let back = m.vertex(3);
+        assert_eq!(back.pos, v.pos, "la position doit être exacte");
+        assert!(back.col.distance(v.col) < 1.0 / 200.0);
+        assert!((back.mask - v.mask).abs() < 1.0 / 60000.0);
+        assert!((back.rough - v.rough).abs() < 1.0 / 200.0);
+        assert!((back.metal - v.metal).abs() < 1.0 / 200.0);
+    }
+
+    /// Le renumérotage par échange doit traiter un canal endormi comme un
+    /// canal éveillé, sinon la couleur suit le mauvais sommet.
+    #[test]
+    fn removing_a_vertex_keeps_the_channels_lined_up() {
+        let mut m = primitives::icosphere(3);
+        let last = m.vert_count() as u32 - 1;
+        m.set_col(last, Vec3::new(1.0, 0.0, 0.0));
+        let doomed = 4u32;
+        let faces: Vec<u32> = m.vfaces[doomed as usize].to_vec();
+        for f in faces.into_iter().rev() {
+            m.remove_face(f);
+        }
+        m.remove_vertex(doomed);
+        // Le dernier sommet a pris la place du supprimé, sa couleur avec lui.
+        assert!(m.col(doomed).x > 0.9, "la couleur n'a pas suivi le sommet déplacé");
     }
 }

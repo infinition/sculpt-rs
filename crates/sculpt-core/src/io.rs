@@ -30,7 +30,7 @@ pub fn write_obj(mesh: &Mesh, path: &Path, with_colors: bool) -> IoResult<()> {
     let f = File::create(path).map_err(err)?;
     let mut w = BufWriter::new(f);
     writeln!(w, "# exported by sculpt-rs").map_err(err)?;
-    for v in &mesh.verts {
+    for v in mesh.vertices() {
         if with_colors {
             writeln!(
                 w,
@@ -42,8 +42,8 @@ pub fn write_obj(mesh: &Mesh, path: &Path, with_colors: bool) -> IoResult<()> {
         }
         .map_err(err)?;
     }
-    for v in &mesh.verts {
-        writeln!(w, "vn {:.6} {:.6} {:.6}", v.nrm.x, v.nrm.y, v.nrm.z).map_err(err)?;
+    for n in &mesh.nrm {
+        writeln!(w, "vn {:.6} {:.6} {:.6}", n.x, n.y, n.z).map_err(err)?;
     }
     for t in &mesh.faces {
         writeln!(
@@ -113,8 +113,8 @@ pub fn read_obj(path: &Path) -> IoResult<Mesh> {
     let n = pos.len() as u32;
     faces.retain(|t| t.iter().all(|&i| i < n));
     let mut mesh = Mesh::from_soup(&pos, &faces);
-    for (v, c) in mesh.verts.iter_mut().zip(cols) {
-        v.col = c;
+    for (i, c) in cols.into_iter().enumerate() {
+        mesh.set_col(i as u32, c);
     }
     Ok(mesh)
 }
@@ -130,7 +130,7 @@ pub fn write_ply(mesh: &Mesh, path: &Path) -> IoResult<()> {
     writeln!(w, "ply").map_err(err)?;
     writeln!(w, "format binary_little_endian 1.0").map_err(err)?;
     writeln!(w, "comment created by sculpt-rs").map_err(err)?;
-    writeln!(w, "element vertex {}", mesh.verts.len()).map_err(err)?;
+    writeln!(w, "element vertex {}", mesh.pos.len()).map_err(err)?;
     for p in ["x", "y", "z", "nx", "ny", "nz"] {
         writeln!(w, "property float {p}").map_err(err)?;
     }
@@ -141,7 +141,7 @@ pub fn write_ply(mesh: &Mesh, path: &Path) -> IoResult<()> {
     writeln!(w, "property list uchar uint vertex_indices").map_err(err)?;
     writeln!(w, "end_header").map_err(err)?;
 
-    for v in &mesh.verts {
+    for v in mesh.vertices() {
         for c in [v.pos.x, v.pos.y, v.pos.z, v.nrm.x, v.nrm.y, v.nrm.z] {
             w.write_all(&c.to_le_bytes()).map_err(err)?;
         }
@@ -331,8 +331,8 @@ pub fn read_ply(path: &Path) -> IoResult<Mesh> {
     let n = pos.len() as u32;
     faces.retain(|t| t.iter().all(|&i| i < n));
     let mut mesh = Mesh::from_soup(&pos, &faces);
-    for (v, c) in mesh.verts.iter_mut().zip(cols) {
-        v.col = c;
+    for (i, c) in cols.into_iter().enumerate() {
+        mesh.set_col(i as u32, c);
     }
     Ok(mesh)
 }
@@ -402,7 +402,7 @@ pub fn write_stl(mesh: &Mesh, path: &Path) -> IoResult<()> {
             w.write_all(&c.to_le_bytes()).map_err(err)?;
         }
         for &v in tri {
-            let p = mesh.verts[v as usize].pos;
+            let p = mesh.pos[v as usize];
             for c in [p.x, p.y, p.z] {
                 w.write_all(&c.to_le_bytes()).map_err(err)?;
             }
@@ -511,9 +511,13 @@ pub fn write_scene(scene: &Scene, path: &Path) -> IoResult<()> {
             w.write_all(&c.to_le_bytes()).map_err(err)?;
         }
         w.write_all(&[o.visible as u8]).map_err(err)?;
-        w.write_all(&(o.mesh.verts.len() as u32).to_le_bytes()).map_err(err)?;
+        w.write_all(&(o.mesh.pos.len() as u32).to_le_bytes()).map_err(err)?;
         w.write_all(&(o.mesh.faces.len() as u32).to_le_bytes()).map_err(err)?;
-        w.write_all(bytemuck::cast_slice(&o.mesh.verts)).map_err(err)?;
+        // Gathered into whole vertices for the file, which is the shape
+        // version 1 of this format promised. Version 2 will write the channels
+        // as they are held.
+        let verts: Vec<Vertex> = o.mesh.vertices().collect();
+        w.write_all(bytemuck::cast_slice(&verts)).map_err(err)?;
         w.write_all(bytemuck::cast_slice(&o.mesh.faces)).map_err(err)?;
     }
     w.flush().map_err(err)?;
@@ -584,8 +588,10 @@ pub fn read_scene(path: &Path) -> IoResult<Scene> {
             .collect();
         o += fbytes;
 
-        let mut mesh = Mesh { verts, faces, vfaces: Vec::new(), ..Default::default() };
-        mesh.rebuild_adjacency();
+        let mut mesh = Mesh::from_soup(&verts.iter().map(|v| v.pos).collect::<Vec<_>>(), &faces);
+        for (i, v) in verts.iter().enumerate() {
+            mesh.write_vertex(i as u32, v);
+        }
         let mut obj = Object::new(name, mesh);
         obj.transform = Transform { position, rotation, scale };
         obj.visible = visible;
