@@ -88,7 +88,8 @@ built for a pen and a touch screen as much as for a mouse.
 - Import and export OBJ (with vertex colours), PLY (binary and ASCII) and STL
   (binary and ASCII).
 - A native `.sculpt` scene file that keeps every object, its placement and
-  every per-vertex attribute.
+  every per-vertex attribute. Each attribute is compressed on its own, and one
+  nobody has touched takes four bytes rather than one per vertex.
 - A plain-text `.brushes` file for a set of named brushes.
 - PNG, JPEG, BMP and TGA in, as brush alphas and as matcaps.
 
@@ -128,12 +129,18 @@ carrying a box and a normal cone, so the view can throw away what it cannot see
 before anything is drawn. Brushes and the heavier commands run in parallel over
 rayon.
 
-A vertex is twelve floats in the engine and twenty-four bytes on the card, in
-two streams. The hot one holds the position at full precision and the normal
-folded onto an octahedron as two sixteen-bit numbers; the cold one holds the
-colour, mask, roughness and metalness at a byte each. Shading a pixel reads only
-the first, a sculpt stroke writes only the first, and a paint stroke only the
-second.
+Every vertex attribute lives in its own array, quantised to what it needs rather
+than to what the widest of them needs, and an attribute nobody has touched is
+not allocated at all: a model that has never been painted carries no colour, no
+mask and no material, which is most models for most of their life. That is
+twenty-four bytes a vertex against the forty-eight one interleaved struct cost,
+and it is what decides whether a model fits on a tablet.
+
+It reaches the card as twenty-four bytes in two streams. The hot one holds the
+position at full precision and the normal folded onto an octahedron as two
+sixteen-bit numbers; the cold one the colour, mask, roughness and metalness at a
+byte each. Shading a pixel reads only the first, a sculpt stroke writes only the
+first, and a paint stroke only the second.
 
 The renderer draws every object from one uniform buffer addressed with dynamic
 offsets, so a scene costs one bind group rebind per object and no buffer writes
