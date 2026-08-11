@@ -299,8 +299,23 @@ pub fn build(mesh: &mut Mesh, target: usize) -> Partition {
         .par_iter()
         .map(|(_, i)| mesh.faces[*i as usize])
         .collect();
+    // The faces have a new order, so every face index in the ring has to point
+    // at its new slot. Rebuilding the ring from the whole face array costs a
+    // read of every face per worker; remapping the old indices in place is one
+    // pass over the ring, which on a sculpted mesh is a handful of entries per
+    // vertex. The ring does not keep its entries sorted by face index, which
+    // nothing that reads it relies on.
+    let mut perm: Vec<u32> = Vec::with_capacity(mesh.faces.len());
+    perm.resize(mesh.faces.len(), 0);
+    for (new_i, &(_, old_i)) in keyed.iter().enumerate() {
+        perm[old_i as usize] = new_i as u32;
+    }
     mesh.faces = faces;
-    mesh.rebuild_adjacency();
+    for fl in &mut mesh.vfaces {
+        for f in fl.iter_mut() {
+            *f = perm[*f as usize];
+        }
+    }
     mesh.invalidate_accel();
     mesh.mark_fully_dirty();
 
