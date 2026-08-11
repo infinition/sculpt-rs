@@ -568,7 +568,7 @@ pub fn laplacian_smooth(mesh: &mut Mesh, amount: f32) {
 }
 
 /// Squared-free distance from a point to a triangle.
-fn point_triangle_distance(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f32 {
+pub fn point_triangle_distance(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> f32 {
     let ab = b - a;
     let ac = c - a;
     let ap = p - a;

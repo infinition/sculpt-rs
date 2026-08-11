@@ -17,6 +17,7 @@ pub mod primitives;
 pub mod query;
 pub mod scene;
 pub mod topology;
+pub mod voxel;
 
 pub use accel::Grid;
 pub use alpha::{Alpha, Shape as AlphaShape};
