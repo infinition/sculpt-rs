@@ -37,6 +37,10 @@ const CELLS_PER_RADIUS: f32 = 2.0;
 const REBUILD_SLACK: f32 = 2.5;
 /// Guard rails on the DDA in [`Grid::raycast`].
 const MAX_RAY_STEPS: usize = 8192;
+/// `fslot` value for a face created mid-stroke whose cell is still waiting for
+/// the flush. Never a real slot, because the table is a power of two and the
+/// mask fits that.
+const UNFILED: u32 = u32::MAX;
 
 #[derive(Clone)]
 pub struct Grid {
@@ -223,10 +227,25 @@ impl Grid {
         self.face_radius = self.face_radius.max(radius);
     }
 
+    /// Grows the face slot table without filing the face.
+    ///
+    /// What a face created in the middle of a stroke wants: its cell is left to
+    /// the flush at the end of the step, where the sphere is worked out across
+    /// the cores instead of one thread at a time. The slot still has to exist,
+    /// and the sentinel tells the flush it was never filed.
+    pub fn push_face_slot(&mut self) {
+        self.fslot.push(UNFILED);
+    }
+
     pub fn move_face(&mut self, f: u32, centroid: Vec3, radius: f32) {
         let s = self.slot(centroid);
         let old = self.fslot[f as usize];
-        if s != old {
+        if old == UNFILED {
+            // A face added in the middle of a stroke joins its bucket here,
+            // once, when the faces are put back.
+            self.fbuckets[s as usize].push(f);
+            self.fslot[f as usize] = s;
+        } else if s != old {
             remove_from(&mut self.fbuckets[old as usize], f);
             self.fbuckets[s as usize].push(f);
             self.fslot[f as usize] = s;
@@ -237,12 +256,16 @@ impl Grid {
     pub fn swap_remove_face(&mut self, f: u32) {
         let last = (self.fslot.len() - 1) as u32;
         let s = self.fslot[f as usize];
-        remove_from(&mut self.fbuckets[s as usize], f);
+        if s != UNFILED {
+            remove_from(&mut self.fbuckets[s as usize], f);
+        }
         if f != last {
             let ls = self.fslot[last as usize];
-            for e in self.fbuckets[ls as usize].iter_mut() {
-                if *e == last {
-                    *e = f;
+            if ls != UNFILED {
+                for e in self.fbuckets[ls as usize].iter_mut() {
+                    if *e == last {
+                        *e = f;
+                    }
                 }
             }
             self.fslot[f as usize] = ls;

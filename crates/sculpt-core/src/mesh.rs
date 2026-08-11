@@ -680,6 +680,31 @@ impl Mesh {
         fi
     }
 
+    /// Adds a face but leaves its cell in the grid to [`Mesh::flush_refit`].
+    ///
+    /// What `split_edge` wants, which creates faces by the thousand in the
+    /// middle of a dab. The grid is only read by vertex queries during a dab,
+    /// so a new face need not be findable until the faces are put back at the
+    /// end of the step, where its sphere is worked out once across the cores
+    /// instead of one thread at a time. A face added this way is never removed
+    /// by the same dab: collapses only walk the edges the plan found, which are
+    /// all older than it.
+    fn add_face_unfiled(&mut self, tri: [u32; 3]) -> u32 {
+        let fi = self.faces.len() as u32;
+        self.faces.push(tri);
+        for &v in &tri {
+            self.vfaces[v as usize].push(fi);
+        }
+        if self.accel.is_some() {
+            if let Some(g) = &mut self.accel {
+                g.push_face_slot();
+            }
+            self.stale_faces.push(fi);
+        }
+        self.touch_face(fi);
+        fi
+    }
+
     /// Removes a face, moving the last face into its slot.
     pub fn remove_face(&mut self, f: u32) {
         let fi = f as usize;
@@ -844,12 +869,12 @@ impl Mesh {
                 // winding reads (a, b, o)
                 let o = tri[(i + 2) % 3];
                 self.replace_face(f, [a, m, o]);
-                self.add_face([m, b, o]);
+                self.add_face_unfiled([m, b, o]);
             } else {
                 // winding reads (a, o, b)
                 let o = tri[(i + 1) % 3];
                 self.replace_face(f, [a, o, m]);
-                self.add_face([m, o, b]);
+                self.add_face_unfiled([m, o, b]);
             }
         }
         Some(m)
