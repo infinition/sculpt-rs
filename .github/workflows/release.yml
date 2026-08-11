@@ -1,0 +1,36 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: sculpt-app-windows
+            bin: sculpt-app.exe
+          - os: ubuntu-latest
+            artifact: sculpt-app-linux
+            bin: sculpt-app
+          - os: macos-latest
+            artifact: sculpt-app-macos
+            bin: sculpt-app
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/${{ matrix.bin }}
+          name: ${{ matrix.artifact }}
