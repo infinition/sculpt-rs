@@ -371,7 +371,37 @@ by cost replaces the sort by length.
 keeps its corners, and the validity test still passes. Both results recorded
 side by side.
 
-**Effort.** 3 days. **High return, low risk.**
+**Effort.** 3 days. **Attempted and reverted; read this before starting
+again.**
+
+The straightforward version, a quadric evaluated at the midpoint of the edge,
+is worse than what it replaces. Measured on a cube of 432 triangles, reach from
+the centre to the furthest vertex, which is the corner while the corner is
+still there:
+
+| kept | quadric at the midpoint | shortest edge |
+|---|---|---|
+| 60% | 1.7321 | 1.7321 |
+| 40% | 1.6008 | 1.7321 |
+| 30% | 1.6008 | 1.7321 |
+| 20% | 1.5635, worst deviation 0.258 | 1.7321, worst deviation 0.188 |
+
+On a sphere at 15% it was marginally better, 0.0040 against 0.0051. Losing the
+corners of a cube to gain four thousandths on a sphere is not a trade worth
+making.
+
+The reason is the forced position. `collapse_edge` puts the merged vertex at
+the midpoint, so that is where the error has to be measured, and a corner
+measured from the midpoint of one of its edges looks cheap enough to spend.
+Real quadric decimation solves for the position that minimises the error, which
+for a corner is the corner itself, and only then is its cost properly enormous.
+Shortest edge meanwhile treats a uniform grid uniformly and spares the corner by
+accident.
+
+So this item now depends on `collapse_edge` taking a target position rather
+than always using the midpoint, which is a change to the mesh and to what
+dynamic topology asks of it. Worth doing, larger than three days, and pointless
+without it.
 
 ### T2. The sparse field
 
@@ -1043,7 +1073,7 @@ ones given a second pair of hands.
 |---|---|---|---|
 | ~~1~~ | ~~M1 channels~~ | **done** | |
 | ~~2~~ | ~~F1 compress the channel store~~ | **done** | |
-| 3 | T1 shape cost collapse | 3 days, every decimation keeps its shape | 3 d |
+| 3 | T1 shape cost collapse | needs a chosen collapse position first, see the entry | 1 wk |
 | 4 | R1 the tone curve | 2 days, changes how everything reads | 2 d |
 | 5 | R2 horizon sweep | 3 days, the model becomes solid | 3 d |
 | 6 | M2 texture channel | unblocks texturing and glTF | 3 d |
