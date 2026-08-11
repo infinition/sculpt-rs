@@ -474,7 +474,15 @@ preserves a hard surface and one that melts it.
 **Done when.** A remeshed cube keeps its edges, a remeshed sphere stays smooth,
 and both stay watertight.
 
-**Effort.** 1 week.
+**Effort.** 1 week. **Done, in `voxel.rs`.** Each surface cell solves a
+quadratic error function: every crossing edge is a plane through its crossing
+point, perpendicular to the field gradient, and the vertex is the point closest
+to all of them, clamped to its cell and falling back to the mean of the
+crossings when the solve is degenerate. A voxelised sphere's surface now reads
+smooth rather than cut from cubes. The 2024 High-Performance SurfaceNets paper
+(parallel over edges, with constrained smoothing) is the recorded next step for
+the extraction's speed and final polish, along with Tao Ju's dual contouring
+for the sharpest features.
 
 ### T4. The mender
 
