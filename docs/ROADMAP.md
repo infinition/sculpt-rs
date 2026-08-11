@@ -455,10 +455,11 @@ triangles of every cell, and a dab re-extracts only the chunks it wrote and
 their halo, so a dab costs about 3 to 5 ms whatever the model. `voxel_bench`
 shows the point: voxelising a 1.5-million and a 5.2-million icosphere pays the
 triangle count once, then sculpting both costs the same across 3.5x the
-triangles. What remains is the work of making it the live surface rather than
-a proof: the application sculpting it instead of the mesh, which the extracted
-mesh slots into the existing renderer unchanged. The corner solve stays under
-T3.
+triangles. The application now sculpts through it: V toggles voxel mode, which
+voxelises the active mesh into the field, and the brush stamps the field with
+the extracted surface becoming the mesh each dab, going to the GPU in full
+because the surface is small. The corner solve stays under T3, and so does
+the quality work the naive surface net owes a smooth field.
 
 ### T3. The corner solve
 
