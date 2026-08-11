@@ -7,7 +7,7 @@
 A real-time 3D sculpting tool written in Rust, with dynamic topology and a
 GPU renderer. Built for a pen and a touch screen as much as for a mouse.
 
-![sculpt-rs](docs/screenshot.png)
+![sculpt-rs](docs/screenshot.jpg)
 
 ## What it does
 
