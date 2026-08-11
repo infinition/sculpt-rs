@@ -2207,6 +2207,20 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
             .show(ui);
     }
 
+    widgets::section_title(ui, "OCCLUSION");
+    widgets::toggle(ui, &mut st.settings.occlusion, "Shade the creases", m.row);
+    ui.add_enabled_ui(st.settings.occlusion, |ui| {
+        BigSlider::new(&mut st.settings.occlusion_radius, 0.01..=0.6, "Reach")
+            .logarithmic(true)
+            .decimals(3)
+            .height(m.row)
+            .show(ui);
+        BigSlider::new(&mut st.settings.occlusion_strength, 0.0..=2.0, "Depth")
+            .decimals(2)
+            .height(m.row)
+            .show(ui);
+    });
+
     // The tone curve, where there is light to map. The other views are colours
     // somebody already chose, so there is nothing to grade.
     if st.settings.shading == Shading::Pbr {

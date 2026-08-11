@@ -84,7 +84,8 @@ parallel. Hole filling. Mirror and symmetrize.
 
 **Rendering.** Matcap in three forms. A three-light view that reads painted
 roughness and metalness, through a **tone curve** with exposure, contrast and
-saturation. Normals, cavity, unlit and clay views. Wireframe, flat
+saturation. **Horizon sweep** occlusion, which darkens a crease and leaves a
+convex surface alone. Normals, cavity, unlit and clay views. Wireframe, flat
 shading, opacity, vertex colours. An infinite ground grid. Multisampling to 8x,
 dropped automatically once triangles fall under a pixel. A GPU vertex of 24
 bytes split into **hot and cold streams**. Sparse GPU updates through a compute
@@ -665,10 +666,23 @@ one that matters once R4 gives the lit view a real range to map.
 object rather than a shaded shell. The cavity view approximates it from normal
 derivatives; this is the real thing.
 
-**Rests on.** Ground truth ambient occlusion, Jimenez et al., with a bilateral
-blur.
+**Rests on.** The horizon-based approach of Bavoil and Sainz. The ground truth
+integral of Jimenez et al. is the fuller version of the same idea and would
+replace the estimator without touching anything around it.
 
-**Effort.** 3 days.
+**Effort.** 3 days. **Done.** A pass of its own after the scene one, reading
+the depth buffer and multiplying what it finds onto the frame. Measured in the
+offscreen example: a lone sphere, convex everywhere and unable to occlude
+itself, has 0.0% of its pixels darkened; the crevice between two overlapping
+spheres has 1.0%. A crevice is narrow by nature, and darkening it and nothing
+else is the whole point.
+
+Two things it does not have yet. There is no bilateral blur, so the estimate
+carries some of the noise of its own sampling; eight directions and a per-pixel
+rotation keep it below what shows on a matcap, and a blur wants a second target
+to write into, which is R3. And the normal is rebuilt from the depth rather than
+read from a pass that wrote it, which is exact on a flat surface and slightly
+soft on a silhouette. R3 gives it a real one.
 
 ### R3. The surface pass
 
@@ -1084,7 +1098,7 @@ ones given a second pair of hands.
 | ~~2~~ | ~~F1 compress the channel store~~ | **done** | |
 | 3 | T1 shape cost collapse | needs a chosen collapse position first, see the entry | 1 wk |
 | ~~4~~ | ~~R1 the tone curve~~ | **done** | |
-| 5 | R2 horizon sweep | 3 days, the model becomes solid | 3 d |
+| ~~5~~ | ~~R2 horizon sweep~~ | **done** | |
 | 6 | M2 texture channel | unblocks texturing and glTF | 3 d |
 | 7 | F2 scene container v2 | before the scene grows further | 4 d |
 | 8 | S1 layers | the missing idea | 1 wk |

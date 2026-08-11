@@ -184,10 +184,88 @@ fn main() {
         "la courbe ne retient pas les hautes lumières",
     );
 
+    // L'occlusion. Sur une sphère seule, convexe de partout, rien ne peut
+    // s'occulter: elle doit rester claire. Entre deux sphères qui se touchent
+    // il y a une gorge, et c'est là qu'elle doit assombrir.
+    let seule = Scene::with_object(Object::new("a", primitives::icosphere(5)));
+    let mut paire = seule.clone();
+    let mut b = Object::new("b", primitives::icosphere(5));
+    b.transform.position = Vec3::new(1.45, 0.0, 0.0);
+    paire.add(b);
+
+    let sans = ao_render(&device, &queue, &mut r, &seule, false, view, proj, eye);
+    let avec = ao_render(&device, &queue, &mut r, &seule, true, view, proj, eye);
+    let convexe = darkened_share(&avec, &sans);
+    println!("sphère seule, part assombrie: {:.3}", convexe);
+    check(
+        convexe < 0.02,
+        "une sphère convexe est assombrie alors que rien ne l'occulte",
+    );
+
+    let eye2 = Vec3::new(0.72, 0.0, 4.2);
+    let view2 = glam::camera::rh::view::look_at_mat4(eye2, Vec3::new(0.72, 0.0, 0.0), Vec3::Y);
+    let sans = ao_render(&device, &queue, &mut r, &paire, false, view2, proj, eye2);
+    let avec = ao_render(&device, &queue, &mut r, &paire, true, view2, proj, eye2);
+    let creux = darkened_share(&avec, &sans);
+    println!("gorge entre deux sphères, part assombrie: {:.3}", creux);
+    // Une gorge est étroite par nature: elle n'occupe qu'un pour cent du
+    // modèle visible, et c'est exactement ce qu'on veut. Ce qui compte est
+    // qu'elle existe là et nulle part sur le convexe.
+    check(
+        creux > 0.005 && creux > convexe * 5.0 + 0.004,
+        "la gorge entre deux sphères ne s'assombrit pas plus que le convexe",
+    );
+
     println!();
     println!("les pipelines se construisent, la sphère arrive à l'écran, une mise");
-    println!("à jour creuse porte le relief comme la couleur, et la courbe de");
-    println!("tonalité retient ce qui brûlait.");
+    println!("à jour creuse porte le relief comme la couleur, la courbe de");
+    println!("tonalité retient ce qui brûlait, et les creux s'assombrissent.");
+}
+
+/// La part du modèle que l'occlusion assombrit d'au moins un dixième.
+///
+/// Une moyenne ne dit rien ici: un creux occupe quelques pour cent de l'image
+/// et disparaît dans le reste, qui est convexe et doit rester intact. Ce qu'on
+/// veut savoir est s'il existe des pixels réellement assombris, et combien.
+fn darkened_share(a: &[u8], b: &[u8]) -> f32 {
+    let mut dark = 0u32;
+    let mut n = 0u32;
+    for (x, y) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+        let lb = y[0] as f32 + y[1] as f32 + y[2] as f32;
+        // Le fond du dégradé est sombre; on ne compare que le modèle.
+        if lb < 200.0 {
+            continue;
+        }
+        let la = x[0] as f32 + x[1] as f32 + x[2] as f32;
+        if la / lb < 0.9 {
+            dark += 1;
+        }
+        n += 1;
+    }
+    if n == 0 { 0.0 } else { dark as f32 / n as f32 }
+}
+
+/// Une image du modèle en argile, avec ou sans occlusion.
+#[allow(clippy::too_many_arguments)]
+fn ao_render(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    r: &mut Renderer,
+    scene: &Scene,
+    occlusion: bool,
+    view: Mat4,
+    proj: Mat4,
+    eye: Vec3,
+) -> Vec<u8> {
+    r.sync(device, queue, scene, None);
+    let settings = FrameSettings {
+        shading: Shading::Clay,
+        grid: false,
+        occlusion,
+        ..Default::default()
+    };
+    r.set_uniforms(queue, scene, view, proj, eye, &settings);
+    draw_settings(device, queue, r, scene, &settings)
 }
 
 /// Une image avec des réglages donnés, plutôt que les réglages par défaut.
@@ -315,6 +393,9 @@ fn draw_settings(
         });
         r.draw(&mut pass, scene, settings, &[None]);
     }
+    // La même passe que dans l'application, au même moment: après que la passe
+    // de scène est close et que sa profondeur est lisible.
+    r.draw_occlusion(&mut encoder, &view_tex, settings);
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: &target,

@@ -74,6 +74,9 @@ built for a pen and a touch screen as much as for a mouse.
 - A tone curve on the lit view, with exposure in stops, contrast and
   saturation, so a highlight rolls off instead of clipping to a white disc.
   The other views are colours somebody already chose, and are left alone.
+- Occlusion in the creases, swept from the depth buffer, with the reach and the
+  depth of it adjustable. A fold goes dark and a convex surface does not, which
+  is most of what makes a sculpt read as a solid object rather than a shell.
 - Matcaps three ways: five generated presets, an editable lightcap where the
   material and all three lights can be taken apart and aimed by dragging, or
   an image loaded off disk.

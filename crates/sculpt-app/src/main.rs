@@ -1401,6 +1401,11 @@ impl State {
             self.renderer
                 .draw(&mut pass, &self.sculptor.scene, &self.ui.settings, &visible);
         }
+        // Creases, once the scene pass has ended and its depth can be read.
+        // Straight onto the resolved image, so multisampling changes nothing
+        // about where it lands.
+        self.renderer
+            .draw_occlusion(&mut encoder, &view, &self.ui.settings);
 
         {
             let mut pass = encoder

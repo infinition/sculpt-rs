@@ -89,6 +89,11 @@ pub struct FrameSettings {
     pub exposure: f32,
     pub contrast: f32,
     pub saturation: f32,
+    /// Occlusion in the creases. See `shaders/occlusion.wgsl`.
+    pub occlusion: bool,
+    /// How far a crease reaches to shade itself, in world units.
+    pub occlusion_radius: f32,
+    pub occlusion_strength: f32,
     pub background_top: [f32; 3],
     pub background_bottom: [f32; 3],
     /// Send only the vertices a stroke touched and let a compute pass scatter
@@ -112,6 +117,9 @@ impl Default for FrameSettings {
             exposure: 0.0,
             contrast: 1.0,
             saturation: 1.0,
+            occlusion: true,
+            occlusion_radius: 0.12,
+            occlusion_strength: 1.0,
             // Held as sRGB so the colour pickers show what the viewport shows.
             background_top: [0.16, 0.17, 0.19],
             background_bottom: [0.075, 0.08, 0.09],
@@ -148,6 +156,8 @@ struct Globals {
     bg_bottom: [f32; 4],
     /// x = exposure, y = contrast, z = saturation, w = 1 when the curve is on.
     tone: [f32; 4],
+    /// x = world radius, y = strength, z = 1 when on, w unused.
+    occlusion: [f32; 4],
 }
 
 #[repr(C)]
@@ -433,6 +443,9 @@ pub struct Renderer {
     wire_pipeline: Option<wgpu::RenderPipeline>,
     background_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
+    occlusion_pipeline: wgpu::RenderPipeline,
+    occlusion_layout: wgpu::BindGroupLayout,
+    occlusion_bind: wgpu::BindGroup,
 
     global_layout: wgpu::BindGroupLayout,
     global_bind: wgpu::BindGroup,
@@ -560,6 +573,10 @@ impl Renderer {
             }],
         });
 
+        let depth_view = make_depth(device, width, height, sample_count);
+        let occl_layout = occlusion_layout(device, sample_count);
+        let occl_bind = make_occlusion_bind(device, &occl_layout, &global_buf, &depth_view);
+
         let mut me = Self {
             // Placeholders replaced right below; building pipelines needs the
             // layouts that were just created.
@@ -567,6 +584,9 @@ impl Renderer {
             wire_pipeline: None,
             background_pipeline: dummy_pipeline(device, color_format),
             grid_pipeline: dummy_pipeline(device, color_format),
+            occlusion_pipeline: dummy_pipeline(device, color_format),
+            occlusion_layout: occl_layout,
+            occlusion_bind: occl_bind,
             global_layout,
             global_bind,
             global_buf,
@@ -578,7 +598,7 @@ impl Renderer {
             meshes: Vec::new(),
             scatter: Scatter::new(device),
             last_upload_bytes: 0,
-            depth_view: make_depth(device, width, height, sample_count),
+            depth_view,
             msaa_view: make_msaa(device, color_format, width, height, sample_count),
             sample_count,
             color_format,
@@ -736,6 +756,69 @@ impl Renderer {
         self.background_pipeline =
             screen_pipeline(&bg_shader, "background", false, Some(wgpu::BlendState::REPLACE));
         self.grid_pipeline = screen_pipeline(&grid_shader, "grid", false, blend_over);
+
+        // The occlusion pass. Its source is written out for the sample count in
+        // use, because a multisampled depth is a different type in the shading
+        // language and there is no preprocessor here yet to say so.
+        let occl_src = include_str!("shaders/occlusion.wgsl")
+            .replace(
+                "DEPTH_TEXTURE_TYPE",
+                if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" },
+            )
+            .replace("LOAD_DEPTH", "textureLoad(depth_tex, c, 0)");
+        let occl_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("occlusion"),
+            source: wgpu::ShaderSource::Wgsl(occl_src.into()),
+        });
+        let occl_pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("occlusion pipeline layout"),
+            bind_group_layouts: &[Some(&self.occlusion_layout)],
+            immediate_size: 0,
+        });
+        self.occlusion_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("occlusion"),
+            layout: Some(&occl_pipe_layout),
+            vertex: wgpu::VertexState {
+                module: &occl_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &occl_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    // Multiply. What the pass writes is how much light gets
+                    // through, so the frame keeps its colour and loses its
+                    // brightness where the surface closes in on itself.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Dst,
+                            dst_factor: wgpu::BlendFactor::Zero,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            // It runs after the scene pass has ended and resolved, so there is
+            // nothing attached to test against.
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
     }
 
     /// Rebuilds every pipeline for a new sample count.
@@ -750,6 +833,15 @@ impl Renderer {
         self.sample_count = samples;
         self.depth_view = make_depth(device, self.width, self.height, samples);
         self.msaa_view = make_msaa(device, self.color_format, self.width, self.height, samples);
+        // A multisampled depth is a different binding, so the layout, the bind
+        // group and the shader all follow the sample count.
+        self.occlusion_layout = occlusion_layout(device, samples);
+        self.occlusion_bind = make_occlusion_bind(
+            device,
+            &self.occlusion_layout,
+            &self.global_buf,
+            &self.depth_view,
+        );
         self.build_pipelines(device);
     }
 
@@ -779,6 +871,12 @@ impl Renderer {
         self.height = height;
         self.depth_view = make_depth(device, width, height, self.sample_count);
         self.msaa_view = make_msaa(device, self.color_format, width, height, self.sample_count);
+        self.occlusion_bind = make_occlusion_bind(
+            device,
+            &self.occlusion_layout,
+            &self.global_buf,
+            &self.depth_view,
+        );
     }
 
     pub fn depth_view(&self) -> &wgpu::TextureView {
@@ -976,6 +1074,12 @@ impl Renderer {
                 s.saturation.max(0.0),
                 if s.tone { 1.0 } else { 0.0 },
             ],
+            occlusion: [
+                s.occlusion_radius.max(1e-4),
+                s.occlusion_strength.max(0.0),
+                if s.occlusion { 1.0 } else { 0.0 },
+                0.0,
+            ],
         };
         queue.write_buffer(&self.global_buf, 0, bytemuck::bytes_of(&g));
 
@@ -1018,6 +1122,40 @@ impl Renderer {
             }
             None => pass.draw_indexed(0..buffers.index_count, 0, 0..1),
         }
+    }
+
+    /// Darkens the creases of the frame that has just been drawn.
+    ///
+    /// A pass of its own, after the scene one has ended, because it reads the
+    /// depth buffer and a texture cannot be sampled while it is still attached.
+    pub fn draw_occlusion(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        s: &FrameSettings,
+    ) {
+        if !s.occlusion {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("occlusion"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.occlusion_pipeline);
+        pass.set_bind_group(0, &self.occlusion_bind, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// `visible` holds, per object, the face ranges worth drawing, or `None` to
@@ -1175,10 +1313,61 @@ fn make_depth(
         sample_count: samples,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        // Read as well as written: the occlusion pass is the only thing that
+        // knows a crease is a crease, and depth is all it has to go on.
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     tex.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// What the occlusion pass reads: the globals, and the depth of the frame that
+/// has just been drawn.
+fn occlusion_layout(device: &wgpu::Device, samples: u32) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("occlusion layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: samples > 1,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn make_occlusion_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    globals: &wgpu::Buffer,
+    depth: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("occlusion bind"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(depth),
+            },
+        ],
+    })
 }
 
 fn make_msaa(
