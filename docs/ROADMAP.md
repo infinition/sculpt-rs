@@ -110,18 +110,29 @@ the pixels back and checks them.
 | | before | now |
 |---|---|---|
 | First dab of a stroke | 94 to 102 ms | 2.4 ms |
-| 20 dabs | 55 to 59 ms | 43 ms |
-| 10 strokes of 10 dabs | 277 to 288 ms | 200 ms |
-| A dab with live topology, 1.3 M triangles | 30 to 41 ms | 17 to 18 ms |
+| 20 dabs | 55 to 59 ms | 43 ms, then 22 ms |
+| 10 strokes of 10 dabs | 277 to 288 ms | 200 ms, then 111 ms |
+| A dab with live topology, 1.3 M triangles | 30 to 41 ms | 17 to 18 ms, then 12 ms |
+| A dab with live topology, 5.2 M triangles | | 2.1 ms, then 1.5 ms |
 | The log for a stroke that cuts | 189 MB | 7 MB |
 | Undo of that stroke | a full copy | 14 ms |
 | Decimation to half | 4.6 s | 3.2 s |
 | Remesh, 20 k triangles at 128 | 476 ms | 67 ms |
 | Vertex memory, nothing painted | 126 MB | 63 MB |
 | The whole mesh, same model | 315 MB | 252 MB |
+| Reordering the packets after a stroke | | 188 ms, then 146 ms |
 
 Reproduce with `cargo run --release -p sculpt-core --example heavy 9`, and
 `--example dab_cost` for the breakdown of a single dab.
+
+**Two further passes over the dab and the reorder, measured and committed.**
+The normals ring was being sorted as a multiset several times the size of the
+unique set, which was the largest single cost of a dab; a stamped scratch now
+deduplicates as it walks, and the sort runs over the small set. The plan's edge
+lengths are reused instead of re-measured, and a pass of splits that cuts
+nothing stops the later passes from replanning. On the reorder, the ring is
+remapped through the face permutation instead of rebuilt from the whole face
+array. Both keep the mesh byte identical, and both are measured above.
 
 ---
 
