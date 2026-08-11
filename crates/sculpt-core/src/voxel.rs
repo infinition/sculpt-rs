@@ -601,11 +601,14 @@ impl VoxelField {
         }
     }
 
-    /// The mean crossing point of a cell, or `None` when the surface misses it.
+    /// The surface vertex of a cell, solved from the crossing planes.
     ///
-    /// The cell's eight corners span at most two chunks per axis; those are
-    /// looked up once into a small local map, so every read after that is an
-    /// index into a loaded block instead of a hash lookup into the field.
+    /// The mean of the crossings is what makes a voxel surface look cut from
+    /// cubes. Dual contouring instead treats every crossing as a plane through
+    /// the crossing point, perpendicular to the field gradient there, and
+    /// solves for the point closest to all of them: a quadratic error function.
+    /// Sharp corners come out sharp, and a smooth surface stays smooth. When
+    /// the planes are degenerate, the mean of the crossings stands in.
     fn cell_vertex(&self, i: i32, j: i32, k: i32) -> Option<Vec3> {
         const EDGES: [(i32, i32, i32, i32, i32, i32); 12] = [
             (0, 0, 0, 1, 0, 0),
@@ -621,31 +624,20 @@ impl VoxelField {
             (0, 1, 0, 0, 1, 1),
             (1, 1, 0, 1, 1, 1),
         ];
-        // The chunks the cell's corners actually fall in, deduplicated. A
-        // missing corner would be a guess at the sign, and a guess is a
-        // phantom shell, so any missing chunk sends the cell away.
-        let corners = [
-            (i, j, k),
-            (i + 1, j, k),
-            (i, j + 1, k),
-            (i, j, k + 1),
-            (i + 1, j + 1, k),
-            (i + 1, j, k + 1),
-            (i, j + 1, k + 1),
-            (i + 1, j + 1, k + 1),
-        ];
-        let mut local: HashMap<(i32, i32, i32), &Chunk> = HashMap::with_capacity(8);
-        for &(x, y, z) in &corners {
-            let key = (
-                x.div_euclid(CHUNK_I32),
-                y.div_euclid(CHUNK_I32),
-                z.div_euclid(CHUNK_I32),
-            );
-            match self.chunks.get(&key) {
-                Some(c) => {
-                    local.insert(key, &**c);
+        // The field values the cell and its gradients touch: the cell's corners
+        // span at most two chunks per axis, and the gradients one more, so
+        // three chunks per axis cover everything, looked up once.
+        let bi = i.div_euclid(CHUNK_I32);
+        let bj = j.div_euclid(CHUNK_I32);
+        let bk = k.div_euclid(CHUNK_I32);
+        let mut local: HashMap<(i32, i32, i32), &Chunk> = HashMap::with_capacity(27);
+        for ci in (bi - 1)..=(bi + 1) {
+            for cj in (bj - 1)..=(bj + 1) {
+                for ck in (bk - 1)..=(bk + 1) {
+                    if let Some(c) = self.chunks.get(&(ci, cj, ck)) {
+                        local.insert((ci, cj, ck), &**c);
+                    }
                 }
-                None => return None,
             }
         }
         let read = |x: i32, y: i32, z: i32| -> f32 {
@@ -659,27 +651,103 @@ impl VoxelField {
             let lz = z.rem_euclid(CHUNK_I32) as usize;
             local.get(&key).map_or(OUTSIDE, |c| c[flat(lx, ly, lz)])
         };
-        let mut sum = Vec3::ZERO;
+        let stored = |x: i32, y: i32, z: i32| -> bool {
+            local.contains_key(&(
+                x.div_euclid(CHUNK_I32),
+                y.div_euclid(CHUNK_I32),
+                z.div_euclid(CHUNK_I32),
+            ))
+        };
+
+        // The quadratic error function: sum over the crossing planes of the
+        // squared distance to each. A is the sum of the outer products of the
+        // normals, b the sum of n (n dot p).
+        let mut a = [[0.0f32; 3]; 3];
+        let mut b = Vec3::ZERO;
+        let mut mean = Vec3::ZERO;
         let mut count = 0usize;
-        for (ax, ay, az, bx, by, bz) in EDGES {
+        for (ax, ay, az, bx2, by2, bz2) in EDGES {
             let (ia, ja, ka) = (i + ax, j + ay, k + az);
-            let (ib, jb, kb) = (i + bx, j + by, k + bz);
+            let (ib, jb, kb) = (i + bx2, j + by2, k + bz2);
             let va = read(ia, ja, ka);
             let vb = read(ib, jb, kb);
             if (va < 0.0) == (vb < 0.0) {
                 continue;
             }
+            // The crossing point, and the gradient there from the field. A
+            // missing neighbour makes the gradient a guess, and a guess is
+            // worse than the edge direction, so it stands in for the normal.
             let t = va / (va - vb);
             let pa = self.corner(ia, ja, ka);
             let pb = self.corner(ib, jb, kb);
-            sum += pa + (pb - pa) * t;
+            let p = pa + (pb - pa) * t;
+            mean += p;
             count += 1;
+            // The gradient of the field at the crossing, interpolated from the
+            // full finite-difference gradient at each endpoint. A missing
+            // neighbour makes the gradient a guess, and a guess is worse than
+            // the edge direction, so it stands in for the normal.
+            let mut n = None;
+            if stored(ia - 1, ja, ka)
+                && stored(ia + 1, ja, ka)
+                && stored(ia, ja - 1, ka)
+                && stored(ia, ja + 1, ka)
+                && stored(ia, ja, ka - 1)
+                && stored(ia, ja, ka + 1)
+                && stored(ib - 1, jb, kb)
+                && stored(ib + 1, jb, kb)
+                && stored(ib, jb - 1, kb)
+                && stored(ib, jb + 1, kb)
+                && stored(ib, jb, kb - 1)
+                && stored(ib, jb, kb + 1)
+            {
+                let ga = Vec3::new(
+                    read(ia + 1, ja, ka) - read(ia - 1, ja, ka),
+                    read(ia, ja + 1, ka) - read(ia, ja - 1, ka),
+                    read(ia, ja, ka + 1) - read(ia, ja, ka - 1),
+                );
+                let gb = Vec3::new(
+                    read(ib + 1, jb, kb) - read(ib - 1, jb, kb),
+                    read(ib, jb + 1, kb) - read(ib, jb - 1, kb),
+                    read(ib, jb, kb + 1) - read(ib, jb, kb - 1),
+                );
+                n = Some((ga + (gb - ga) * t).normalize_or(Vec3::X));
+            }
+            let n = n.unwrap_or(if ax == 1 { Vec3::X } else if ay == 1 { Vec3::Y } else { Vec3::Z });
+            for m in 0..3 {
+                for l in 0..3 {
+                    a[m][l] += n[m] * n[l];
+                }
+            }
+            b += n * n.dot(p);
         }
         if count == 0 {
-            None
-        } else {
-            Some(sum / count as f32)
+            return None;
         }
+        let fallback = mean / count as f32;
+        match solve_qef(a, b) {
+            Some(v) => {
+                // Clamp the corner to its cell: an ill-conditioned solve can
+                // throw a vertex far from the surface, which is a spike. The
+                // mean of the crossings never leaves the cell.
+                let lo = self.corner(i, j, k);
+                let hi = self.corner(i + 1, j + 1, k + 1);
+                let m = self.h * 0.5;
+                if v.x < lo.x - m
+                    || v.x > hi.x + m
+                    || v.y < lo.y - m
+                    || v.y > hi.y + m
+                    || v.z < lo.z - m
+                    || v.z > hi.z + m
+                {
+                    fallback
+                } else {
+                    v
+                }
+            }
+            None => fallback,
+        }
+        .into()
     }
 
     /// Pushes a quad for the X edge of cell (i, j, k), if it crosses.
@@ -751,6 +819,47 @@ impl VoxelField {
         out.push([a, b, c]);
         out.push([a, c, d]);
     }
+}
+
+/// Solves the 3x3 quadratic error function A x = b by Gaussian elimination.
+/// Returns `None` when the planes are degenerate and the answer is not fixed.
+fn solve_qef(a: [[f32; 3]; 3], b: Vec3) -> Option<Vec3> {
+    let mut m = [
+        [a[0][0], a[0][1], a[0][2], b.x],
+        [a[1][0], a[1][1], a[1][2], b.y],
+        [a[2][0], a[2][1], a[2][2], b.z],
+    ];
+    for col in 0..3 {
+        // Partial pivot: bring the largest row in this column up.
+        let mut pivot = col;
+        for r in (col + 1)..3 {
+            if m[r][col].abs() > m[pivot][col].abs() {
+                pivot = r;
+            }
+        }
+        if m[pivot][col].abs() < 1e-6 {
+            return None;
+        }
+        m.swap(col, pivot);
+        for r in (col + 1)..3 {
+            let f = m[r][col] / m[col][col];
+            for c in col..=3 {
+                m[r][c] -= f * m[col][c];
+            }
+        }
+    }
+    let mut x = [0.0f32; 3];
+    for r in (0..3).rev() {
+        let mut sum = m[r][3];
+        for c in (r + 1)..3 {
+            sum -= m[r][c] * x[c];
+        }
+        if m[r][r].abs() < 1e-6 {
+            return None;
+        }
+        x[r] = sum / m[r][r];
+    }
+    Some(Vec3::new(x[0], x[1], x[2]))
 }
 
 #[cfg(test)]
