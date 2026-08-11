@@ -1550,12 +1550,13 @@ impl ApplicationHandler for App {
         }
         let egui_captured = response.consumed || st.egui_ctx.egui_wants_pointer_input();
 
-        // Anything that is not the frame itself may have changed what the
-        // frame should show, so it asks for one. Events are rare next to
-        // frames, and one frame too many costs nothing.
-        if !matches!(event, WindowEvent::RedrawRequested) {
-            st.window.request_redraw();
-        }
+        // Whether this event is the frame itself. Anything else may have
+        // changed what a frame should show, and asks for one **after** it has
+        // been handled: asking first queues a frame that renders the state as
+        // it was before the event, and if no further event follows, the change
+        // sits unshown. With a pen down that is a stroke whose result only
+        // appears when the pen lifts.
+        let was_redraw = matches!(event, WindowEvent::RedrawRequested);
 
         match event {
             WindowEvent::CloseRequested => el.exit(),
@@ -1731,6 +1732,12 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
+        }
+
+        // Now that the event has been applied, ask for the frame that will
+        // show it.
+        if !was_redraw {
+            st.window.request_redraw();
         }
     }
 }
