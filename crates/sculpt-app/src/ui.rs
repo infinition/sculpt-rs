@@ -2207,6 +2207,29 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
             .show(ui);
     }
 
+    // The tone curve, where there is light to map. The other views are colours
+    // somebody already chose, so there is nothing to grade.
+    if st.settings.shading == Shading::Pbr {
+        widgets::section_title(ui, "TONE");
+        widgets::toggle(ui, &mut st.settings.tone, "Roll off the highlights", m.row);
+        ui.add_enabled_ui(st.settings.tone, |ui| {
+            BigSlider::new(&mut st.settings.exposure, -3.0..=3.0, "Exposure")
+                .decimals(2)
+                .suffix(" stops")
+                .height(m.row)
+                .show(ui);
+            BigSlider::new(&mut st.settings.contrast, 0.5..=2.0, "Contrast")
+                .decimals(2)
+                .height(m.row)
+                .show(ui);
+            BigSlider::new(&mut st.settings.saturation, 0.0..=2.0, "Saturation")
+                .decimals(2)
+                .height(m.row)
+                .show(ui);
+        });
+        widgets::section_title(ui, "SURFACE");
+    }
+
     widgets::toggle(ui, &mut st.settings.flat, "Flat shading", m.row);
     widgets::toggle(ui, &mut st.settings.vertex_color, "Vertex colours", m.row);
     let wire_ok = st.wireframe_available;

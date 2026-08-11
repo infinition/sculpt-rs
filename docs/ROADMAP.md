@@ -83,7 +83,8 @@ fraction. A remesh through the **field** and the **dual mesher**, every pass
 parallel. Hole filling. Mirror and symmetrize.
 
 **Rendering.** Matcap in three forms. A three-light view that reads painted
-roughness and metalness. Normals, cavity, unlit and clay views. Wireframe, flat
+roughness and metalness, through a **tone curve** with exposure, contrast and
+saturation. Normals, cavity, unlit and clay views. Wireframe, flat
 shading, opacity, vertex colours. An infinite ground grid. Multisampling to 8x,
 dropped automatically once triangles fall under a pixel. A GPU vertex of 24
 bytes split into **hot and cold streams**. Sparse GPU updates through a compute
@@ -648,7 +649,15 @@ clips flat. One good curve changes how every view reads.
 **Done when.** A bright highlight rolls off instead of clipping, checked in the
 offscreen example.
 
-**Effort.** 2 days. **The best visual return per hour.**
+**Effort.** 2 days. **Done.** Pushed three stops, the lit view without the
+curve puts 24951 pixels at pure white and loses the form inside them; with it,
+none. Exposure, contrast and saturation sit next to it.
+
+Only the lit view goes through the curve, and that is deliberate. A matcap is
+an image somebody already graded, the normals view is data rather than light,
+and the unlit view exists precisely to show a painted colour untouched. A curve
+on any of those changes an answer rather than shaping a picture. It becomes the
+one that matters once R4 gives the lit view a real range to map.
 
 ### R2. Horizon sweep
 
@@ -1074,7 +1083,7 @@ ones given a second pair of hands.
 | ~~1~~ | ~~M1 channels~~ | **done** | |
 | ~~2~~ | ~~F1 compress the channel store~~ | **done** | |
 | 3 | T1 shape cost collapse | needs a chosen collapse position first, see the entry | 1 wk |
-| 4 | R1 the tone curve | 2 days, changes how everything reads | 2 d |
+| ~~4~~ | ~~R1 the tone curve~~ | **done** | |
 | 5 | R2 horizon sweep | 3 days, the model becomes solid | 3 d |
 | 6 | M2 texture channel | unblocks texturing and glTF | 3 d |
 | 7 | F2 scene container v2 | before the scene grows further | 4 d |

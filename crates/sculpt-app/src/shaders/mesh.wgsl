@@ -11,6 +11,8 @@ struct Globals {
     extra: vec4<f32>,
     bg_top: vec4<f32>,
     bg_bottom: vec4<f32>,
+    // x = exposure, y = contrast, z = saturation, w = 1 when the curve is on
+    tone: vec4<f32>,
 };
 
 struct ObjectData {
@@ -70,6 +72,34 @@ fn vs_main(in: VsIn) -> VsOut {
     out.mask = in.paint.a;
     out.material = in.material.xy;
     return out;
+}
+
+// Light as a camera would have recorded it.
+//
+// Without this, everything above one is clipped flat: a specular highlight
+// arrives as a white disc with no shape, and the brightest part of a form
+// reads as a hole. The curve rolls the top off instead, so a highlight keeps
+// its falloff and the rest of the range is left where it was.
+//
+// Rests on the fitted approximation of the academy transform published by
+// Narkowicz, which is four constants and one divide and is what most engines
+// reach for when they want the look without the cost.
+fn tone_curve(linear: vec3<f32>) -> vec3<f32> {
+    // Exposure is a camera control and applies either way. Only the roll-off
+    // is optional, so turning it off leaves the same light clipping flat
+    // against the top of the range, which is the thing worth comparing.
+    var c = linear * g.tone.x;
+    if (g.tone.w < 0.5) {
+        return c;
+    }
+    let a = c * (2.51 * c + 0.03);
+    let b = c * (2.43 * c + 0.59) + 0.14;
+    c = clamp(a / b, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Contrast around the middle of the range, then saturation around the
+    // luminance, both after the curve so neither can push anything back over.
+    c = clamp((c - 0.5) * g.tone.y + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lum = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return clamp(mix(vec3<f32>(lum), c, g.tone.z), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn matcap(n: vec3<f32>) -> vec3<f32> {
@@ -146,7 +176,9 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
     if (mode == 0) {
         c = matcap(normalize(nv)) * tint;
     } else if (mode == 1) {
-        c = pbr(nw, in.world, tint * 0.8 + 0.1, in.material.x, in.material.y);
+        // The one mode that simulates light, and so the one with a range to
+        // map. Everything else here is already a colour somebody chose.
+        c = tone_curve(pbr(nw, in.world, tint * 0.8 + 0.1, in.material.x, in.material.y));
     } else if (mode == 2) {
         c = normalize(nw) * 0.5 + vec3<f32>(0.5, 0.5, 0.5);
     } else if (mode == 3) {

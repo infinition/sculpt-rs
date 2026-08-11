@@ -142,9 +142,68 @@ fn main() {
         "la couleur peinte n'est pas arrivée: le flux froid ne suit pas",
     );
 
+    // La courbe de tonalité. Poussée de trois diaphragmes, une vue éclairée
+    // sans courbe part au blanc pur et la forme disparaît; avec, elle doit
+    // rester une forme.
+    let brûlé = draw_with(
+        &device,
+        &queue,
+        &r,
+        &s.scene,
+        FrameSettings { shading: Shading::Pbr, grid: false, tone: false, exposure: 3.0, ..Default::default() },
+        view,
+        proj,
+        eye,
+    );
+    let tenu = draw_with(
+        &device,
+        &queue,
+        &r,
+        &s.scene,
+        FrameSettings { shading: Shading::Pbr, grid: false, tone: true, exposure: 3.0, ..Default::default() },
+        view,
+        proj,
+        eye,
+    );
+    let blancs = |img: &[u8]| {
+        img.chunks_exact(4)
+            .filter(|p| p[0] == 255 && p[1] == 255 && p[2] == 255)
+            .count()
+    };
+    println!(
+        "pixels au blanc pur, sans courbe: {}   avec: {}",
+        blancs(&brûlé),
+        blancs(&tenu)
+    );
+    check(
+        blancs(&brûlé) > 200,
+        "la scène de contrôle ne brûle pas, le test ne vérifie rien",
+    );
+    check(
+        blancs(&tenu) * 4 < blancs(&brûlé),
+        "la courbe ne retient pas les hautes lumières",
+    );
+
     println!();
-    println!("les pipelines se construisent, la sphère arrive à l'écran, et une");
-    println!("mise à jour creuse porte le relief comme la couleur.");
+    println!("les pipelines se construisent, la sphère arrive à l'écran, une mise");
+    println!("à jour creuse porte le relief comme la couleur, et la courbe de");
+    println!("tonalité retient ce qui brûlait.");
+}
+
+/// Une image avec des réglages donnés, plutôt que les réglages par défaut.
+#[allow(clippy::too_many_arguments)]
+fn draw_with(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    r: &Renderer,
+    scene: &Scene,
+    settings: FrameSettings,
+    view: Mat4,
+    proj: Mat4,
+    eye: Vec3,
+) -> Vec<u8> {
+    r.set_uniforms(queue, scene, view, proj, eye, &settings);
+    draw_settings(device, queue, r, scene, &settings)
 }
 
 /// Envoie ce que le dernier trait a touché, puis dessine.
@@ -195,6 +254,17 @@ fn draw(
 ) -> Vec<u8> {
     let settings = FrameSettings { shading, grid: false, ..Default::default() };
     r.set_uniforms(queue, scene, view, proj, eye, &settings);
+    draw_settings(device, queue, r, scene, &settings)
+}
+
+/// Le rendu proprement dit, une fois les uniformes posés.
+fn draw_settings(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    r: &Renderer,
+    scene: &Scene,
+    settings: &FrameSettings,
+) -> Vec<u8> {
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("cible"),
@@ -243,7 +313,7 @@ fn draw(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        r.draw(&mut pass, scene, &settings, &[None]);
+        r.draw(&mut pass, scene, settings, &[None]);
     }
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {

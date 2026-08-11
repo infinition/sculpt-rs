@@ -78,6 +78,17 @@ pub struct FrameSettings {
     pub grid: bool,
     pub grid_spacing: f32,
     pub cavity_strength: f32,
+    /// The tone curve, and what it is fed.
+    ///
+    /// Only the lit view goes through it. A matcap is an image somebody already
+    /// graded, the normals view is data rather than light, and the unlit view
+    /// exists precisely to show a painted colour untouched. Putting a curve on
+    /// any of those would be changing an answer, not shaping a picture.
+    pub tone: bool,
+    /// Stops of exposure, so one step is a doubling.
+    pub exposure: f32,
+    pub contrast: f32,
+    pub saturation: f32,
     pub background_top: [f32; 3],
     pub background_bottom: [f32; 3],
     /// Send only the vertices a stroke touched and let a compute pass scatter
@@ -97,6 +108,10 @@ impl Default for FrameSettings {
             grid: true,
             grid_spacing: 0.25,
             cavity_strength: 6.0,
+            tone: true,
+            exposure: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
             // Held as sRGB so the colour pickers show what the viewport shows.
             background_top: [0.16, 0.17, 0.19],
             background_bottom: [0.075, 0.08, 0.09],
@@ -131,6 +146,8 @@ struct Globals {
     extra: [f32; 4],
     bg_top: [f32; 4],
     bg_bottom: [f32; 4],
+    /// x = exposure, y = contrast, z = saturation, w = 1 when the curve is on.
+    tone: [f32; 4],
 }
 
 #[repr(C)]
@@ -952,6 +969,13 @@ impl Renderer {
             ],
             bg_top: to_linear(s.background_top),
             bg_bottom: to_linear(s.background_bottom),
+            tone: [
+                // Stops, which is how anyone holding a camera thinks about it.
+                (2.0f32).powf(s.exposure),
+                s.contrast.max(0.0),
+                s.saturation.max(0.0),
+                if s.tone { 1.0 } else { 0.0 },
+            ],
         };
         queue.write_buffer(&self.global_buf, 0, bytemuck::bytes_of(&g));
 

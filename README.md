@@ -71,6 +71,9 @@ built for a pen and a touch screen as much as for a mouse.
 - Six shading modes: matcap, a lit PBR view that reads the painted roughness
   and metalness, world normals, cavity, unlit for hand-painting, and
   untextured clay for judging form.
+- A tone curve on the lit view, with exposure in stops, contrast and
+  saturation, so a highlight rolls off instead of clipping to a white disc.
+  The other views are colours somebody already chose, and are left alone.
 - Matcaps three ways: five generated presets, an editable lightcap where the
   material and all three lights can be taken apart and aimed by dragging, or
   an image loaded off disk.
