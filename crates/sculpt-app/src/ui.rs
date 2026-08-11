@@ -1053,10 +1053,16 @@ fn floating_panels(
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 let inner_width = ui.available_width();
                 egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
+                    // Allowed to shrink. Told to take everything available, it
+                    // reports that as the width it needs, and the window takes
+                    // that for a minimum: it could be dragged wider and never
+                    // narrower, snapping back on release. The content is pinned
+                    // to the window below instead, which fills it just the same
+                    // and follows it back in.
+                    .auto_shrink([true, true])
                     .max_height(st.viewport.height() * 0.75)
                     .show(ui, |ui| {
-                        ui.set_max_width(inner_width);
+                        ui.set_width(inner_width);
                         tab_body(ui, tab, s, st, cam, giz, cx);
                     });
             });
@@ -2659,7 +2665,10 @@ fn help_window(ctx: &egui::Context, st: &mut UiState, p: Palette) {
             for (key, what) in rows {
                 ui.horizontal(|ui| {
                     ui.scope(|ui| {
-                        ui.set_width(210.0);
+                        // A share of what there is rather than a fixed column:
+                        // a hard number here is a floor the whole panel cannot
+                        // go below once it is floating.
+                        ui.set_width((ui.available_width() * 0.55).clamp(80.0, 210.0));
                         ui.label(egui::RichText::new(key).monospace().small().color(p.accent));
                     });
                     ui.label(egui::RichText::new(what).small().color(p.text));
