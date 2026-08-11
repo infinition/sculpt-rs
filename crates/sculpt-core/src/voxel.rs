@@ -14,7 +14,7 @@
 //! surface nets, which place a vertex in every cell whose edges cross the
 //! surface and connect the cells around each crossing edge into quads.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use glam::Vec3;
@@ -36,6 +36,9 @@ type Chunk = [f32; CHUNK * CHUNK * CHUNK];
 /// far that no edge touching it can be near a crossing on its own.
 const OUTSIDE: f32 = 1e6;
 
+/// One surface cell, keyed by its lower corner's voxel index.
+type Cell = (i32, i32, i32);
+
 /// The sparse, chunked field.
 #[derive(Clone)]
 pub struct VoxelField {
@@ -44,6 +47,16 @@ pub struct VoxelField {
     /// World position of voxel (0, 0, 0)'s corner.
     pub origin: Vec3,
     chunks: HashMap<(i32, i32, i32), Box<Chunk>>,
+    /// Chunks written since the last extraction, so only they are re-extracted.
+    dirty: HashSet<(i32, i32, i32)>,
+    /// Extracted surface vertex per cell.
+    cell_pos: HashMap<Cell, Vec3>,
+    /// Triangles of each cell, named by the cells they join rather than by
+    /// mesh indices, so a cell can be re-extracted without knowing the mesh.
+    cell_quads: HashMap<Cell, Vec<[Cell; 3]>>,
+    /// The surface as a triangle mesh, rebuilt from the caches when a dirty
+    /// chunk is re-extracted.
+    surface: Mesh,
 }
 
 fn flat(i: usize, j: usize, k: usize) -> usize {
@@ -53,7 +66,15 @@ fn flat(i: usize, j: usize, k: usize) -> usize {
 impl VoxelField {
     /// An empty field at the given voxel size.
     pub fn new(h: f32) -> Self {
-        Self { h: h.max(1e-6), origin: Vec3::ZERO, chunks: HashMap::new() }
+        Self {
+            h: h.max(1e-6),
+            origin: Vec3::ZERO,
+            chunks: HashMap::new(),
+            dirty: HashSet::new(),
+            cell_pos: HashMap::new(),
+            cell_quads: HashMap::new(),
+            surface: Mesh::new(),
+        }
     }
 
     /// Voxelises a triangle mesh into the field, at voxel size `h`.
@@ -323,67 +344,122 @@ impl VoxelField {
         self.chunks.len()
     }
 
-    /// Extracts the surface as a triangle mesh with surface nets.
-    pub fn extract(&self) -> Mesh {
-        // Every cell of every stored chunk, one entry per cell. The crossing
-        // test and the quad wiring are both independent per cell, so both run
-        // across the cores.
-        let mut cells: Vec<(i32, i32, i32)> =
-            Vec::with_capacity(self.chunks.len() * CHUNK * CHUNK * CHUNK);
-        for &(cx, cy, cz) in self.chunks.keys() {
-            for lk in 0..CHUNK {
-                for lj in 0..CHUNK {
-                    for li in 0..CHUNK {
-                        cells.push((
-                            cx * CHUNK_I32 + li as i32,
-                            cy * CHUNK_I32 + lj as i32,
-                            cz * CHUNK_I32 + lk as i32,
-                        ));
+    /// Extracts the whole surface, recomputing every cell.
+    ///
+    /// What a freshly voxelised field wants. After it, [`Self::extract_modified`]
+    /// keeps the surface up to date by re-extracting only the written chunks.
+    pub fn extract(&mut self) -> Mesh {
+        self.cell_pos.clear();
+        self.cell_quads.clear();
+        let cells: Vec<Cell> = self
+            .chunks
+            .keys()
+            .flat_map(|&(cx, cy, cz)| {
+                (0..CHUNK).flat_map(move |lk| {
+                    (0..CHUNK)
+                        .flat_map(move |lj| {
+                            (0..CHUNK).map(move |li| {
+                                (
+                                    cx * CHUNK_I32 + li as i32,
+                                    cy * CHUNK_I32 + lj as i32,
+                                    cz * CHUNK_I32 + lk as i32,
+                                )
+                            })
+                        })
+                })
+            })
+            .collect();
+        // Positions first, then faces: a quad names its four cells, and they
+        // must all exist before any of them is wired.
+        for &cell in &cells {
+            self.compute_cell_pos(cell);
+        }
+        for &cell in &cells {
+            self.compute_cell_quads(cell);
+        }
+        self.rebuild();
+        self.dirty.clear();
+        self.surface.clone()
+    }
+
+    /// Re-extracts only the cells the written chunks and their halo cover,
+    /// and rebuilds the surface from the caches.
+    ///
+    /// This is the per-dab cost. A stamp writes a handful of chunks, and only
+    /// their cells and the band around them are re-examined; the rest of the
+    /// surface is handed back as it was.
+    pub fn extract_modified(&mut self) -> Mesh {
+        if self.dirty.is_empty() {
+            return self.surface.clone();
+        }
+        let dirty: Vec<(i32, i32, i32)> = self.dirty.iter().copied().collect();
+        // The halo is three cells: one for the corner values a cell reads from
+        // its neighbours, and two more for the quads whose four cells straddle
+        // the chunk boundary.
+        let mut affected: Vec<Cell> = Vec::new();
+        for &(cx, cy, cz) in &dirty {
+            for i in cx * CHUNK_I32 - 3..=(cx + 1) * CHUNK_I32 + 2 {
+                for j in cy * CHUNK_I32 - 3..=(cy + 1) * CHUNK_I32 + 2 {
+                    for k in cz * CHUNK_I32 - 3..=(cz + 1) * CHUNK_I32 + 2 {
+                        affected.push((i, j, k));
                     }
                 }
             }
         }
-
-        // One vertex per cell whose edges cross the surface, at the mean of
-        // the crossings. The mean is the naive surface net; the corner solve
-        // (T3) is what sharpens it later.
-        let found: Vec<((i32, i32, i32), Vec3)> = cells
-            .par_iter()
-            .filter_map(|&(i, j, k)| self.cell_vertex(i, j, k).map(|v| ((i, j, k), v)))
-            .collect();
-
-        let mut mesh = Mesh::new();
-        let mut index: HashMap<(i32, i32, i32), u32> = HashMap::with_capacity(found.len());
-        for ((i, j, k), v) in found {
-            let vi = mesh.add_vertex(Vertex::new(v));
-            index.insert((i, j, k), vi);
+        for &cell in &affected {
+            self.compute_cell_pos(cell);
         }
-
-        // Each cell owns its three positive edges, so every crossing edge is
-        // visited once. The four cells around an edge contribute a quad, and
-        // the faces are gathered in parallel against the shared index.
-        let faces: Vec<[u32; 3]> = cells
-            .par_chunks(2048)
-            .flat_map_iter(|part| part.iter().flat_map(|&(i, j, k)| self.cell_faces(&index, i, j, k)))
-            .collect();
-        for f in faces {
-            mesh.add_face(f);
+        for &cell in &affected {
+            self.compute_cell_quads(cell);
         }
-        mesh
+        self.rebuild();
+        self.dirty.clear();
+        self.surface.clone()
     }
 
-    /// The up-to-two triangles a cell contributes, from its three edges.
-    fn cell_faces(
-        &self,
-        index: &HashMap<(i32, i32, i32), u32>,
-        i: i32,
-        j: i32,
-        k: i32,
-    ) -> Vec<[u32; 3]> {
+    /// Rebuilds the surface mesh from the cached cells.
+    fn rebuild(&mut self) {
+        let mut mesh = Mesh::new();
+        let mut index: HashMap<Cell, u32> = HashMap::with_capacity(self.cell_pos.len());
+        for (cell, &pos) in &self.cell_pos {
+            let vi = mesh.add_vertex(Vertex::new(pos));
+            index.insert(*cell, vi);
+        }
+        for tris in self.cell_quads.values() {
+            for tri in tris {
+                let Some(a) = index.get(&tri[0]).copied() else { continue };
+                let Some(b) = index.get(&tri[1]).copied() else { continue };
+                let Some(c) = index.get(&tri[2]).copied() else { continue };
+                mesh.add_face([a, b, c]);
+            }
+        }
+        self.surface = mesh;
+    }
+
+    /// Recomputes one cell's surface vertex into the cache.
+    fn compute_cell_pos(&mut self, cell: Cell) {
+        match self.cell_vertex(cell.0, cell.1, cell.2) {
+            Some(p) => self.cell_pos.insert(cell, p),
+            None => self.cell_pos.remove(&cell),
+        };
+    }
+
+    /// Regenerates one cell's triangles, read from the cached vertices, which
+    /// all exist by now: the positions are computed in their own pass first,
+    /// or a quad would drop because a neighbour it names had not been reached.
+    fn compute_cell_quads(&mut self, cell: Cell) {
+        let quads = self.cell_faces_from(cell);
+        self.cell_quads.insert(cell, quads);
+    }
+
+    /// The up-to-two triangles a cell contributes, named by the cells they
+    /// join, from its three positive edges.
+    fn cell_faces_from(&self, cell: Cell) -> Vec<[Cell; 3]> {
+        let (i, j, k) = cell;
         let mut out = Vec::new();
-        self.quad_along_x(index, &mut out, i, j, k);
-        self.quad_along_y(index, &mut out, i, j, k);
-        self.quad_along_z(index, &mut out, i, j, k);
+        self.quad_along_x(&mut out, i, j, k);
+        self.quad_along_y(&mut out, i, j, k);
+        self.quad_along_z(&mut out, i, j, k);
         out
     }
 
@@ -444,86 +520,44 @@ impl VoxelField {
     }
 
     /// Pushes a quad for the X edge of cell (i, j, k), if it crosses.
-    fn quad_along_x(
-        &self,
-        index: &HashMap<(i32, i32, i32), u32>,
-        out: &mut Vec<[u32; 3]>,
-        i: i32,
-        j: i32,
-        k: i32,
-    ) {
+    fn quad_along_x(&self, out: &mut Vec<[Cell; 3]>, i: i32, j: i32, k: i32) {
         if self.inside(i, j, k) == self.inside(i + 1, j, k) {
             return;
         }
         // The four cells sharing this edge: it lies along the X axis at
         // (i, j, k), so the ring is the cells offset in y and z around it.
-        let ring = [
-            (i, j, k),
-            (i, j - 1, k),
-            (i, j - 1, k - 1),
-            (i, j, k - 1),
-        ];
-        self.push_quad(index, out, ring);
+        let ring = [(i, j, k), (i, j - 1, k), (i, j - 1, k - 1), (i, j, k - 1)];
+        self.push_quad(out, ring);
     }
 
-    fn quad_along_y(
-        &self,
-        index: &HashMap<(i32, i32, i32), u32>,
-        out: &mut Vec<[u32; 3]>,
-        i: i32,
-        j: i32,
-        k: i32,
-    ) {
+    fn quad_along_y(&self, out: &mut Vec<[Cell; 3]>, i: i32, j: i32, k: i32) {
         if self.inside(i, j, k) == self.inside(i, j + 1, k) {
             return;
         }
-        let ring = [
-            (i, j, k),
-            (i - 1, j, k),
-            (i - 1, j, k - 1),
-            (i, j, k - 1),
-        ];
-        self.push_quad(index, out, ring);
+        let ring = [(i, j, k), (i - 1, j, k), (i - 1, j, k - 1), (i, j, k - 1)];
+        self.push_quad(out, ring);
     }
 
-    fn quad_along_z(
-        &self,
-        index: &HashMap<(i32, i32, i32), u32>,
-        out: &mut Vec<[u32; 3]>,
-        i: i32,
-        j: i32,
-        k: i32,
-    ) {
+    fn quad_along_z(&self, out: &mut Vec<[Cell; 3]>, i: i32, j: i32, k: i32) {
         if self.inside(i, j, k) == self.inside(i, j, k + 1) {
             return;
         }
-        let ring = [
-            (i, j, k),
-            (i - 1, j, k),
-            (i - 1, j - 1, k),
-            (i, j - 1, k),
-        ];
-        self.push_quad(index, out, ring);
+        let ring = [(i, j, k), (i - 1, j, k), (i - 1, j - 1, k), (i, j - 1, k)];
+        self.push_quad(out, ring);
     }
 
-    fn push_quad(
-        &self,
-        index: &HashMap<(i32, i32, i32), u32>,
-        out: &mut Vec<[u32; 3]>,
-        ring: [(i32, i32, i32); 4],
-    ) {
+    fn push_quad(&self, out: &mut Vec<[Cell; 3]>, ring: [Cell; 4]) {
         // A quad needs all four cells to have a surface vertex. At the edge of
         // the stored field one is missing and the quad is dropped, which only
         // happens where the surface leaves the field.
-        let [a, b, c, d] = [
-            index.get(&ring[0]).copied(),
-            index.get(&ring[1]).copied(),
-            index.get(&ring[2]).copied(),
-            index.get(&ring[3]).copied(),
-        ];
-        let (Some(a), Some(b), Some(c), Some(d)) = (a, b, c, d) else {
+        let [a, b, c, d] = ring;
+        if !(self.cell_pos.contains_key(&a)
+            && self.cell_pos.contains_key(&b)
+            && self.cell_pos.contains_key(&c)
+            && self.cell_pos.contains_key(&d))
+        {
             return;
-        };
+        }
         out.push([a, b, c]);
         out.push([a, c, d]);
     }
@@ -535,7 +569,7 @@ mod tests {
 
     #[test]
     fn a_sphere_extracts_as_a_closed_shell() {
-        let f = VoxelField::sphere(Vec3::ZERO, 1.0, 0.05);
+        let mut f = VoxelField::sphere(Vec3::ZERO, 1.0, 0.05);
         let mesh = f.extract();
         // A unit sphere at h = 0.05 has a surface of a few thousand cells.
         assert!(
@@ -594,7 +628,7 @@ mod tests {
     fn a_voxelised_mesh_extracts_as_a_closed_shell() {
         use crate::primitives;
         let mesh = primitives::icosphere(4);
-        let f = VoxelField::from_mesh(&mesh, 0.04);
+        let mut f = VoxelField::from_mesh(&mesh, 0.04);
         let out = f.extract();
         assert!(out.face_count() > 1_000, "too small: {}", out.face_count());
         let mut edges: HashMap<(u32, u32), u32> = HashMap::new();

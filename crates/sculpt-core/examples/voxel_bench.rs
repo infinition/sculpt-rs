@@ -45,11 +45,14 @@ fn main() {
     );
 
     let sculpt = |f: &mut voxel::VoxelField, dabs: usize| {
+        // One full extraction to stand the surface up, then incremental
+        // extraction per dab, which is what a frame of sculpting pays.
+        f.extract();
         let t = Instant::now();
         for i in 0..dabs {
             let at = Vec3::new((i as f32 * 0.01).sin(), 1.0, (i as f32 * 0.01).cos());
             f.stamp(at, 0.2, 0.1);
-            let _ = f.extract();
+            let _ = f.extract_modified();
         }
         t.elapsed().as_secs_f64() * 1000.0
     };
@@ -59,8 +62,8 @@ fn main() {
     let mut fine = fine;
     let coarse_s = sculpt(&mut coarse, dabs);
     let fine_s = sculpt(&mut fine, dabs);
-    println!("{:<46} {:>10.1} ms", "sculpt 20 dabs, coarse field", coarse_s);
-    println!("{:<46} {:>10.1} ms", "sculpt 20 dabs, fine field", fine_s);
+    println!("{:<46} {:>10.1} ms  ({:.2} ms/dab)", "sculpt 20 dabs, coarse field", coarse_s, coarse_s / dabs as f64);
+    println!("{:<46} {:>10.1} ms  ({:.2} ms/dab)", "sculpt 20 dabs, fine field", fine_s, fine_s / dabs as f64);
     let ratio = fine_s / coarse_s.max(0.001);
     println!(
         "\n3.5x the triangles, sculpting cost ratio {:.2}x. The one-time\nvoxelisation paid the density; the sculpting does not.",
