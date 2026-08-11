@@ -195,11 +195,11 @@ impl Sculptor {
             return;
         }
         let mut field = VoxelField::from_mesh(mesh, h);
-        let surface = field.extract();
+        field.extract();
         self.voxel_field = Some(field);
         self.voxel_mode = true;
         if let Some(o) = self.scene.active_mut() {
-            o.mesh = surface;
+            o.mesh = self.voxel_field.as_ref().unwrap().surface().clone();
         }
         self.mark_all_dirty();
     }
@@ -218,10 +218,11 @@ impl Sculptor {
             return false;
         };
         field.stamp(point, radius, amount);
-        let surface = field.extract_modified();
+        field.extract_modified();
+        let (dirty_v, dirty_f, fully) = field.take_dirty();
         let active = self.scene.active;
         if let Some(o) = self.scene.objects.get_mut(active) {
-            o.mesh = surface;
+            o.mesh.sync_from(field.surface(), &dirty_v, &dirty_f, fully);
         }
         self.mark_all_dirty();
         true

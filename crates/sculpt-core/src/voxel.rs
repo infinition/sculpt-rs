@@ -356,12 +356,22 @@ impl VoxelField {
         self.chunks.len()
     }
 
+    /// The extracted surface, which a caller keeps in step via [`Self::take_dirty`].
+    pub fn surface(&self) -> &Mesh {
+        &self.surface
+    }
+
+    /// Hands over the surface slots written since the last extraction.
+    pub fn take_dirty(&mut self) -> (Vec<u32>, Vec<u32>, bool) {
+        self.surface.take_dirty()
+    }
+
     /// Extracts the whole surface, recomputing every cell.
     ///
     /// What a freshly voxelised field wants. After it, [`Self::extract_modified`]
     /// keeps the surface up to date in place, and the mesh's dirty slots tell
     /// a renderer what to upload.
-    pub fn extract(&mut self) -> Mesh {
+    pub fn extract(&mut self) -> &Mesh {
         self.cell_index.clear();
         self.cell_faces.clear();
         self.free_faces.clear();
@@ -400,15 +410,15 @@ impl VoxelField {
         self.surface.fully_dirty = true;
         self.dirty.clear();
         self.finish_normals();
-        self.surface.clone()
+        &self.surface
     }
 
     /// Re-extracts only the cells the written chunks and their halo cover,
     /// mutating the surface in place. The surface mesh's dirty vertex and face
     /// slots are the only ones a renderer has to send.
-    pub fn extract_modified(&mut self) -> Mesh {
+    pub fn extract_modified(&mut self) -> &Mesh {
         if self.dirty.is_empty() {
-            return self.surface.clone();
+            return &self.surface;
         }
         // The previous round's dirty slots were already handed to a renderer,
         // so this round starts fresh.
@@ -458,7 +468,7 @@ impl VoxelField {
 
         self.dirty.clear();
         self.finish_normals();
-        self.surface.clone()
+        &self.surface
     }
 
     /// Moves or grows one cell's vertex in the stable mesh.

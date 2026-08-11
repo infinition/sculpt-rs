@@ -999,6 +999,43 @@ impl Mesh {
     /// of vertices, and every one of them changes the normal of everything
     /// around it. Both halves run across every core, and both were written to
     /// avoid the work rather than to spread it.
+    /// Brings the dirty region of `other` into this mesh, growing it to match.
+    ///
+    /// A renderer's sparse upload needs the mesh to stay the same object with
+    /// only the written slots changed, which replacing the whole mesh would
+    /// break: the index of an untouched vertex would suddenly mean a different
+    /// vertex. The voxel surface grows and rewrites only its written chunks,
+    /// so this copies exactly those vertices and faces, extends the arrays
+    /// when the surface grew, and hands the dirty sets on.
+    pub fn sync_from(&mut self, other: &Mesh, dirty_v: &[u32], dirty_f: &[u32], fully: bool) {
+        while self.pos.len() < other.pos.len() {
+            let i = self.pos.len();
+            self.pos.push(other.pos[i]);
+            self.nrm.push(other.nrm[i]);
+        }
+        self.vfaces.resize(other.pos.len(), Default::default());
+        while self.faces.len() < other.faces.len() {
+            let i = self.faces.len();
+            self.faces.push(other.faces[i]);
+        }
+        for &v in dirty_v {
+            let i = v as usize;
+            if i < self.pos.len() {
+                self.pos[i] = other.pos[i];
+                self.nrm[i] = other.nrm[i];
+            }
+        }
+        for &f in dirty_f {
+            let i = f as usize;
+            if i < self.faces.len() {
+                self.faces[i] = other.faces[i];
+            }
+        }
+        self.dirty_verts = dirty_v.to_vec();
+        self.dirty_faces = dirty_f.to_vec();
+        self.fully_dirty = fully;
+    }
+
     pub fn update_normals(&mut self, touched: &[u32]) -> Vec<u32> {
         if touched.is_empty() {
             return Vec::new();
