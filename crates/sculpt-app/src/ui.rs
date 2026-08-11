@@ -2253,6 +2253,12 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
         widgets::section_title(ui, "SURFACE");
     }
 
+    widgets::toggle(
+        ui,
+        &mut st.settings.backface_cull,
+        "Hide faces turned away",
+        m.row,
+    );
     widgets::toggle(ui, &mut st.settings.flat, "Flat shading", m.row);
     widgets::toggle(ui, &mut st.settings.vertex_color, "Vertex colours", m.row);
     let wire_ok = st.wireframe_available;

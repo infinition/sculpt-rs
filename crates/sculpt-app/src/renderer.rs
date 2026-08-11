@@ -94,6 +94,14 @@ pub struct FrameSettings {
     /// How far a crease reaches to shade itself, in world units.
     pub occlusion_radius: f32,
     pub occlusion_strength: f32,
+    /// Whether the card is allowed to throw away triangles facing away.
+    ///
+    /// On a closed model every one of them is behind something else and the
+    /// picture is identical without them, which on a dense mesh is most of the
+    /// rasterising gone. On an open surface, a plane or a sheet, it is the
+    /// difference between seeing it from behind and not, so it is a switch and
+    /// not an assumption.
+    pub backface_cull: bool,
     pub background_top: [f32; 3],
     pub background_bottom: [f32; 3],
     /// Send only the vertices a stroke touched and let a compute pass scatter
@@ -120,6 +128,7 @@ impl Default for FrameSettings {
             occlusion: true,
             occlusion_radius: 0.12,
             occlusion_strength: 1.0,
+            backface_cull: true,
             // Held as sRGB so the colour pickers show what the viewport shows.
             background_top: [0.16, 0.17, 0.19],
             background_bottom: [0.075, 0.08, 0.09],
@@ -440,6 +449,7 @@ impl Scatter {
 
 pub struct Renderer {
     mesh_pipeline: wgpu::RenderPipeline,
+    mesh_pipeline_culled: wgpu::RenderPipeline,
     wire_pipeline: Option<wgpu::RenderPipeline>,
     background_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
@@ -581,6 +591,7 @@ impl Renderer {
             // Placeholders replaced right below; building pipelines needs the
             // layouts that were just created.
             mesh_pipeline: dummy_pipeline(device, color_format),
+            mesh_pipeline_culled: dummy_pipeline(device, color_format),
             wire_pipeline: None,
             background_pipeline: dummy_pipeline(device, color_format),
             grid_pipeline: dummy_pipeline(device, color_format),
@@ -660,7 +671,7 @@ impl Renderer {
         let color_format = self.color_format;
         let blend_over = Some(wgpu::BlendState::ALPHA_BLENDING);
 
-        let mesh_pipeline = |entry: &str, polygon, bias: i32, blend| {
+        let mesh_pipeline = |entry: &str, polygon, bias: i32, blend, cull| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("mesh pipeline"),
                 layout: Some(&mesh_layout),
@@ -684,9 +695,11 @@ impl Renderer {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    // Sculpted surfaces get inverted locally all the time, and
-                    // culling them would punch holes in the model.
-                    cull_mode: None,
+                    // Two of these are built, one that keeps every triangle and
+                    // one that lets the card drop what faces away. Which is
+                    // used is a setting, because the answer differs between a
+                    // closed volume and a sheet.
+                    cull_mode: cull,
                     unclipped_depth: false,
                     polygon_mode: polygon,
                     conservative: false,
@@ -707,10 +720,18 @@ impl Renderer {
             })
         };
 
-        self.mesh_pipeline = mesh_pipeline("fs_main", wgpu::PolygonMode::Fill, 0, blend_over);
+        self.mesh_pipeline =
+            mesh_pipeline("fs_main", wgpu::PolygonMode::Fill, 0, blend_over, None);
+        self.mesh_pipeline_culled = mesh_pipeline(
+            "fs_main",
+            wgpu::PolygonMode::Fill,
+            0,
+            blend_over,
+            Some(wgpu::Face::Back),
+        );
         self.wire_pipeline = self
             .wire_supported
-            .then(|| mesh_pipeline("fs_wire", wgpu::PolygonMode::Line, -2, blend_over));
+            .then(|| mesh_pipeline("fs_wire", wgpu::PolygonMode::Line, -2, blend_over, None));
 
         let screen_pipeline = |shader: &wgpu::ShaderModule, label, depth_write, blend| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1171,7 +1192,11 @@ impl Renderer {
         pass.set_pipeline(&self.background_pipeline);
         pass.draw(0..3, 0..1);
 
-        pass.set_pipeline(&self.mesh_pipeline);
+        pass.set_pipeline(if s.backface_cull {
+            &self.mesh_pipeline_culled
+        } else {
+            &self.mesh_pipeline
+        });
         for (i, obj) in scene.objects.iter().enumerate().take(MAX_OBJECTS as usize) {
             if !obj.visible {
                 continue;

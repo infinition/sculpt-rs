@@ -216,6 +216,32 @@ fn main() {
         "la gorge entre deux sphères ne s'assombrit pas plus que le convexe",
     );
 
+    // Faces arrière. Sur un volume fermé, chacune est derrière une autre: en
+    // les jetant, l'image doit être exactement la même. Si elle ne l'est pas,
+    // c'est un trou.
+    let gardees = ao_render_with(&device, &queue, &mut r, &seule, false, view, proj, eye);
+    let jetees = ao_render_with(&device, &queue, &mut r, &seule, true, view, proj, eye);
+    let differents = gardees
+        .chunks_exact(4)
+        .zip(jetees.chunks_exact(4))
+        .filter(|(a, b)| a.iter().zip(*b).any(|(x, y)| x != y))
+        .count();
+    println!("pixels changés en jetant les faces arrière: {differents}");
+    check(
+        differents == 0,
+        "jeter les faces arrière change l'image d'un volume fermé: il y a un trou",
+    );
+
+    // Et ce que tout cela coûte réellement, sur une cible assez grande pour
+    // que le travail des fragments compte, et un maillage assez dense pour que
+    // les triangles descendent sous le pixel. C'est le chiffre qui décide s'il
+    // faut un niveau de détail ou pas.
+    println!();
+    println!("coût d'une image, 1024x1024, sur {}", adapter.get_info().name);
+    for level in [7u32, 8, 9] {
+        bench(&device, &queue, level);
+    }
+
     println!();
     println!("les pipelines se construisent, la sphère arrive à l'écran, une mise");
     println!("à jour creuse porte le relief comme la couleur, la courbe de");
@@ -243,6 +269,30 @@ fn darkened_share(a: &[u8], b: &[u8]) -> f32 {
         n += 1;
     }
     if n == 0 { 0.0 } else { dark as f32 / n as f32 }
+}
+
+/// Une image du modèle en argile, avec ou sans élimination des faces arrière.
+#[allow(clippy::too_many_arguments)]
+fn ao_render_with(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    r: &mut Renderer,
+    scene: &Scene,
+    backface_cull: bool,
+    view: Mat4,
+    proj: Mat4,
+    eye: Vec3,
+) -> Vec<u8> {
+    r.sync(device, queue, scene, None);
+    let settings = FrameSettings {
+        shading: Shading::Clay,
+        grid: false,
+        occlusion: false,
+        backface_cull,
+        ..Default::default()
+    };
+    r.set_uniforms(queue, scene, view, proj, eye, &settings);
+    draw_settings(device, queue, r, scene, &settings)
 }
 
 /// Une image du modèle en argile, avec ou sans occlusion.
@@ -429,4 +479,94 @@ fn draw_settings(
         out.extend_from_slice(&padded[start..start + (SIZE * 4) as usize]);
     }
     out
+}
+
+/// Ce qu'une image coûte vraiment, à densité élevée.
+///
+/// Le GPU travaille derrière le CPU, donc mesurer autour de `submit` ne dit
+/// rien. On attend la fin de chaque image avant de mesurer la suivante: ce
+/// n'est pas ce que fait l'application, mais c'est le seul moyen d'attribuer
+/// un temps à un réglage plutôt qu'à la file d'attente.
+fn bench(device: &wgpu::Device, queue: &wgpu::Queue, level: u32) {
+    const SIDE: u32 = 1024;
+    const FRAMES: u32 = 24;
+
+    let mut r = Renderer::new(device, queue, FORMAT, SIDE, SIDE, false, 1);
+    let mesh = primitives::icosphere(level);
+    let faces = mesh.face_count();
+    let scene = Scene::with_object(Object::new("dense", mesh));
+    r.sync(device, queue, &scene, None);
+
+    let eye = Vec3::new(0.0, 0.0, 2.4);
+    let view = glam::camera::rh::view::look_at_mat4(eye, Vec3::ZERO, Vec3::Y);
+    let proj = glam::camera::rh::proj::directx::perspective(0.9, 1.0, 0.05, 100.0);
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("bench"),
+        size: wgpu::Extent3d { width: SIDE, height: SIDE, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view_tex = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mut time = |label: &str, settings: FrameSettings| {
+        r.set_uniforms(queue, &scene, view, proj, eye, &settings);
+        // Une image pour chauffer, puis on mesure.
+        for warm in 0..=FRAMES {
+            if warm == 1 {
+                let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            }
+            let mut e = device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench") });
+            {
+                let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("bench scene"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view_tex,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: r.depth_view(),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                r.draw(&mut pass, &scene, &settings, &[None]);
+            }
+            r.draw_occlusion(&mut e, &view_tex, &settings);
+            queue.submit(Some(e.finish()));
+            if warm == 0 {
+                let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            }
+        }
+        let started = std::time::Instant::now();
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        let ms = started.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
+        let _ = label;
+        ms
+    };
+
+    let base = FrameSettings { shading: Shading::Clay, grid: false, occlusion: false,
+                               backface_cull: false, ..Default::default() };
+    let sans = time("", base);
+    let cull = time("", FrameSettings { backface_cull: true, ..base });
+    let ao = time("", FrameSettings { backface_cull: true, occlusion: true, ..base });
+    println!(
+        "  {faces:>9} faces   tout {sans:>6.2} ms   sans les arrières {cull:>6.2} ms            avec occlusion {ao:>6.2} ms",
+    );
 }

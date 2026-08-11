@@ -757,8 +757,34 @@ together, and picks a level by projected error in pixels.
 triangles with no visible seam, checked in the offscreen example against a full
 density render.
 
-**Effort.** 3 weeks. **Not a quick win.** Only worth it once scenes are
-regularly past 20 million triangles.
+**Effort.** 3 weeks. **Measured first, and it is not the problem.**
+
+The offscreen example now times a frame at three densities, on a 1024 by 1024
+target, waiting for the card between frames so a cost can be attributed to a
+setting rather than to the queue:
+
+| faces | everything | back faces dropped | with occlusion |
+|---|---|---|---|
+| 327 k | 0.03 ms | 0.02 ms | 0.51 ms |
+| 1.3 M | 0.34 ms | 0.22 ms | 0.72 ms |
+| 5.2 M | 0.91 ms | 0.87 ms | 1.47 ms |
+
+Five million triangles draw in under a millisecond, and the curve is flattening
+rather than steepening: four times the triangles between the last two rows cost
+under three times the milliseconds, because at this size the work is in the
+fragments and they are already saturated. Twenty-five million lands somewhere
+near three milliseconds by that slope.
+
+So a packet tree would buy single-digit milliseconds, at three weeks and a
+standing risk of cracks, on the part of the frame that was never the problem.
+The occlusion pass costs half a millisecond regardless of the triangle count and
+is the largest single item in the list.
+
+**What was slow was never the drawing.** It was a dab costing twenty
+milliseconds, a reorder costing a hundred and eighty-five, a full upload of a
+hundred and ninety megabytes, and a frame counter that measured the wrong thing.
+Those are what to keep after. This item drops to the bottom until a measurement
+puts it back.
 
 ### R11. Culling on the GPU
 
@@ -1133,7 +1159,7 @@ ones given a second pair of hands.
 | 29 | T6 the quad pass | | 3 wk |
 | 30 | T7 the flattener | | 3 wk |
 | 31 | T8 levels | | 2 wk |
-| 32 | R10 the packet tree, R11 GPU culling | once scenes pass 20 M triangles | 4 wk |
+| 32 | R10 the packet tree, R11 GPU culling | **measured, not the bottleneck; see the entry** | 4 wk |
 | 33 | F7 FBX, F9 mesh compression, A5 and A11 translations | | 4 wk |
 | 34 | F11 baking, F13 images, R14 encodings, R15 final extras | | 3 wk |
 
@@ -1259,7 +1285,9 @@ Known, unresolved, and written down so they are not rediscovered.
 4. **The ring costs 48 bytes a vertex.** Eight face indices held inline. A
    packed row layout would halve it but cannot be mutated in place, which live
    topology needs constantly.
-5. **Hardware backface culling is off.** The comment says a locally inverted
-   surface would show holes. The packet normal cone already discards
-   back-facing packets, so the remaining gain is smaller than it looks, and it
-   has never been measured.
+5. **Resolved.** Hardware backface culling is available and on by default. On
+   a closed model the picture is identical to the pixel, which the offscreen
+   example asserts, and it takes twenty-two percent off the frame at 1.3 M
+   faces and five at 5.2 M. It is a switch rather than an assumption, because
+   on an open surface it is the difference between seeing a sheet from behind
+   and not.
