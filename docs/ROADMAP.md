@@ -141,6 +141,19 @@ that outgrows itself grows in place, old contents copied, so a heavy dyntopo
 stroke no longer falls back to re-encoding the whole mesh, and frame latency
 is three. The offscreen example verifies the pipelines and the scatter.
 
+**Three stutters removed at the application level, measured on the machine.**
+A dab now cuts at most a bounded number of edges, so a fine detail target
+cannot make one dab a hundred milliseconds: the plan names the worst offenders
+first and the rest wait for the next dab, and the mesh converges to the detail
+over the stroke. Measured with the stress config of `dab_cost 9`, which forces
+the detail to half the edge length, a dab drops from 104 to 26 ms, and a heavy
+stroke after decimating to half drops from 565 to 143 ms. The packet reorder no
+longer runs between strokes: a stroke patches the packets it touched, and once
+they have spread past a point the model is drawn whole in one call, which costs
+the same rasterising and none of the stall that used to land after every stroke.
+And the frame readout leaves re-encoding frames out of its average, so a slow
+load no longer reads as a slow viewport at rest.
+
 ---
 
 ## Phase 1. The mesh core
