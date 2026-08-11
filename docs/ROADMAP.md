@@ -1229,18 +1229,29 @@ than discovering later.
 
 Known, unresolved, and written down so they are not rediscovered.
 
-1. **A dab is not identical across core counts.** A stroke lands on 7639 new
+1. **Resolved, kept as a warning.** A model of ten million triangles was
+   reported as running at seven frames a second at rest and sixty to a hundred
+   and twenty while a stroke was in progress. The readout was measuring the gap
+   between frames, and since nothing is drawn while nothing moves, that gap was
+   mostly time spent waiting. The arithmetic settles at one over the gap, so
+   seven meant a hundred and forty-three milliseconds between events. The same
+   report gives the real answer: sixty to a hundred and twenty while drawing
+   continuously is a frame that costs eight to sixteen milliseconds, at ten
+   million triangles, which is the number that was there all along. The readout
+   now measures what a frame costs to produce.
+
+2. **A dab is not identical across core counts.** A stroke lands on 7639 new
    vertices on six cores and 7649 on one, each repeatable. The edge search was
    proved not to be the cause: its output is sorted into a total order and is a
    pure function of the mesh. Something else in a dab still follows how the work
    was divided.
-2. **The packet reorder still stalls between strokes.** 185 ms on five million
+3. **The packet reorder still stalls between strokes.** 185 ms on five million
    triangles, of which 60 ms is rebuilding the ring. Doing it on a worker thread
    against a snapshot would hide it, at the cost of a frame of staleness.
-3. **The ring costs 48 bytes a vertex.** Eight face indices held inline. A
+4. **The ring costs 48 bytes a vertex.** Eight face indices held inline. A
    packed row layout would halve it but cannot be mutated in place, which live
    topology needs constantly.
-4. **Hardware backface culling is off.** The comment says a locally inverted
+5. **Hardware backface culling is off.** The comment says a locally inverted
    surface would show holes. The packet normal cone already discards
    back-facing packets, so the remaining gain is smaller than it looks, and it
    has never been measured.

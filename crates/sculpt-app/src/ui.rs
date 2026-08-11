@@ -162,7 +162,12 @@ pub struct UiState {
     pub show_rail: bool,
     pub show_stats: bool,
     pub show_help: bool,
-    pub fps: f32,
+    /// What the last frames cost to produce, in milliseconds, smoothed.
+    ///
+    /// The honest number: the rate a frame would sustain if one were asked for
+    /// straight after the last. The gap between frames is not that, because at
+    /// rest nothing asks for one.
+    pub frame_ms: f32,
     pub status: String,
     pub status_age: f32,
     pub remesh: RemeshOptions,
@@ -363,7 +368,7 @@ impl Default for UiState {
             show_rail: true,
             show_stats: true,
             show_help: false,
-            fps: 0.0,
+            frame_ms: 0.0,
             status: String::new(),
             status_age: 0.0,
             remesh: RemeshOptions::default(),
@@ -782,10 +787,14 @@ fn top_bar(
                         st.show_help = !st.show_help;
                     }
                     ui.label(
-                        egui::RichText::new(format!("{:>3.0} fps", st.fps))
+                        egui::RichText::new(format!(
+                            "{:>4.1} ms  {:>3.0} fps",
+                            st.frame_ms,
+                            if st.frame_ms > 0.01 { 1000.0 / st.frame_ms } else { 0.0 }
+                        ))
                             .small()
                             .monospace()
-                            .color(if st.fps < 25.0 { p.warn } else { p.faint }),
+                            .color(if st.frame_ms > 40.0 { p.warn } else { p.faint }),
                     );
                 });
             });

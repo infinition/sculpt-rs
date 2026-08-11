@@ -1219,10 +1219,12 @@ impl State {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
-        if dt > 0.0 {
-            // Exponential moving average, otherwise the readout is unreadable.
-            self.ui.fps = self.ui.fps * 0.9 + (1.0 / dt) * 0.1;
-        }
+        // `dt` is the gap since the last frame, which is what an animation
+        // needs and what a rate must not be read from. Nothing is drawn while
+        // nothing moves, so that gap is mostly time the application spent
+        // waiting, and dividing one by it reported seven frames a second for a
+        // model that was drawing in twelve milliseconds. What a frame costs is
+        // measured below, around the work itself.
         self.ui.status_age += dt;
         self.camera.update(dt);
 
@@ -1430,6 +1432,15 @@ impl State {
         }
 
         self.queue.submit(Some(encoder.finish()));
+        // What this frame cost to produce. Not how long since the last one:
+        // that is the pace of whatever asked for it, and at rest there is
+        // nothing asking.
+        let cost = now.elapsed().as_secs_f32() * 1000.0;
+        self.ui.frame_ms = if self.ui.frame_ms <= 0.0 {
+            cost
+        } else {
+            self.ui.frame_ms * 0.9 + cost * 0.1
+        };
         self.queue.present(frame);
 
         for id in &full_output.textures_delta.free {
