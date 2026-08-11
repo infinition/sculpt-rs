@@ -1013,14 +1013,15 @@ impl Mesh {
         // largest single cost of the pass: a dab produced half a million
         // entries to arrive at a set of a few tens of thousands. A scratch
         // below stamps each vertex as it is met, so each is pushed once and
-        // the sort is over the small set, not the multiset.
+        // the work is over the small set, not the multiset.
         //
         // The scratch is stamped rather than cleared: each round is one more
         // generation, and a vertex is pushed only when its stored generation
-        // differs, which is the first time it was met. The sort is kept, not
-        // dropped: sorting the multiset then deduplicating and deduplicating
-        // then sorting give the same list, so this changes neither the normals
-        // nor the order they land in `dirty_verts`.
+        // differs, which is the first time it was met. The set is left in that
+        // first-seen order rather than sorted: the order only decides the
+        // scatter slots a renderer fills, which use the vertex index, so it
+        // changes nothing about the mesh or the normals, and the sort was the
+        // largest single cost of the pass.
         let (vfaces, faces) = (&self.vfaces, &self.faces);
         let mut set: Vec<u32> = Vec::new();
         NORMALS_MARK.with(|c| {
@@ -1053,7 +1054,6 @@ impl Mesh {
                 }
             }
         });
-        set.sort_unstable();
 
         // Collected, then written back. A parallel loop cannot write into the
         // vertices while another reads them, and the write is a cheap scatter
