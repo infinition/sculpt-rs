@@ -1585,7 +1585,7 @@ impl ApplicationHandler for App {
                     st.apply_gesture(g);
                 } else if st.gizmo.is_dragging() {
                     st.gizmo_drag();
-                } else if st.stroke.active {
+                } else if st.stroke.active && !st.ui.wheel.open {
                     st.continue_stroke(1.0);
                 }
             }
@@ -1640,7 +1640,12 @@ impl ApplicationHandler for App {
                 // A pen and a finger have no hover, so egui has never seen the
                 // pointer where it lands and cannot say whether the interface
                 // wants it. The geometry can.
+                // The radial menu owns the pointer while it is up. The
+                // mouse path already said so; a pen or a finger goes through
+                // here, and without this a press meant for the size pad landed
+                // on the model behind the menu and sculpted it.
                 let over_ui = egui_captured
+                    || st.ui.wheel.open
                     || ui::interface_owns(
                         &st.egui_ctx,
                         st.ui.viewport,

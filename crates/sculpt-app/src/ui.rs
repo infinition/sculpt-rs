@@ -1034,6 +1034,13 @@ fn floating_panels(
                 st.viewport.top() + 40.0 + i as f32 * 26.0,
             ))
             .default_width(m.panel_width)
+            // A window sizes itself to what it holds, and what it holds asks
+            // for the width it is given: sliders here are full-width rails by
+            // design. Left alone the two chase each other to the edge of the
+            // screen on the first frame, and the window never comes back
+            // however it is dragged. The ceiling breaks the circle and still
+            // leaves room to make it as wide as anyone would want.
+            .max_width((st.viewport.width() * 0.45).max(m.panel_width * 1.5))
             .resizable(true)
             .frame(
                 Frame::new()
