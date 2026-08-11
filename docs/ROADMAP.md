@@ -60,7 +60,10 @@ found to be regressions, and reverted; that is the process working.
 
 Recorded so this document stands alone.
 
-**The mesh.** Gap-free position and face arrays. An incremental **ring**, the
+**The mesh.** **Channels**: every vertex attribute in its own array,
+quantised to what it needs, and a **dormant channel** costs nothing at all.
+Twenty-four bytes a vertex on a model nobody has painted, against forty-eight
+interleaved. Gap-free position and face arrays. An incremental **ring**, the
 faces around each vertex. Edge split and collapse with a link condition and a
 normal flip guard. The **grid**, an incremental spatial hash over vertices and
 faces, built across cores and never rebuilt mid-stroke. **Packets**, contiguous
@@ -87,7 +90,10 @@ bytes split into **hot and cold streams**. Sparse GPU updates through a compute
 scatter.
 
 **Files.** OBJ with vertex colours, PLY binary and ASCII, STL binary and ASCII,
-a scene file, brush sets as plain text, PNG, JPEG, BMP and TGA in.
+the **scene container** version 2, which writes each channel as its own
+compressed block and a dormant one as four bytes, brush sets as plain text,
+PNG, JPEG, BMP and TGA in. Version 1 files still open, and a truncated one is
+refused with a message.
 
 **Interface.** Docked panels that tear out into floating windows. A radial menu.
 Floating viewport controls and an orientation ball. Vector icons drawn in code.
@@ -109,6 +115,8 @@ the pixels back and checks them.
 | Undo of that stroke | a full copy | 14 ms |
 | Decimation to half | 4.6 s | 3.2 s |
 | Remesh, 20 k triangles at 128 | 476 ms | 67 ms |
+| Vertex memory, nothing painted | 126 MB | 63 MB |
+| The whole mesh, same model | 315 MB | 252 MB |
 
 Reproduce with `cargo run --release -p sculpt-core --example heavy 9`, and
 `--example dab_cost` for the breakdown of a single dab.
@@ -147,7 +155,10 @@ reports vertex memory under half of today's. The normals of a dab are measurably
 faster on 1.3 M triangles. A mesh loaded with no painted colour reports its
 colour channel dormant.
 
-**Effort.** 1 to 2 weeks. **The highest return item in this document.**
+**Effort.** 1 to 2 weeks. **Done.** Twenty-four bytes a vertex against
+forty-eight, sixty-three megabytes against a hundred and twenty-six on five
+million triangles. Speed unchanged within the noise at that size, and the
+spread of the normals pass roughly halved.
 
 ### M2. The texture channel
 
@@ -233,7 +244,10 @@ element size, so only the compressed length is stored.
 **Done when.** A round trip is byte identical, a five million vertex scene
 writes under a third of today's size, and a dormant channel occupies no bytes.
 
-**Effort.** 2 days. **The best return per hour in this document.**
+**Effort.** 2 days. **Done**, and it took the shape of F2 with it, since the
+channels made per-block writing the natural thing to do. Version 1 files still
+open. What remains under F2 is the manifest: materials, lights and a hierarchy,
+none of which exist yet to write.
 
 ### F2. The scene container, version 2
 
@@ -1027,8 +1041,8 @@ ones given a second pair of hands.
 
 | # | Item | Why here | Effort |
 |---|---|---|---|
-| 1 | M1 channels | everything downstream gets cheaper | 1-2 wk |
-| 2 | F1 compress the channel store | 2 days, and large scenes become saveable | 2 d |
+| ~~1~~ | ~~M1 channels~~ | **done** | |
+| ~~2~~ | ~~F1 compress the channel store~~ | **done** | |
 | 3 | T1 shape cost collapse | 3 days, every decimation keeps its shape | 3 d |
 | 4 | R1 the tone curve | 2 days, changes how everything reads | 2 d |
 | 5 | R2 horizon sweep | 3 days, the model becomes solid | 3 d |
