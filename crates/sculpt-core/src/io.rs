@@ -487,7 +487,82 @@ fn read_stl_ascii(buf: &[u8]) -> IoResult<(Vec<Vec3>, Vec<[u32; 3]>)> {
 // ---------------------------------------------------------------------------
 
 const MAGIC: &[u8; 8] = b"SCULPTRS";
-const VERSION: u32 = 1;
+/// What we write. Version 1 is still read.
+const VERSION: u32 = 2;
+
+/// One channel of one mesh, on disk.
+///
+/// The uncompressed size is never stored: it is the count times the size of an
+/// element, both of which the reader already knows. Only what the block cost
+/// after compression is written, which is what lets a dormant channel take
+/// four bytes and a compressible one take what it deserves.
+mod block {
+    /// The compressed bytes follow.
+    pub const COMPRESSED: u8 = 1 << 0;
+    /// Nothing follows: every entry is the channel's default.
+    pub const DORMANT: u8 = 1 << 1;
+}
+
+/// Writes one channel, compressed, or writes that there is nothing to write.
+///
+/// Compression is skipped when it does not pay. Positions are floats whose low
+/// bits are noise and they barely shrink, so paying to compress and then to
+/// decompress a hundred megabytes of them on every open would be a poor trade;
+/// face indices and quantised channels shrink a great deal.
+fn write_block<W: Write>(w: &mut W, raw: Option<&[u8]>) -> IoResult<()> {
+    let Some(raw) = raw else {
+        w.write_all(&[block::DORMANT]).map_err(err)?;
+        w.write_all(&0u32.to_le_bytes()).map_err(err)?;
+        return Ok(());
+    };
+    let packed = lz4_flex::block::compress(raw);
+    // A tenth off is the least worth the time it takes to unpack again.
+    if packed.len() < raw.len() - raw.len() / 10 {
+        w.write_all(&[block::COMPRESSED]).map_err(err)?;
+        w.write_all(&(packed.len() as u32).to_le_bytes()).map_err(err)?;
+        w.write_all(&packed).map_err(err)?;
+    } else {
+        w.write_all(&[0u8]).map_err(err)?;
+        w.write_all(&(raw.len() as u32).to_le_bytes()).map_err(err)?;
+        w.write_all(raw).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Reads one channel back, or reports that it was never written.
+///
+/// `expect` is what the caller knows the block has to expand to, so a file that
+/// claims otherwise is refused here rather than corrupting a mesh.
+fn read_block(buf: &[u8], o: &mut usize, expect: usize) -> IoResult<Option<Vec<u8>>> {
+    if *o + 5 > buf.len() {
+        return Err("scene file truncated in a channel header".into());
+    }
+    let flags = buf[*o];
+    *o += 1;
+    let len = u32::from_le_bytes([buf[*o], buf[*o + 1], buf[*o + 2], buf[*o + 3]]) as usize;
+    *o += 4;
+    if flags & block::DORMANT != 0 {
+        return Ok(None);
+    }
+    if *o + len > buf.len() {
+        return Err("scene file truncated in a channel".into());
+    }
+    let raw = &buf[*o..*o + len];
+    *o += len;
+    let out = if flags & block::COMPRESSED != 0 {
+        lz4_flex::block::decompress(raw, expect)
+            .map_err(|e| format!("a channel would not decompress: {e}"))?
+    } else {
+        raw.to_vec()
+    };
+    if out.len() != expect {
+        return Err(format!(
+            "a channel expanded to {} bytes where {expect} were expected",
+            out.len()
+        ));
+    }
+    Ok(Some(out))
+}
 
 /// Writes the whole scene, transforms and per-vertex attributes included.
 pub fn write_scene(scene: &Scene, path: &Path) -> IoResult<()> {
@@ -513,12 +588,18 @@ pub fn write_scene(scene: &Scene, path: &Path) -> IoResult<()> {
         w.write_all(&[o.visible as u8]).map_err(err)?;
         w.write_all(&(o.mesh.pos.len() as u32).to_le_bytes()).map_err(err)?;
         w.write_all(&(o.mesh.faces.len() as u32).to_le_bytes()).map_err(err)?;
-        // Gathered into whole vertices for the file, which is the shape
-        // version 1 of this format promised. Version 2 will write the channels
-        // as they are held.
-        let verts: Vec<Vertex> = o.mesh.vertices().collect();
-        w.write_all(bytemuck::cast_slice(&verts)).map_err(err)?;
-        w.write_all(bytemuck::cast_slice(&o.mesh.faces)).map_err(err)?;
+        // Channel by channel, in the order the reader expects them, each one
+        // compressed on its own or written as nothing at all. A model nobody
+        // has painted writes four bytes for its colour, four for its mask and
+        // four for each material value.
+        let m = &o.mesh;
+        write_block(&mut w, Some(bytemuck::cast_slice(&m.pos)))?;
+        write_block(&mut w, Some(bytemuck::cast_slice(&m.nrm)))?;
+        write_block(&mut w, m.col_channel().as_slice().map(bytemuck::cast_slice))?;
+        write_block(&mut w, m.mask_channel().as_slice().map(bytemuck::cast_slice))?;
+        write_block(&mut w, m.rough_channel().as_slice())?;
+        write_block(&mut w, m.metal_channel().as_slice())?;
+        write_block(&mut w, Some(bytemuck::cast_slice(&m.faces)))?;
     }
     w.flush().map_err(err)?;
     Ok(())
@@ -537,7 +618,7 @@ pub fn read_scene(path: &Path) -> IoResult<Scene> {
         v
     };
     let version = u32_at(&mut o);
-    if version != VERSION {
+    if version != 1 && version != VERSION {
         return Err(format!("unsupported scene version {version}"));
     }
     let count = u32_at(&mut o) as usize;
@@ -572,26 +653,75 @@ pub fn read_scene(path: &Path) -> IoResult<Scene> {
         let nf = u32_at(&mut o) as usize;
         let vbytes = nv * std::mem::size_of::<Vertex>();
         let fbytes = nf * std::mem::size_of::<[u32; 3]>();
-        if o + vbytes + fbytes > buf.len() {
-            return Err("scene file truncated".into());
-        }
-        // The payload starts wherever the variable-length name left off, so it
-        // is not necessarily aligned: read it element by element.
-        let verts: Vec<Vertex> = buf[o..o + vbytes]
-            .chunks_exact(std::mem::size_of::<Vertex>())
-            .map(bytemuck::pod_read_unaligned)
-            .collect();
-        o += vbytes;
-        let faces: Vec<[u32; 3]> = buf[o..o + fbytes]
-            .chunks_exact(std::mem::size_of::<[u32; 3]>())
-            .map(bytemuck::pod_read_unaligned)
-            .collect();
-        o += fbytes;
 
-        let mut mesh = Mesh::from_soup(&verts.iter().map(|v| v.pos).collect::<Vec<_>>(), &faces);
-        for (i, v) in verts.iter().enumerate() {
-            mesh.write_vertex(i as u32, v);
-        }
+        // Nothing here is aligned: the payload starts wherever the
+        // variable-length name left off, so every array is read element by
+        // element rather than cast in place.
+        let unpack = |b: &[u8]| -> Vec<[u32; 3]> {
+            b.chunks_exact(12).map(bytemuck::pod_read_unaligned).collect()
+        };
+        let mesh = if version == 1 {
+            if o + vbytes + fbytes > buf.len() {
+                return Err("scene file truncated".into());
+            }
+            let verts: Vec<Vertex> = buf[o..o + vbytes]
+                .chunks_exact(std::mem::size_of::<Vertex>())
+                .map(bytemuck::pod_read_unaligned)
+                .collect();
+            o += vbytes;
+            let faces = unpack(&buf[o..o + fbytes]);
+            o += fbytes;
+            let mut mesh =
+                Mesh::from_soup(&verts.iter().map(|v| v.pos).collect::<Vec<_>>(), &faces);
+            for (i, v) in verts.iter().enumerate() {
+                mesh.write_vertex(i as u32, v);
+            }
+            mesh
+        } else {
+            let read3 = |b: &[u8]| -> Vec<Vec3> {
+                b.chunks_exact(12)
+                    .map(|c| {
+                        let a: [f32; 3] = bytemuck::pod_read_unaligned(c);
+                        Vec3::from(a)
+                    })
+                    .collect()
+            };
+            let pos = read_block(&buf, &mut o, nv * 12)?
+                .ok_or_else(|| "a scene without positions".to_string())?;
+            let nrm = read_block(&buf, &mut o, nv * 12)?;
+            let col = read_block(&buf, &mut o, nv * 3)?;
+            let mask = read_block(&buf, &mut o, nv * 2)?;
+            let rough = read_block(&buf, &mut o, nv)?;
+            let metal = read_block(&buf, &mut o, nv)?;
+            let faces = read_block(&buf, &mut o, fbytes)?
+                .ok_or_else(|| "a scene without faces".to_string())?;
+
+            let mut mesh = Mesh::from_soup(&read3(&pos), &unpack(&faces));
+            if let Some(n) = nrm {
+                mesh.nrm = read3(&n);
+            }
+            // A channel that was never written stays asleep, which is the whole
+            // point: a model nobody painted costs nothing to hold.
+            if let Some(c) = col {
+                mesh.col_channel_mut()
+                    .make_mut()
+                    .copy_from_slice(&c.chunks_exact(3).map(|x| [x[0], x[1], x[2]]).collect::<Vec<_>>());
+            }
+            if let Some(m) = mask {
+                let v: Vec<u16> = m
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                mesh.mask_channel_mut().make_mut().copy_from_slice(&v);
+            }
+            if let Some(r) = rough {
+                mesh.rough_channel_mut().make_mut().copy_from_slice(&r);
+            }
+            if let Some(m) = metal {
+                mesh.metal_channel_mut().make_mut().copy_from_slice(&m);
+            }
+            mesh
+        };
         let mut obj = Object::new(name, mesh);
         obj.transform = Transform { position, rotation, scale };
         obj.visible = visible;
@@ -805,4 +935,79 @@ pub fn read_brushes(path: &Path, alphas: &[String]) -> IoResult<Vec<NamedBrush>>
         out.push(nb);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod scene_format_tests {
+    use super::*;
+    use crate::primitives;
+
+    /// Un canal endormi doit coûter presque rien sur le disque, et un maillage
+    /// peint doit revenir intact.
+    #[test]
+    fn the_scene_file_leaves_out_what_nobody_touched() {
+        let dir = std::env::temp_dir().join("sculpt-rs-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let plain = primitives::icosphere(4);
+        let n = plain.vert_count();
+        let mut painted = plain.clone();
+        for v in 0..n as u32 {
+            painted.set_col(v, Vec3::new(0.9, 0.1, 0.1));
+            painted.set_mask(v, 0.5);
+        }
+
+        let a = dir.join("plain.sculpt");
+        let b = dir.join("painted.sculpt");
+        write_scene(&Scene::with_object(Object::new("a", plain)), &a).unwrap();
+        write_scene(&Scene::with_object(Object::new("b", painted.clone())), &b).unwrap();
+
+        let plain_size = std::fs::metadata(&a).unwrap().len();
+        let painted_size = std::fs::metadata(&b).unwrap().len();
+        assert!(
+            plain_size < painted_size,
+            "un maillage non peint ({plain_size}) devrait peser moins qu'un peint ({painted_size})"
+        );
+        // Douze octets de position et douze de normale par sommet, plus les
+        // faces: un canal absent ne doit rien ajouter de sensible.
+        assert!(
+            plain_size < (n * 25 + plain_size as usize / 2) as u64,
+            "le fichier non peint est trop gros: {plain_size}"
+        );
+
+        // Et l'aller-retour rend ce qu'on a mis.
+        let back = read_scene(&b).unwrap();
+        let m = &back.objects[0].mesh;
+        assert_eq!(m.vert_count(), n);
+        assert!(m.col(3).distance(Vec3::new(0.9, 0.1, 0.1)) < 0.01);
+        assert!((m.mask(3) - 0.5).abs() < 0.001);
+        assert!(m.pos[3].distance(painted.pos[3]) < 1e-6);
+
+        // Le maillage non peint revient avec ses canaux toujours endormis.
+        let back = read_scene(&a).unwrap();
+        for (name, awake) in back.objects[0].mesh.awake_channels() {
+            assert!(!awake, "le canal {name} s'est réveillé à la relecture");
+        }
+
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    /// Un fichier tronqué doit être refusé avec un message, jamais paniquer.
+    #[test]
+    fn a_broken_scene_file_is_refused_not_fatal() {
+        let dir = std::env::temp_dir().join("sculpt-rs-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("broken.sculpt");
+        write_scene(
+            &Scene::with_object(Object::new("x", primitives::icosphere(2))),
+            &p,
+        )
+        .unwrap();
+        let mut bytes = std::fs::read(&p).unwrap();
+        bytes.truncate(bytes.len() * 2 / 3);
+        std::fs::write(&p, &bytes).unwrap();
+        assert!(read_scene(&p).is_err(), "un fichier coupé a été accepté");
+        let _ = std::fs::remove_file(&p);
+    }
 }

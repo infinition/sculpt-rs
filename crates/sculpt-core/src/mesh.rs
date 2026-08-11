@@ -375,6 +375,36 @@ impl Mesh {
             + self.metal.bytes()
     }
 
+    /// The quantised channels as they are stored, for the file formats.
+    ///
+    /// Handed out rather than gathered, because writing a scene wants each
+    /// channel whole and compressed on its own, and a dormant one wants writing
+    /// as nothing at all.
+    pub fn col_channel(&self) -> &Channel<[u8; 3]> {
+        &self.col
+    }
+    pub fn mask_channel(&self) -> &Channel<u16> {
+        &self.mask
+    }
+    pub fn rough_channel(&self) -> &Channel<u8> {
+        &self.rough
+    }
+    pub fn metal_channel(&self) -> &Channel<u8> {
+        &self.metal
+    }
+    pub fn col_channel_mut(&mut self) -> &mut Channel<[u8; 3]> {
+        &mut self.col
+    }
+    pub fn mask_channel_mut(&mut self) -> &mut Channel<u16> {
+        &mut self.mask
+    }
+    pub fn rough_channel_mut(&mut self) -> &mut Channel<u8> {
+        &mut self.rough
+    }
+    pub fn metal_channel_mut(&mut self) -> &mut Channel<u8> {
+        &mut self.metal
+    }
+
     /// Which channels are awake, for the statistics readout.
     pub fn awake_channels(&self) -> [(&'static str, bool); 4] {
         [
