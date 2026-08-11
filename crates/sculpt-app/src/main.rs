@@ -349,27 +349,21 @@ impl State {
 
         let active = self.sculptor.scene.active;
         let target = sculpt_core::cluster::TARGET_FACES;
-        // Reordering is a long job and it drops the spatial grid with it.
-        // Never in the middle of a stroke: a second of silence with the pen
-        // down is worse than packets that have grown loose.
-        let may_reorder = !self.sculptor.is_stroking();
-
+        // Reordering a dense mesh takes a hundred milliseconds and it drops the
+        // spatial grid with it, so it is never done between two strokes: a
+        // stroke patches the packets it touched, and once they have spread past
+        // a point the model is drawn whole in one call rather than paying the
+        // reorder. A wholesale rewrite still reorders, because its face order
+        // is gone whatever the partition says.
         for (i, obj) in self.sculptor.scene.objects.iter_mut().enumerate() {
             let p = &mut self.partitions[i];
             if obj.mesh.faces.is_empty() {
                 p.clusters.clear();
                 continue;
             }
-            let loose = p.drift() > 2.0;
-            if p.is_empty() || (may_reorder && loose && i == active) {
+            if p.is_empty() || (rewritten && i == active) {
                 *p = sculpt_core::cluster::build(&mut obj.mesh, target);
                 self.partition_fresh = true;
-            } else if rewritten && i == active {
-                // The faces were rewritten by something else, so the boxes are
-                // wrong but the packets still cover them. Measuring again is a
-                // fifth of the cost of putting them back in order, and it is
-                // enough to keep the picture right.
-                p.remeasure_all(&obj.mesh, target);
             } else if i == active && !dirty_faces.is_empty() {
                 sculpt_core::cluster::follow(&obj.mesh, p, dirty_faces, target);
             }
@@ -392,6 +386,15 @@ impl State {
             .map(|(i, obj)| {
                 let p = self.partitions.get(i)?;
                 if p.is_empty() || obj.mesh.faces.len() < WORTH_SORTING {
+                    return None;
+                }
+                // Packets that have spread more than this are no longer worth
+                // sorting: every one of them passes the cull, so drawing the
+                // model whole in one call costs the same rasterising and none
+                // of the submission. Tightening them would mean the reorder,
+                // which blocks for a hundred milliseconds on a dense mesh and
+                // would land between two strokes.
+                if p.drift() > 2.0 {
                     return None;
                 }
                 // The partition lives in the object's own space, so the camera
@@ -1323,6 +1326,11 @@ impl State {
             self.renderer
                 .sync(&self.device, &self.queue, &self.sculptor.scene, target);
         }
+        // A frame that re-encoded the whole mesh is a one-time cost, not the
+        // rate the viewport can hold, so it is left out of the frame readout.
+        // Without this the readout sat on the last load for a minute after it
+        // finished, which read as a slow viewport that was actually idle.
+        let slow_upload = !done && (self.full_resync || changed);
         self.ui.upload_bytes = self.renderer.last_upload_bytes;
         self.sculptor.verts_dirty = false;
         self.sculptor.topology_dirty = false;
@@ -1470,11 +1478,15 @@ impl State {
         // that is the pace of whatever asked for it, and at rest there is
         // nothing asking.
         let cost = now.elapsed().as_secs_f32() * 1000.0;
-        self.ui.frame_ms = if self.ui.frame_ms <= 0.0 {
-            cost
-        } else {
-            self.ui.frame_ms * 0.9 + cost * 0.1
-        };
+        if !slow_upload {
+            self.ui.frame_ms = if self.ui.frame_ms <= 0.0 {
+                cost
+            } else {
+                // 0.7 rather than the old 0.9, so a slow frame does not take
+                // the readout a minute to shake off.
+                self.ui.frame_ms * 0.7 + cost * 0.3
+            };
+        }
         self.queue.present(frame);
 
         for id in &full_output.textures_delta.free {
