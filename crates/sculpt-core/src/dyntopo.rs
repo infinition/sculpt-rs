@@ -136,6 +136,16 @@ const SPLIT_FACTOR: f32 = 1.0;
 const COLLAPSE_FACTOR: f32 = 0.45;
 /// Refinement passes per stroke step.
 const PASSES: usize = 3;
+/// Most edges a pass will cut or close.
+///
+/// A dab on a dense mesh under a fine detail setting finds tens of thousands of
+/// edges to cut, and cutting them all is what turns one dab into a hundred
+/// milliseconds and a session into a stutter. The sorted plan names the worst
+/// offenders first, so taking the head of the list cuts the worst of them and
+/// leaves the rest for the next dab, which keeps a stroke responsive however
+/// far it is from its target density. The mesh converges to the detail over
+/// the stroke instead of inside a single dab.
+const MAX_EDGES_PER_PASS: usize = 1024;
 
 /// The edges a dab is about to cut or close, found before anything is touched.
 ///
@@ -255,6 +265,10 @@ fn classify_edges(
     // the work was divided, and it is not this.
     long.sort_unstable_by_key(|(len, e)| (std::cmp::Reverse(len.to_bits()), *e));
     short.sort_unstable();
+    // The plan is sorted so the worst offenders come first; taking the head
+    // bounds what a single dab does, and what is left waits for the next one.
+    long.truncate(MAX_EDGES_PER_PASS);
+    short.truncate(MAX_EDGES_PER_PASS);
     (long, short)
 }
 
