@@ -73,7 +73,8 @@ def main():
             shutil.copy2(repo / "assets/icon.png", folder / "sculpt-rs.png")
             (folder / "sculpt-rs.desktop").write_text(
                 "[Desktop Entry]\nType=Application\nName=Sculpt RS\nExec=sculpt-app\n"
-                "Icon=sculpt-rs\nCategories=Graphics;3DGraphics;\nTerminal=false\n", encoding="utf-8")
+                "Icon=sculpt-rs\nCategories=Graphics;3DGraphics;\nTerminal=false\n",
+                encoding="utf-8", newline="\n")
         if "linux" in args.target:
             archive = args.output / f"{name}.tar.gz"
             with tarfile.open(archive, "w:gz") as output:
@@ -85,7 +86,10 @@ def main():
                     if file.is_file():
                         output.write(file, file.relative_to(folder.parent))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    archive.with_name(archive.name + ".sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
+    # LF even when packaging on Windows: sha256sum --check reads the name
+    # literally, and a trailing CR makes the archive unfindable on Linux.
+    archive.with_name(archive.name + ".sha256").write_text(
+        f"{digest}  {archive.name}\n", encoding="ascii", newline="\n")
     print(archive.resolve())
 
 
