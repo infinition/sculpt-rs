@@ -30,7 +30,7 @@ Pour préparer localement une archive Windows après les tests :
 ```powershell
 cargo test --release --locked --workspace
 cargo build --release --locked -p sculpt-app
-python scripts/package.py --target x86_64-pc-windows-msvc --version v0.2.0 --binary target/release/sculpt-app.exe
+python scripts/package.py --target x86_64-pc-windows-msvc --version v0.2.1 --binary target/release/sculpt-app.exe
 ```
 
 La création de paquets macOS doit tourner sur macOS (iconutil et codesign).
