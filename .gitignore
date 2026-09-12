@@ -1,4 +1,9 @@
 /target
-Cargo.lock
+/dist
 .private/
 .DS_Store
+
+# Releves bruts et lanceurs locaux, propres a une station
+/docs/benchmarks/
+/run-release.bat
+*.log
