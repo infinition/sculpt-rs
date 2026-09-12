@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,29 +16,52 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
-            artifact: sculpt-app-windows
+            target: x86_64-pc-windows-msvc
             bin: sculpt-app.exe
-          - os: ubuntu-latest
-            artifact: sculpt-app-linux
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
             bin: sculpt-app
-          - os: macos-latest
-            artifact: sculpt-app-macos
+          - os: macos-15
+            target: aarch64-apple-darwin
+            bin: sculpt-app
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
             bin: sculpt-app
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Test
-        run: cargo test --release
-      - name: Build
-        run: cargo build --release
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: target/release/${{ matrix.bin }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libudev-dev pkg-config
+      - name: Test
+        run: cargo test --release --locked --workspace --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p sculpt-app --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          version="dev-${COMMIT:0:8}"
+          if [ "$REF_TYPE" = tag ]; then version="$REF_NAME"; fi
+          python scripts/package.py --target "${{ matrix.target }}" --version "$version" --binary "target/${{ matrix.target }}/release/${{ matrix.bin }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sculpt-rs-${{ matrix.target }}
+          path: dist/*
           if-no-files-found: error
