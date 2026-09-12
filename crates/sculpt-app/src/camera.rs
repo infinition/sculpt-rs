@@ -4,7 +4,7 @@
 //! with a critically damped step. Nothing snaps, which is what makes fast
 //! orbiting readable, and it costs one lerp per frame.
 
-use glam::{Mat4, Vec3, Vec4Swizzles};
+use glam::{Mat4, Vec2, Vec3, Vec4Swizzles};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Projection {
@@ -87,6 +87,8 @@ pub struct Camera {
     /// view. In that moment you still need to slide the model across and get
     /// closer to it, so only the rotation is held.
     pub locked: bool,
+    /// Lens shift places the pivot in the usable canvas, between the docks.
+    projection_offset: Vec2,
 }
 
 impl Default for Camera {
@@ -103,6 +105,7 @@ impl Default for Camera {
             orbit_speed: 0.008,
             invert_orbit_y: false,
             locked: false,
+            projection_offset: Vec2::ZERO,
         }
     }
 }
@@ -143,7 +146,7 @@ impl Camera {
     pub fn proj(&self, aspect: f32) -> Mat4 {
         let aspect = aspect.max(1e-4);
         // The "directx" variants map z to 0..1, which is what wgpu expects.
-        match self.projection {
+        let projection = match self.projection {
             Projection::Perspective => glam::camera::rh::proj::directx::perspective(
                 self.fov_y,
                 aspect,
@@ -164,7 +167,13 @@ impl Camera {
                     self.zfar,
                 )
             }
-        }
+        };
+        Mat4::from_translation(self.projection_offset.extend(0.0)) * projection
+    }
+
+    pub fn set_canvas_center(&mut self, center: Vec2, window: Vec2) {
+        let normalized = center / window.max(Vec2::ONE);
+        self.projection_offset = Vec2::new(normalized.x * 2.0 - 1.0, 1.0 - normalized.y * 2.0);
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
@@ -280,11 +289,31 @@ impl Camera {
     pub fn world_radius_to_pixels(&self, world_pos: Vec3, r: f32, h: f32) -> f32 {
         let half = match self.projection {
             Projection::Perspective => {
-                let d = (world_pos - self.eye()).length().max(1e-4);
+                let d = (world_pos - self.eye()).dot(self.forward()).max(1e-4);
                 (self.fov_y * 0.5).tan() * d
             }
             Projection::Orthographic => self.ortho_half_height(),
         };
         r / half.max(1e-6) * (h * 0.5)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shifted_canvas_keeps_projection_and_picking_in_agreement() {
+        let mut camera = Camera::default();
+        let center = Vec2::new(510.0, 425.0);
+        camera.set_canvas_center(center, Vec2::new(1280.0, 800.0));
+        for projection in [Projection::Perspective, Projection::Orthographic] {
+            camera.projection = projection;
+            let clip = camera.view_proj(1.6) * camera.target().extend(1.0);
+            let screen = Vec2::new((clip.x / clip.w + 1.0) * 640.0, (1.0 - clip.y / clip.w) * 400.0);
+            assert!(screen.distance(center) < 0.001);
+            let (origin, direction) = camera.ray(center.x, center.y, 1280.0, 800.0);
+            let t = (camera.target() - origin).dot(camera.forward()) / direction.dot(camera.forward());
+            assert!((origin + direction * t).distance(camera.target()) < 0.001);
+        }
     }
 }

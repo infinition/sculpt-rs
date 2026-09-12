@@ -25,7 +25,7 @@ pub enum Gesture {
 ///
 /// Everyone holds a tablet differently and every application trains a different
 /// reflex, so rather than pick one, each device gets a job you can change.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     /// Sculpt on the model, spin the view off it. Decided where the press
     /// landed, once, and held for the rest of that press.
@@ -113,7 +113,7 @@ pub enum PressTarget {
 
 /// What each device does. Pen and touch are separate because a stylus usually
 /// wants to draw while a finger usually wants to move the model.
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct Bindings {
     pub left: Role,
     pub middle: Role,
@@ -300,6 +300,16 @@ impl Input {
         !self.fingers.is_empty()
     }
 
+    pub fn has_contact(&self, id: u64) -> bool {
+        self.fingers.iter().any(|finger| finger.id == id)
+    }
+
+    pub fn release_all(&mut self) {
+        let cursor = self.cursor;
+        *self = Self::default();
+        self.cursor = cursor;
+    }
+
     /// Feeds one touch event through the gesture recogniser.
     ///
     /// `on_model` is whether the model lies under this contact, and only the
@@ -411,6 +421,7 @@ impl Input {
                 }
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
+                if touch.phase == TouchPhase::Cancelled { self.taps = TapTracker::default(); }
                 self.fingers.retain(|f| f.id != touch.id);
                 if !self.fingers.is_empty() {
                     return None;
@@ -512,6 +523,27 @@ impl Input {
 mod tests {
     use super::*;
     use winit::event::MouseButton;
+
+    fn finger(id: u64, phase: TouchPhase, x: f64, y: f64) -> Touch {
+        Touch { device_id: winit::event::DeviceId::dummy(), phase,
+            location: winit::dpi::PhysicalPosition::new(x, y), force: None, id }
+    }
+
+    #[test]
+    fn pressureless_fingers_sculpt_then_pinch_without_resuming_a_stroke() {
+        let mut input = Input::default();
+        let bindings = Bindings::default();
+        assert!(matches!(input.on_touch(&finger(1, TouchPhase::Started, 10.0, 10.0), false, &bindings, true), Some(TouchOutcome::StrokeStart { .. })));
+        assert!(input.has_contact(1));
+        assert!(matches!(input.on_touch(&finger(1, TouchPhase::Moved, 30.0, 10.0), false, &bindings, true), Some(TouchOutcome::StrokeMove { .. })));
+        assert!(matches!(input.on_touch(&finger(2, TouchPhase::Started, 60.0, 10.0), false, &bindings, true), Some(TouchOutcome::CancelStroke)));
+        let Some(TouchOutcome::Navigate(gestures)) = input.on_touch(&finger(2, TouchPhase::Moved, 90.0, 10.0), false, &bindings, true) else { panic!("missing pinch"); };
+        assert!(gestures.iter().any(|g| matches!(g, Gesture::Zoom(scale) if *scale > 1.0)));
+        input.on_touch(&finger(2, TouchPhase::Ended, 90.0, 10.0), false, &bindings, true);
+        assert!(!matches!(input.on_touch(&finger(1, TouchPhase::Moved, 35.0, 10.0), false, &bindings, true), Some(TouchOutcome::StrokeMove { .. })));
+        input.release_all();
+        assert!(!input.touch_active());
+    }
 
     #[test]
     fn auto_sculpts_on_the_model_and_orbits_off_it() {

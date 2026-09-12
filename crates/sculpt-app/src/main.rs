@@ -1,14 +1,18 @@
 //! sculpt-rs: a dynamic-topology 3D sculpting tool.
 
 mod camera;
+mod brush_library;
 mod gizmo;
 mod gpu_vertex;
 mod hud;
 mod icons;
 mod input;
 mod matcap;
+mod materials;
 mod navwidget;
+mod preferences;
 mod renderer;
+mod stroke_samples;
 mod theme;
 mod ui;
 mod wheel;
@@ -48,6 +52,10 @@ struct Stroke {
     kind: BrushKind,
     /// Tool the user actually picked, restored when the modifier is released.
     restore_kind: Option<BrushKind>,
+    pending: stroke_samples::Samples,
+    original_negative: bool,
+    last_pressure: f32,
+    latest_input: Option<(Vec2, f32)>,
 }
 
 struct State {
@@ -214,7 +222,11 @@ impl State {
             },
         );
 
-        let mut sculptor = Sculptor::new(primitives::icosphere(5));
+        let stress = std::env::args().any(|arg| arg == "--stress-40m");
+        let mut sculptor = Sculptor::new(if stress {
+            window.set_title("Sculpt RS - preparing 41.9 million triangles");
+            primitives::uv_sphere(4096, 5121)
+        } else { primitives::icosphere(5) });
         // The buffers grow to the next power of two of one and a half times
         // what is needed, so the headroom the engine may plan for is a third of
         // what the card takes.
@@ -229,7 +241,7 @@ impl State {
         camera.frame(Vec3::ZERO, 1.0);
         camera.settle();
 
-        let ui = UiState {
+        let mut ui = UiState {
             wireframe_available: wire_supported,
             msaa_available: max_samples > 1,
             max_samples,
@@ -237,7 +249,16 @@ impl State {
             ..Default::default()
         };
 
-        Self {
+        if let Err(error) = preferences::load(&mut ui, &mut sculptor, &egui_ctx) {
+            ui.say(format!("workspace restore: {error}"));
+        }
+        if stress {
+            sculptor.dyntopo_enabled = false;
+            sculptor.brush.radius = 0.05;
+            ui.say("41.9M triangles - fixed topology, radius 0.05; change these in Brush to compare");
+        }
+        window.set_title("Sculpt RS");
+        let mut state = Self {
             window,
             surface,
             device,
@@ -261,7 +282,10 @@ impl State {
             partition_fresh: false,
             egui_animating: true,
             dab_ms: 0.0,
-        }
+        };
+        state.renderer.set_sample_count(&state.device, state.ui.sample_count);
+        state.rebuild_matcap();
+        state
     }
 
     /// Whether anything on screen is still moving, and therefore whether the
@@ -348,6 +372,7 @@ impl State {
         self.partition_fresh = false;
 
         let active = self.sculptor.scene.active;
+        let voxel_active = self.sculptor.voxel_mode();
         let target = sculpt_core::cluster::TARGET_FACES;
         // Reordering a dense mesh takes a hundred milliseconds and it drops the
         // spatial grid with it, so it is never done between two strokes: a
@@ -366,6 +391,13 @@ impl State {
                 self.partition_fresh = true;
             } else if i == active && !dirty_faces.is_empty() {
                 sculpt_core::cluster::follow(&obj.mesh, p, dirty_faces, target);
+            }
+            // A face reorder invalidates picking too. Prepare the index as
+            // part of loading/rewriting, before hover or navigation can scan
+            // millions of triangles and before the first pen-down event.
+            if obj.visible && !(voxel_active && i == active) {
+                let radius = self.sculptor.brush.radius / obj.transform.mean_scale().max(1e-6);
+                obj.mesh.ensure_accel_if_missing(radius);
             }
         }
     }
@@ -586,7 +618,8 @@ impl State {
         }
 
         self.sculptor.begin_stroke();
-        self.sculptor.brush.negative = self.input.ctrl;
+        let original_negative = self.sculptor.brush.negative;
+        self.sculptor.brush.negative = original_negative ^ self.input.ctrl;
         self.stroke = Stroke {
             active: true,
             last_hit: Some((hit.world.point, hit.world.normal)),
@@ -596,11 +629,17 @@ impl State {
             prev_screen: cursor,
             kind: self.sculptor.brush.kind,
             restore_kind: self.stroke.restore_kind,
+            pending: Default::default(),
+            original_negative,
+            last_pressure: pressure,
+            latest_input: Some((cursor, pressure)),
         };
 
         if !self.sculptor.brush.kind.is_grab() {
             let input = self.stroke_input(hit.world.point, hit.world.normal, Vec3::ZERO, pressure);
+            let started = Instant::now();
             self.sculptor.stroke(&input);
+            self.dab_ms = started.elapsed().as_secs_f32() * 1000.0;
             self.dirty_object = Some(self.sculptor.scene.active);
         }
     }
@@ -638,7 +677,25 @@ impl State {
         }
     }
 
-    fn continue_stroke(&mut self, pressure: f32) {
+    fn queue_stroke(&mut self, pressure: f32) {
+        if self.stroke.active {
+            self.stroke.latest_input = Some((self.input.cursor, pressure));
+            self.stroke.pending.push(self.input.cursor, pressure);
+        }
+    }
+
+    fn flush_stroke(&mut self, finish: bool) {
+        let start = Instant::now();
+        while let Some((cursor, pressure)) = self.stroke.pending.pop() {
+            let latest_cursor = self.input.cursor;
+            self.input.cursor = cursor;
+            self.continue_stroke(pressure, finish && self.stroke.pending.is_empty());
+            self.input.cursor = latest_cursor;
+            if start.elapsed().as_secs_f32() >= 0.010 { break; }
+        }
+    }
+
+    fn continue_stroke(&mut self, pressure: f32, force_endpoint: bool) {
         if !self.stroke.active {
             return;
         }
@@ -651,6 +708,17 @@ impl State {
             return;
         }
 
+        if !force_endpoint {
+            if let Some((point, _)) = self.stroke.last_hit {
+                let brush = &self.sculptor.brush;
+                let radius = brush.radius * if brush.pressure_radius { pressure.clamp(0.05, 1.0) } else { 1.0 };
+                let spacing = self.camera.world_radius_to_pixels(point, radius, self.viewport().1)
+                    * brush.spacing.clamp(0.02, 1.0);
+                if !stroke_samples::dab_due(self.stroke.prev_screen, cursor, self.stroke.last_pressure, pressure, spacing) {
+                    return;
+                }
+            }
+        }
         let Some(hit) = self.pick_for_brush(cursor) else {
             return;
         };
@@ -676,7 +744,7 @@ impl State {
         // leaves its dabs a little further apart, which is a far better trade
         // than the application stopping to catch up.
         const BUDGET_MS: f32 = 10.0;
-        let spacing = (self.sculptor.brush.radius * 0.25).max(1e-4);
+        let spacing = (self.sculptor.brush.radius * self.sculptor.brush.spacing.clamp(0.02, 1.0)).max(1e-4);
         let affordable = if self.dab_ms > 0.05 {
             (BUDGET_MS / self.dab_ms) as usize
         } else {
@@ -691,8 +759,8 @@ impl State {
             let input = self.stroke_input(
                 from.0.lerp(to.0, t),
                 from.1.lerp(to.1, t).normalize_or(to.1),
-                Vec3::ZERO,
-                pressure,
+                (to.0 - from.0) / steps as f32,
+                self.stroke.last_pressure + (pressure - self.stroke.last_pressure) * t,
             );
             self.sculptor.stroke(&input);
         }
@@ -700,6 +768,7 @@ impl State {
         self.dab_ms = if self.dab_ms <= 0.0 { each } else { self.dab_ms * 0.8 + each * 0.2 };
 
         self.stroke.last_hit = Some(to);
+        self.stroke.last_pressure = pressure;
         self.stroke.prev_screen = cursor;
         self.dirty_object = Some(self.sculptor.scene.active);
     }
@@ -758,8 +827,18 @@ impl State {
         if !self.stroke.active {
             return;
         }
+        // Preserve the endpoint even when release arrived before redraw.
+        while !self.stroke.pending.is_empty() { self.flush_stroke(true); }
+        if let Some((cursor, pressure)) = self.stroke.latest_input {
+            if cursor.distance_squared(self.stroke.prev_screen) > 1e-6 {
+                let current = self.input.cursor;
+                self.input.cursor = cursor;
+                self.continue_stroke(pressure, true);
+                self.input.cursor = current;
+            }
+        }
         self.sculptor.end_stroke();
-        self.sculptor.brush.negative = false;
+        self.sculptor.brush.negative = self.stroke.original_negative;
         self.stroke = Stroke { restore_kind: self.stroke.restore_kind, ..Default::default() };
     }
 
@@ -827,6 +906,7 @@ impl State {
                     self.ui.say(format!("added a {}", p.label().to_lowercase()));
                 }
                 Action::Import => self.import(),
+                Action::ImportObject => self.import_object(),
                 Action::Export => self.export(),
                 Action::OpenScene => self.open_scene(),
                 Action::SaveScene => self.save_scene(),
@@ -956,8 +1036,14 @@ impl State {
                 }
                 Action::ResetTheme => {
                     self.ui.theme = theme::UiTheme::default();
+                    self.ui.ui_scale_draft = self.ui.theme.ui_scale;
                     self.ui.say("theme reset");
                 }
+                Action::SaveWorkspace => match preferences::save(&self.ui, &self.sculptor, &self.egui_ctx) {
+                    Ok(()) => self.ui.say("workspace saved: layout, brushes, alphas and lighting"),
+                    Err(error) => self.ui.say(format!("workspace save failed: {error}")),
+                },
+                Action::LoadBrushIcon(index) => self.load_brush_icon(index),
             }
         }
     }
@@ -979,7 +1065,7 @@ impl State {
             match io::read_scene(&path) {
                 Ok(scene) => {
                     let limit = self.sculptor.max_gpu_verts;
-                    self.sculptor = Sculptor::with_scene(scene);
+                    self.sculptor.replace_scene(scene);
                     self.sculptor.max_gpu_verts = limit;
                     self.frame_view();
                     self.full_resync = true;
@@ -1000,6 +1086,38 @@ impl State {
                 self.ui.say(format!("loaded {name}"));
             }
             Err(e) => self.ui.say(format!("import failed: {e}")),
+        }
+    }
+
+    fn import_object(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("Mesh", &["obj", "ply", "stl"]).pick_file() else { return; };
+        match io::load(&path) {
+            Ok(mesh) => {
+                if self.sculptor.max_gpu_verts.is_some_and(|limit| mesh.vert_count() > limit) {
+                    self.ui.say("mesh exceeds this device's vertex buffer limit");
+                    return;
+                }
+                let name = path.file_stem().unwrap_or_default().to_string_lossy();
+                self.sculptor.add_object(&name, mesh);
+                self.frame_view();
+                self.full_resync = true;
+                self.ui.say(format!("added {name}"));
+            }
+            Err(error) => self.ui.say(format!("import failed: {error}")),
+        }
+    }
+
+    fn load_brush_icon(&mut self, index: usize) {
+        let Some(path) = rfd::FileDialog::new().add_filter("Icon image", &["png", "jpg", "jpeg", "bmp", "tga"]).pick_file() else { return; };
+        match image::open(path) {
+            Ok(image) => {
+                let rgba = image.resize_exact(64, 64, image::imageops::FilterType::Lanczos3).to_rgba8();
+                use std::fmt::Write;
+                let mut icon = String::from("rgba64:");
+                for byte in rgba.as_raw() { let _ = write!(icon, "{byte:02x}"); }
+                if let Some(brush) = self.ui.brushes.get_mut(index) { brush.icon = Some(icon); }
+            }
+            Err(error) => self.ui.say(format!("icon import failed: {error}")),
         }
     }
 
@@ -1040,7 +1158,7 @@ impl State {
         match io::read_scene(&path) {
             Ok(scene) => {
                 let limit = self.sculptor.max_gpu_verts;
-                self.sculptor = Sculptor::with_scene(scene);
+                self.sculptor.replace_scene(scene);
                 self.sculptor.max_gpu_verts = limit;
                 self.frame_view();
                 self.full_resync = true;
@@ -1062,13 +1180,19 @@ impl State {
             return;
         }
         let Some(path) = rfd::FileDialog::new()
+            .add_filter("Brush pack with textures and icons", &["sculptbrush"])
             .add_filter("sculpt-rs brushes", &[io::BRUSH_EXTENSION])
-            .set_file_name(format!("mine.{}", io::BRUSH_EXTENSION))
+            .set_file_name("mine.sculptbrush")
             .save_file()
         else {
             return;
         };
-        match io::write_brushes(&self.ui.brushes, &self.alpha_names(), &path) {
+        let result = if path.extension().is_some_and(|ext| ext == "brushes") {
+            io::write_brushes(&self.ui.brushes, &self.alpha_names(), &path)
+        } else {
+            brush_library::save(&path, &self.ui.brushes, &self.sculptor.alphas)
+        };
+        match result {
             Ok(()) => self.ui.say(format!("{} brushes saved", self.ui.brushes.len())),
             Err(e) => self.ui.say(format!("save failed: {e}")),
         }
@@ -1076,12 +1200,17 @@ impl State {
 
     fn load_brushes(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("sculpt-rs brushes", &[io::BRUSH_EXTENSION])
+            .add_filter("sculpt-rs brushes and packs", &["sculptbrush", io::BRUSH_EXTENSION])
             .pick_file()
         else {
             return;
         };
-        match io::read_brushes(&path, &self.alpha_names()) {
+        let result = if path.extension().is_some_and(|ext| ext == "sculptbrush") {
+            brush_library::load(&path, &mut self.sculptor.alphas)
+        } else {
+            io::read_brushes(&path, &self.alpha_names())
+        };
+        match result {
             Ok(loaded) => {
                 let n = loaded.len();
                 // Added to what is already there rather than replacing it: a
@@ -1169,7 +1298,7 @@ impl State {
                 return;
             }
         };
-        let rgba = img.to_rgba8();
+        let rgba = img.resize(2048, 2048, image::imageops::FilterType::Lanczos3).to_rgba8();
         let (w, h) = rgba.dimensions();
         let transparent = rgba.pixels().any(|p| p.0[3] < 250);
         let data: Vec<f32> = rgba
@@ -1188,6 +1317,13 @@ impl State {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
+        let base = name;
+        let mut name = base.clone();
+        let mut suffix = 2;
+        while self.sculptor.alphas.iter().any(|alpha| alpha.name == name) {
+            name = format!("{base} ({suffix})");
+            suffix += 1;
+        }
         self.sculptor
             .alphas
             .push(std::sync::Arc::new(sculpt_core::Alpha::new(name, w, h, data)));
@@ -1269,6 +1405,10 @@ impl State {
 
     fn render(&mut self) {
         let now = Instant::now();
+        let center = self.ui.viewport.center();
+        let ppp = self.egui_ctx.pixels_per_point();
+        self.camera.set_canvas_center(Vec2::new(center.x, center.y) * ppp,
+            Vec2::new(self.config.width as f32, self.config.height as f32));
         let dt = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
         // `dt` is the gap since the last frame, which is what an animation
@@ -1279,6 +1419,7 @@ impl State {
         // measured below, around the work itself.
         self.ui.status_age += dt;
         self.camera.update(dt);
+        self.flush_stroke(false);
 
         theme::apply(&self.egui_ctx, &self.ui.theme);
         widgets::set_icon_scale(&self.egui_ctx, self.ui.theme.icon_scale);
@@ -1308,6 +1449,10 @@ impl State {
         // The partition follows the same list of touched faces the upload uses,
         // before anything consumes it.
         self.update_partitions(&dirty_faces, fully_dirty || self.full_resync);
+        // Deformation changes culling bounds, but keeps triangle indices.
+        if !self.sculptor.topology_dirty && !self.sculptor.voxel_mode() {
+            dirty_faces.clear();
+        }
         self.adapt_sampling();
         let visible = self.visible_ranges();
         // What the sorting actually saved, for the statistics panel.
@@ -1348,11 +1493,10 @@ impl State {
             self.renderer
                 .sync(&self.device, &self.queue, &self.sculptor.scene, target);
         }
-        // A frame that re-encoded the whole mesh is a one-time cost, not the
-        // rate the viewport can hold, so it is left out of the frame readout.
-        // Without this the readout sat on the last load for a minute after it
-        // finished, which read as a slow viewport that was actually idle.
-        let slow_upload = !done && (self.full_resync || changed);
+        // Upload counters describe this frame, including frames with no edits.
+        if !changed && !self.full_resync {
+            self.renderer.last_upload_bytes = 0;
+        }
         self.ui.upload_bytes = self.renderer.last_upload_bytes;
         self.sculptor.verts_dirty = false;
         self.sculptor.topology_dirty = false;
@@ -1500,15 +1644,11 @@ impl State {
         // that is the pace of whatever asked for it, and at rest there is
         // nothing asking.
         let cost = now.elapsed().as_secs_f32() * 1000.0;
-        if !slow_upload {
-            self.ui.frame_ms = if self.ui.frame_ms <= 0.0 {
-                cost
-            } else {
-                // 0.7 rather than the old 0.9, so a slow frame does not take
-                // the readout a minute to shake off.
-                self.ui.frame_ms * 0.7 + cost * 0.3
-            };
-        }
+        self.ui.frame_ms = if self.ui.frame_ms <= 0.0 {
+            cost
+        } else {
+            self.ui.frame_ms * 0.7 + cost * 0.3
+        };
         self.queue.present(frame);
 
         for id in &full_output.textures_delta.free {
@@ -1535,7 +1675,9 @@ impl State {
             })
             .is_some()
             || self.gizmo.is_dragging();
-        let hit = (!over_ui && !over_gizmo && !self.input.touch_active())
+        let navigating = self.input.mouse_navigation(Vec2::ZERO, &self.ui.bindings).is_some()
+            || self.camera.is_settling();
+        let hit = (!over_ui && !over_gizmo && !self.input.touch_active() && !navigating)
             .then(|| self.pick_for_brush(self.input.cursor))
             .flatten();
 
@@ -1565,6 +1707,17 @@ impl State {
         Overlay {
             cursor,
             cursor_tilt: tilt,
+            footprint: hit.as_ref().and_then(|h| {
+                let input = self.stroke_input(h.world.point, h.world.normal, Vec3::ZERO, 1.0);
+                let (right, up) = sculpt_core::brush::stamp_basis(&self.sculptor.brush, &input);
+                let r = self.sculptor.brush.radius;
+                Some([
+                    self.project_to_points(h.world.point + (-right + up) * r)?,
+                    self.project_to_points(h.world.point + (right + up) * r)?,
+                    self.project_to_points(h.world.point + (right - up) * r)?,
+                    self.project_to_points(h.world.point + (-right - up) * r)?,
+                ])
+            }),
             anchor,
             stroking: self.stroke.active,
         }
@@ -1643,7 +1796,19 @@ impl ApplicationHandler for App {
         let was_redraw = matches!(event, WindowEvent::RedrawRequested);
 
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                st.end_stroke();
+                if let Err(error) = preferences::save(&st.ui, &st.sculptor, &st.egui_ctx) {
+                    eprintln!("workspace save failed: {error}");
+                }
+                el.exit();
+            }
+            WindowEvent::Focused(false) => {
+                st.end_stroke();
+                st.input.release_all();
+                st.sync_modifier_tool();
+                st.ui.wheel.open = false;
+            }
             WindowEvent::Resized(size) => st.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 st.render();
@@ -1660,9 +1825,15 @@ impl ApplicationHandler for App {
                 st.input.shift = s.shift_key();
                 st.input.ctrl = s.control_key();
                 st.input.alt = s.alt_key();
+                if st.stroke.active {
+                    st.sculptor.brush.negative = st.stroke.original_negative ^ st.input.ctrl;
+                }
                 st.sync_modifier_tool();
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // Pen/touch drivers may also synthesize mouse events. A unit
+                // mouse pressure must not overwrite the digitizer's pressure.
+                if st.input.touch_active() { return; }
                 let delta = st.input.move_cursor(position.x as f32, position.y as f32);
                 st.update_hover_color();
                 if let Some(g) = st.input.mouse_navigation(delta, &st.ui.bindings) {
@@ -1670,7 +1841,7 @@ impl ApplicationHandler for App {
                 } else if st.gizmo.is_dragging() {
                     st.gizmo_drag();
                 } else if st.stroke.active && !st.ui.wheel.open {
-                    st.continue_stroke(1.0);
+                    st.queue_stroke(1.0);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1683,6 +1854,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if st.input.touch_active() { return; }
                 let down = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => st.input.lmb = down,
@@ -1724,7 +1896,10 @@ impl ApplicationHandler for App {
                 // as a touch with no force and no Started phase. It is a cursor
                 // move: move the brush ring and the hover colour, and start no
                 // stroke. A finger never hovers, so this cannot be one.
-                if touch.phase == winit::event::TouchPhase::Moved && touch.force.is_none() {
+                if touch.phase == winit::event::TouchPhase::Moved
+                    && touch.force.is_none()
+                    && !st.input.has_contact(touch.id)
+                {
                     st.input.cursor = where_;
                     st.update_hover_color();
                 } else {
@@ -1758,16 +1933,18 @@ impl ApplicationHandler for App {
                         TouchOutcome::StrokeMove { at, pressure } => {
                             st.input.cursor = at;
                             st.update_hover_color();
-                            st.continue_stroke(pressure);
+                            st.queue_stroke(pressure);
                         }
                         TouchOutcome::StrokeEnd => st.end_stroke(),
                         TouchOutcome::CancelStroke => {
                             // The dab the first finger left was part of a
                             // two-finger gesture, so take it back rather than
                             // leaving a mark nobody asked for.
-                            st.end_stroke();
-                            st.sculptor.undo();
-                            st.full_resync = true;
+                            if st.stroke.active {
+                                st.end_stroke();
+                                st.sculptor.undo();
+                                st.full_resync = true;
+                            }
                         }
                         TouchOutcome::Undo => {
                             st.sculptor.undo();
@@ -1873,7 +2050,8 @@ fn frustum_planes(m: glam::Mat4) -> [[f32; 4]; 6] {
         combine(r3, r0, -1.0),
         combine(r3, r1, 1.0),
         combine(r3, r1, -1.0),
-        combine(r3, r2, 1.0),
+        // wgpu depth is 0..w, so the near plane is row 2, not row 3 + row 2.
+        combine([0.0; 4], r2, 1.0),
         combine(r3, r2, -1.0),
     ]
 }

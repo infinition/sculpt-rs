@@ -57,6 +57,7 @@ pub enum Action {
     New(Primitive),
     AddObject(Primitive),
     Import,
+    ImportObject,
     Export,
     OpenScene,
     SaveScene,
@@ -90,13 +91,15 @@ pub enum Action {
     LoadBrushes,
     ResetBrushes,
     ResetTheme,
+    SaveWorkspace,
+    LoadBrushIcon(usize),
     /// Toggle voxel sculpting: the brush stamps a voxel field instead of the
     /// mesh, so the cost of a dab stops depending on the polygon count.
     ToggleVoxel,
 }
 
 /// Where things that pop up should appear.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq)]
 pub enum Anchor {
     /// Wherever the pointer is, which is where you are already looking.
     Cursor,
@@ -124,10 +127,11 @@ impl Anchor {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Tab {
     Brush,
     Colour,
+    Materials,
     Model,
     Scene,
     View,
@@ -135,9 +139,10 @@ pub enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 6] = [
+    const ALL: [Tab; 7] = [
         Tab::Brush,
         Tab::Colour,
+        Tab::Materials,
         Tab::Model,
         Tab::Scene,
         Tab::View,
@@ -148,6 +153,7 @@ impl Tab {
         match self {
             Tab::Brush => "Brush",
             Tab::Colour => "Colour",
+            Tab::Materials => "Materials",
             Tab::Model => "Model",
             Tab::Scene => "Scene",
             Tab::View => "View",
@@ -243,6 +249,12 @@ pub struct UiState {
     pub brushes: Vec<io::NamedBrush>,
     /// Name being typed for the next one kept.
     pub brush_name: String,
+    pub materials: Vec<crate::materials::Material>,
+    pub material_name: String,
+    pub preview_opacity: f32,
+    pub(crate) preview_texture: Option<egui::TextureHandle>,
+    pub(crate) preview_key: Option<(Falloff, Option<u32>, usize)>,
+    pub(crate) brush_icons: std::collections::HashMap<String, egui::TextureHandle>,
 }
 
 /// Whether a press at this point belongs to the interface rather than the model.
@@ -270,7 +282,7 @@ pub fn interface_owns(ctx: &egui::Context, viewport: egui::Rect, at: egui::Pos2)
 /// The point is not the arithmetic, which is trivial, but having the other
 /// colours already on screen: picking a shadow by eye from a hue wheel is how
 /// paintings end up muddy.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Harmony {
     None,
     Complement,
@@ -337,7 +349,7 @@ impl Harmony {
 }
 
 /// The three ways to get a matcap.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatcapSource {
     /// One of the built-in materials, lit the built-in way.
     Preset,
@@ -409,6 +421,12 @@ impl Default for UiState {
             harmony: Harmony::Analogous,
             brushes: Vec::new(),
             brush_name: String::new(),
+            materials: crate::materials::defaults(),
+            material_name: String::new(),
+            preview_opacity: 0.28,
+            preview_texture: None,
+            preview_key: None,
+            brush_icons: Default::default(),
         }
     }
 }
@@ -458,6 +476,8 @@ pub struct Overlay {
     pub cursor: Option<(egui::Pos2, f32)>,
     /// Surface normal under the cursor, projected to screen, for the tilt spoke.
     pub cursor_tilt: Option<(f32, f32)>,
+    /// Tangent-plane stamp, clockwise from the upper left. One surface pick.
+    pub footprint: Option<[egui::Pos2; 4]>,
     /// Where the brush will actually bite, when that is not under the cursor.
     /// Set while the cursor sits off the silhouette and the stroke is reaching
     /// for the nearest surface instead.
@@ -791,9 +811,8 @@ fn top_bar(
                     }
                     ui.label(
                         egui::RichText::new(format!(
-                            "{:>4.1} ms  {:>3.0} fps",
+                            "CPU {:>4.1} ms",
                             st.frame_ms,
-                            if st.frame_ms > 0.01 { 1000.0 / st.frame_ms } else { 0.0 }
                         ))
                             .small()
                             .monospace()
@@ -1013,6 +1032,7 @@ fn tab_body(
     match tab {
         Tab::Brush => brush_tab(ui, s, st, cx),
         Tab::Colour => colour_tab(ui, s, st, cx),
+        Tab::Materials => materials_tab(ui, s, st, cx),
         Tab::Model => model_tab(ui, s, st, cx),
         Tab::Scene => scene_tab(ui, s, st, giz, cx),
         Tab::View => view_tab(ui, st, cam, cx),
@@ -1126,6 +1146,8 @@ fn brush_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
     alpha_picker(ui, st, s, cx, &m, p);
 
     widgets::section_title(ui, "BEHAVIOUR");
+    BigSlider::new(&mut s.brush.spacing, 0.02..=1.0, "Dab spacing")
+        .decimals(2).height(m.row).show(ui);
     widgets::toggle(ui, &mut s.brush.culling, "Front faces only", m.row);
     widgets::toggle(ui, &mut s.brush.lock_plane, "Lock the stroke plane", m.row);
     BigSlider::new(&mut s.brush.auto_smooth, 0.0..=1.0, "Auto smooth")
@@ -1272,26 +1294,81 @@ fn saved_brushes(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut
 
     let mut apply = None;
     let mut remove = None;
-    for (i, nb) in st.brushes.iter().enumerate() {
-        ui.horizontal(|ui| {
-            // Highlighted when the brush in hand looks like this one. Comparing
-            // the settings that carry the feel of it is enough, and reads the
-            // way the eye does.
+    let mut duplicate = None;
+    let mut reorder = None;
+    let count = st.brushes.len();
+    for (i, nb) in st.brushes.iter_mut().enumerate() {
+        ui.push_id(i, |ui| ui.horizontal(|ui| {
             let live = s.brush.kind == nb.brush.kind
                 && (s.brush.radius - nb.brush.radius).abs() < 1e-4
                 && (s.brush.strength - nb.brush.strength).abs() < 1e-4
                 && s.brush.falloff == nb.brush.falloff
                 && s.brush.alpha == nb.brush.alpha;
-            if widgets::wide_button(ui, Icon::of_brush(nb.brush.kind), &nb.name, m.row, live)
-                .clicked()
-            {
-                apply = Some(i);
-            }
-            if widgets::icon_button(ui, Icon::Trash, m.row, false, "Drop this brush").clicked() {
-                remove = Some(i);
-            }
-        });
+            let icon = nb.icon.as_deref().and_then(BrushKind::from_label).unwrap_or(nb.brush.kind);
+            let texture = nb.icon.as_ref().and_then(|key| {
+                if !st.brush_icons.contains_key(key) {
+                    let hex = key.strip_prefix("rgba64:")?;
+                    if hex.len() != 64 * 64 * 8 || !hex.is_ascii() { return None; }
+                    let bytes: Option<Vec<u8>> = (0..hex.len()).step_by(2)
+                        .map(|n| u8::from_str_radix(&hex[n..n+2], 16).ok()).collect();
+                    let image = egui::ColorImage::from_rgba_unmultiplied([64, 64], &bytes?);
+                    st.brush_icons.insert(key.clone(), ui.ctx().load_texture(
+                        format!("custom brush {}", st.brush_icons.len()), image, egui::TextureOptions::LINEAR));
+                }
+                st.brush_icons.get(key).map(|texture| texture.id())
+            });
+            let response = if let Some(texture) = texture {
+                ui.add(egui::Button::image_and_text(
+                    egui::Image::new((texture, egui::vec2(m.row - 6.0, m.row - 6.0))), &nb.name)
+                    .selected(live).min_size(egui::vec2(80.0, m.row)))
+            } else {
+                widgets::wide_button(ui, Icon::of_brush(icon), &nb.name, m.row, live)
+            };
+            if response.clicked() { apply = Some(i); }
+            let mut edit = |ui: &mut egui::Ui| {
+                ui.label("Brush name");
+                ui.text_edit_singleline(&mut nb.name);
+                if ui.button("Replace settings with current brush").clicked() {
+                    nb.brush = s.brush;
+                    ui.close();
+                }
+                if ui.button("Duplicate").clicked() { duplicate = Some(i); ui.close(); }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(i > 0, egui::Button::new("Move up")).clicked() {
+                        reorder = Some((i, i - 1)); ui.close();
+                    }
+                    if ui.add_enabled(i + 1 < count, egui::Button::new("Move down")).clicked() {
+                        reorder = Some((i, i + 1)); ui.close();
+                    }
+                });
+                ui.separator();
+                ui.label("Icon");
+                ui.horizontal_wrapped(|ui| {
+                    for kind in BrushKind::ALL {
+                        if widgets::icon_button(ui, Icon::of_brush(kind), m.row,
+                            nb.icon.as_deref() == Some(kind.label()), kind.label()).clicked() {
+                            nb.icon = Some(kind.label().into());
+                        }
+                    }
+                });
+                if ui.button("Import image as icon...").clicked() {
+                    cx.actions.push(Action::LoadBrushIcon(i)); ui.close();
+                }
+                if ui.button("Restore tool icon").clicked() { nb.icon = None; }
+                ui.separator();
+                if ui.button("Delete brush").clicked() { remove = Some(i); ui.close(); }
+            };
+            // Visible menu also works on touch devices without a right button.
+            ui.menu_button("...", &mut edit);
+            response.context_menu(&mut edit);
+        }));
     }
+    if let Some(i) = duplicate {
+        let mut brush = st.brushes[i].clone();
+        brush.name.push_str(" copy");
+        st.brushes.insert(i + 1, brush);
+    }
+    if let Some((from, to)) = reorder { st.brushes.swap(from, to); }
     if st.brushes.is_empty() {
         ui.label(
             egui::RichText::new("Nothing kept yet. Set a tool up the way you like it, then keep it.")
@@ -1322,7 +1399,7 @@ fn saved_brushes(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut
             } else {
                 st.brush_name.trim().to_string()
             };
-            st.brushes.push(io::NamedBrush { name, brush: s.brush });
+            st.brushes.push(io::NamedBrush { name, brush: s.brush, icon: None });
             st.brush_name.clear();
         }
     });
@@ -1342,6 +1419,58 @@ fn saved_brushes(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut
 /// middle of a stroke. This is the other half of the job: sitting down and
 /// choosing a scheme. It is a tab like any other, so it can be torn off and
 /// parked beside the model while a painting pass goes on.
+fn materials_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
+    let (p, m) = (cx.p, cx.m);
+    widgets::section_title(ui, "MATERIAL LIBRARY");
+    ui.label("Choose a material to paint colour, roughness and metalness together. Lit shading shows their response to light.");
+    let mut selected = None;
+    let mut remove = None;
+    for (index, material) in st.materials.iter_mut().enumerate() {
+        ui.push_id(index, |ui| ui.horizontal(|ui| {
+            if colour_chip(ui, glam::Vec3::from_array(material.color), m.row, p).clicked() {
+                selected = Some(index);
+            }
+            if ui.button(&material.name).clicked() { selected = Some(index); }
+            ui.menu_button("...", |ui| {
+                ui.text_edit_singleline(&mut material.name);
+                ui.color_edit_button_rgb(&mut material.color);
+                ui.add(egui::Slider::new(&mut material.roughness, 0.02..=1.0).text("Roughness"));
+                ui.add(egui::Slider::new(&mut material.metalness, 0.0..=1.0).text("Metalness"));
+                if ui.button("Delete").clicked() { remove = Some(index); ui.close(); }
+            });
+        }));
+    }
+    if let Some(index) = selected {
+        let material = &st.materials[index];
+        s.set_brush_kind(BrushKind::Paint);
+        s.brush.paint_color = glam::Vec3::from_array(material.color);
+        s.brush.paint_rough = material.roughness;
+        s.brush.paint_metal = material.metalness;
+        s.brush.paint_albedo = true;
+        s.brush.paint_material = true;
+        st.settings.shading = Shading::Pbr;
+        st.settings.vertex_color = true;
+    }
+    if let Some(index) = remove { st.materials.remove(index); }
+    ui.separator();
+    ui.add(egui::TextEdit::singleline(&mut st.material_name).hint_text("Material name"));
+    if widgets::wide_button(ui, Icon::Plus, "Keep current paint material", m.row, false).clicked() {
+        st.materials.push(crate::materials::Material {
+            name: if st.material_name.trim().is_empty() { format!("Material {}", st.materials.len() + 1) } else { st.material_name.trim().into() },
+            color: s.brush.paint_color.to_array(), roughness: s.brush.paint_rough, metalness: s.brush.paint_metal,
+        });
+        st.material_name.clear();
+    }
+    ui.separator();
+    widgets::section_title(ui, "MESH ASSETS");
+    if widgets::wide_button(ui, Icon::Open, "Add mesh to scene", m.row, false).clicked() {
+        cx.actions.push(Action::ImportObject);
+    }
+    ui.label("OBJ, PLY and STL. Existing objects stay in the scene; use Scene to select, rename, transform or merge them.");
+    widgets::section_title(ui, "STAMP TEXTURES");
+    alpha_picker(ui, st, s, cx, &m, p);
+}
+
 fn colour_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx) {
     let (p, m) = (cx.p, cx.m);
     let colour = s.brush.paint_color;
@@ -1801,6 +1930,10 @@ fn model_tab(ui: &mut egui::Ui, s: &mut Sculptor, st: &mut UiState, cx: &mut Ctx
             .show(ui);
         widgets::toggle(ui, &mut s.dyntopo.subdivide, "Subdivide under the brush", m.row);
         widgets::toggle(ui, &mut s.dyntopo.decimate, "Decimate under the brush", m.row);
+        widgets::toggle(ui, &mut s.dyntopo.responsive, "Progressive refinement", m.row);
+        ui.label(egui::RichText::new(
+            "Progressive adds detail over more dabs to keep the brush responsive."
+        ).small().color(p.dim));
         let mut millions = s.dyntopo.max_verts as f32 / 1.0e6;
         if BigSlider::new(&mut millions, 0.05..=8.0, "Vertex ceiling")
             .decimals(2)
@@ -2235,7 +2368,7 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
 
     // The tone curve, where there is light to map. The other views are colours
     // somebody already chose, so there is nothing to grade.
-    if st.settings.shading == Shading::Pbr {
+    if matches!(st.settings.shading, Shading::Pbr | Shading::Clay) {
         widgets::section_title(ui, "TONE");
         widgets::toggle(ui, &mut st.settings.tone, "Roll off the highlights", m.row);
         ui.add_enabled_ui(st.settings.tone, |ui| {
@@ -2397,6 +2530,12 @@ fn view_tab(ui: &mut egui::Ui, st: &mut UiState, cam: &mut Camera, cx: &mut Ctx)
 
 fn interface_tab(ui: &mut egui::Ui, st: &mut UiState, cx: &mut Ctx) {
     let (p, m) = (cx.p, cx.m);
+    ui.label("Layout, brushes, imported alphas and lighting are restored on the next launch.");
+    if widgets::wide_button(ui, Icon::Save, "Save workspace now", m.row, false).clicked() {
+        cx.actions.push(Action::SaveWorkspace);
+    }
+    BigSlider::new(&mut st.preview_opacity, 0.0..=0.8, "Brush preview opacity")
+        .decimals(2).height(m.row).show(ui);
     let t = &mut st.theme;
 
     widgets::section_title(ui, "COLOUR");
@@ -2610,7 +2749,44 @@ fn viewport_overlay(
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new("viewport_overlay"),
-    ));
+    )).with_clip_rect(st.viewport);
+
+    if let Some(corners) = overlay.footprint.filter(|_| st.preview_opacity > 0.0) {
+        let key = (s.brush.falloff, s.brush.alpha, s.alphas.len());
+        if st.preview_key != Some(key) {
+            const N: usize = 96;
+            let alpha = s.brush.alpha.and_then(|i| s.alphas.get(i as usize));
+            let pixels = (0..N * N).map(|i| {
+                let u = (i % N) as f32 / (N - 1) as f32;
+                let v = (i / N) as f32 / (N - 1) as f32;
+                let radius = egui::vec2(u * 2.0 - 1.0, v * 2.0 - 1.0).length();
+                let weight = if radius >= 1.0 { 0.0 } else {
+                    s.brush.falloff.eval(radius) * alpha.map_or(1.0, |a| a.sample(u, v))
+                };
+                Color32::from_white_alpha((weight * 255.0) as u8)
+            }).collect();
+            let image = egui::ColorImage { size: [N, N], pixels, source_size: egui::vec2(N as f32, N as f32) };
+            if let Some(texture) = &mut st.preview_texture {
+                texture.set(image, egui::TextureOptions::LINEAR);
+            } else {
+                st.preview_texture = Some(ctx.load_texture("brush footprint", image, egui::TextureOptions::LINEAR));
+            }
+            st.preview_key = Some(key);
+        }
+        if let Some(texture) = &st.preview_texture {
+            let tint = if s.brush.negative { Color32::from_rgb(255, 140, 100) } else { p.accent };
+            let color = tint.gamma_multiply(st.preview_opacity);
+            let mut mesh = egui::Mesh::with_texture(texture.id());
+            for (pos, uv) in corners.into_iter().zip([
+                egui::pos2(0.0, 0.0), egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0), egui::pos2(0.0, 1.0),
+            ]) {
+                mesh.vertices.push(egui::epaint::Vertex { pos, uv, color });
+            }
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            painter.add(egui::Shape::mesh(mesh));
+        }
+    }
 
     // Brush cursor: outer ring is the radius, inner ring the strength.
     if let Some((pos, radius)) = overlay.cursor {

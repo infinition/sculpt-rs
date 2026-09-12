@@ -513,13 +513,12 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue, level: u32) {
     });
     let view_tex = target.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let mut time = |label: &str, settings: FrameSettings| {
+    let time = |label: &str, settings: FrameSettings| {
         r.set_uniforms(queue, &scene, view, proj, eye, &settings);
+        let mut total_ms = 0.0;
         // Une image pour chauffer, puis on mesure.
         for warm in 0..=FRAMES {
-            if warm == 1 {
-                let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-            }
+            let started = std::time::Instant::now();
             let mut e = device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bench") });
             {
@@ -550,15 +549,13 @@ fn bench(device: &wgpu::Device, queue: &wgpu::Queue, level: u32) {
             }
             r.draw_occlusion(&mut e, &view_tex, &settings);
             queue.submit(Some(e.finish()));
-            if warm == 0 {
-                let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            if warm > 0 {
+                total_ms += started.elapsed().as_secs_f64() * 1000.0;
             }
         }
-        let started = std::time::Instant::now();
-        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-        let ms = started.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
         let _ = label;
-        ms
+        total_ms / FRAMES as f64
     };
 
     let base = FrameSettings { shading: Shading::Clay, grid: false, occlusion: false,

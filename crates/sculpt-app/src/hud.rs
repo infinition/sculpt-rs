@@ -28,7 +28,7 @@ pub enum HudAction {
 }
 
 /// The five floating controls.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PodKind {
     Size,
     Menu,
@@ -78,7 +78,7 @@ impl PodKind {
 }
 
 /// One floating control.
-#[derive(Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
 pub struct Pod {
     pub kind: PodKind,
     pub at: Vec2,

@@ -191,9 +191,21 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f
         // judge hand-painted work without the shading lying to you.
         c = in.col;
     } else {
-        // Untextured clay, the neutral view for judging form.
-        let ndl = max(dot(normalize(nv), normalize(vec3<f32>(-0.3, 0.5, 0.8))), 0.0);
-        c = vec3<f32>(0.62, 0.60, 0.58) * (0.25 + 0.75 * ndl);
+        // Broad studio key, cool fill and restrained rim. The rig follows the
+        // camera so forms remain readable while orbiting, like a sculpt matcap.
+        let n = normalize(nv);
+        let key = normalize(vec3<f32>(-0.45, 0.65, 0.70));
+        let fill = normalize(vec3<f32>(0.70, 0.10, 0.65));
+        let rim = normalize(vec3<f32>(0.35, 0.45, -0.80));
+        let diffuse = max((dot(n, key) + 0.15) / 1.15, 0.0);
+        let bounce = max(dot(n, fill), 0.0);
+        let edge = pow(max(dot(n, rim), 0.0), 3.0);
+        let half_key = normalize(key + vec3<f32>(0.0, 0.0, 1.0));
+        let sheen = pow(max(dot(n, half_key), 0.0), 32.0) * 0.055;
+        let base = vec3<f32>(0.42, 0.37, 0.31);
+        c = tone_curve(base * (0.13 + 0.95 * diffuse)
+            + base * vec3<f32>(0.68, 0.80, 1.0) * bounce * 0.24
+            + vec3<f32>(0.10, 0.12, 0.15) * edge + vec3<f32>(sheen));
     }
 
     c *= obj.tint.rgb;

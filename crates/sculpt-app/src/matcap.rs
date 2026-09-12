@@ -15,7 +15,7 @@ use glam::Vec3;
 /// visible steps, small enough to rebuild while a light is being dragged.
 pub const SIZE: u32 = 256;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Preset {
     Clay,
     Pearl,
@@ -84,7 +84,7 @@ impl Preset {
 }
 
 /// The surface a lightcap is lighting.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Debug)]
 pub struct Look {
     pub base: Vec3,
     pub spec: Vec3,
@@ -96,7 +96,7 @@ pub struct Look {
 
 /// One of the three lights, aimed in view space: +X is to the right of the
 /// screen, +Y is up it, +Z is out of it toward the viewer.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Debug)]
 pub struct Light {
     pub dir: Vec3,
     pub color: Vec3,
@@ -105,7 +105,7 @@ pub struct Light {
 }
 
 /// A material and the lights on it: everything a matcap is baked from.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Debug)]
 pub struct Lightcap {
     pub look: Look,
     pub lights: [Light; 3],

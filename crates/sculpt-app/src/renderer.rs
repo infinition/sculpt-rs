@@ -17,7 +17,7 @@ const MATCAP_SIZE: u32 = 256;
 const OBJECT_STRIDE: u64 = 256;
 const MAX_OBJECTS: u64 = 64;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shading {
     Matcap,
     Pbr,
@@ -67,7 +67,7 @@ impl Shading {
 }
 
 /// Everything the renderer needs to know about how to draw a frame.
-#[derive(Clone, Copy)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
 pub struct FrameSettings {
     pub shading: Shading,
     pub flat: bool,
@@ -80,7 +80,7 @@ pub struct FrameSettings {
     pub cavity_strength: f32,
     /// The tone curve, and what it is fed.
     ///
-    /// Only the lit view goes through it. A matcap is an image somebody already
+    /// Lit and studio clay views use it. A matcap is an image somebody already
     /// graded, the normals view is data rather than light, and the unlit view
     /// exists precisely to show a painted colour untouched. Putting a curve on
     /// any of those would be changing an answer, not shaping a picture.

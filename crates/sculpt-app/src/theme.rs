@@ -8,7 +8,7 @@
 use egui::{Color32, CornerRadius, Margin, Stroke, Vec2};
 
 /// Where a dock sits.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
     Left,
     Right,
@@ -75,7 +75,7 @@ impl ColorPreset {
 }
 
 /// Everything the user can change about the look and the layout.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq)]
 pub struct UiTheme {
     /// Electric accent, used for selection, handles and highlights.
     pub accent: [f32; 3],
