@@ -2,7 +2,8 @@
 
 Le workflow Build produit des archives Windows x64, Linux x64, macOS Apple Silicon
 et macOS Intel. Le workflow Release réutilise exactement ce build pour les tags
-`v*`, puis joint les quatre archives et leurs SHA-256 à une release brouillon.
+`v*`, puis publie directement une release avec les quatre archives et leurs
+SHA-256.
 Le lancement manuel prépare les artefacts sans publier de release.
 
 - Windows : extraire le ZIP puis lancer `sculpt-app.exe`.
