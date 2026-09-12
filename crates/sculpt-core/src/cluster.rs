@@ -227,28 +227,54 @@ pub fn follow(mesh: &Mesh, p: &mut Partition, dirty_faces: &[u32], target: usize
         });
     }
 
-    let mut todo: Vec<usize> = dirty_faces
-        .iter()
-        .map(|f| *f as usize / target)
-        .chain(fresh)
-        .chain(p.clusters.len().checked_sub(1))
-        .filter(|k| *k < p.clusters.len())
-        .collect();
-    todo.sort_unstable();
-    todo.dedup();
-
-    for k in todo {
+    // New packets have no previous bound; measure those once.
+    for k in fresh {
         let c = &mut p.clusters[k];
         let (first, count) = (c.first as usize, c.count as usize);
-        if count == 0 || first + count > n {
-            continue;
-        }
         let (lo, hi, axis, cos_spread) = extent(mesh, first, count);
         c.lo = lo;
         c.hi = hi;
         c.axis = axis;
         c.cos_spread = cos_spread;
     }
+
+    // A changed face only needs to expand its packet's previous box/cone.
+    // Re-reading all 2048 faces of every touched packet makes scattered
+    // dyntopo writes approach a full-mesh pass. Keeping conservative bounds
+    // costs one visit per dirty face, and never hides a visible triangle.
+    let mut sorted;
+    let faces = if dirty_faces.is_sorted() {
+        dirty_faces
+    } else {
+        sorted = dirty_faces.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        &sorted
+    };
+    let Some(&first) = faces.first() else { return };
+    let last = *faces.last().unwrap() as usize / target;
+    let mut remaining = faces;
+    // Disjoint packets can be refit independently. This also avoids repeatedly
+    // scattering into the same box for interleaved vertex/face changes.
+    let jobs: Vec<_> = p.clusters.iter_mut().enumerate().take(last + 1).skip(first as usize / target)
+        .filter_map(|(index, cluster)| {
+            let end = remaining.partition_point(|f| (*f as usize) < (index + 1) * target);
+            if end == 0 { return None; }
+            let (local, rest) = remaining.split_at(end);
+            remaining = rest;
+            Some((cluster, local))
+        }).collect();
+    jobs.into_par_iter().for_each(|(c, local)| {
+        for &f in local {
+            let Some(tri) = mesh.faces.get(f as usize) else { continue };
+            for &v in tri {
+                let point = mesh.pos[v as usize];
+                c.lo = c.lo.min(point);
+                c.hi = c.hi.max(point);
+            }
+            c.cos_spread = c.cos_spread.min(c.axis.dot(face_normal(mesh, tri)));
+        }
+    });
 }
 
 /// Entrelace les bits d'un entier de 10 bits, un sur trois.
@@ -674,5 +700,29 @@ mod tests {
 
         assert!(p.clusters[0].hi.y > before.hi.y + 1.0, "la boîte n'a pas suivi");
         assert_eq!(p.clusters[1], measure(&m, 256)[1], "un paquet voisin a bougé");
+    }
+
+    #[test]
+    fn ordinary_deformation_expands_boxes_and_normal_cones() {
+        let mut mesh = primitives::icosphere(3);
+        let mut p = build(&mut mesh, 128);
+        mesh.ensure_accel(0.3);
+        mesh.take_dirty();
+        for i in (0..mesh.vert_count() as u32).step_by(7) {
+            mesh.set_pos(i, mesh.pos[i as usize] + Vec3::new(0.4, 0.2, 0.0));
+        }
+        mesh.flush_refit();
+        let (_, dirty, full) = mesh.take_dirty();
+        assert!(!full && !dirty.is_empty());
+        follow(&mesh, &mut p, &dirty, 128);
+        for c in &p.clusters {
+            for tri in &mesh.faces[c.first as usize..(c.first + c.count) as usize] {
+                for &v in tri {
+                    assert!(mesh.pos[v as usize].cmpge(c.lo - Vec3::splat(1e-5)).all());
+                    assert!(mesh.pos[v as usize].cmple(c.hi + Vec3::splat(1e-5)).all());
+                }
+                assert!(c.axis.dot(face_normal(&mesh, tri)) >= c.cos_spread - 1e-5);
+            }
+        }
     }
 }

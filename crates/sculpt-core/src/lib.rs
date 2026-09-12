@@ -129,6 +129,30 @@ impl Sculptor {
         self.brush = self.presets[Self::preset_index(self.brush.kind)];
     }
 
+    pub fn brush_presets(&self) -> Vec<Brush> {
+        let mut presets = self.presets.clone();
+        presets[Self::preset_index(self.brush.kind)] = self.brush;
+        presets
+    }
+
+    pub fn restore_brush_presets(&mut self, brushes: &[Brush]) {
+        for brush in brushes {
+            self.presets[Self::preset_index(brush.kind)] = *brush;
+        }
+    }
+
+    /// Opening a scene changes geometry and history, not the artist's tools.
+    pub fn replace_scene(&mut self, scene: Scene) {
+        self.scene = scene;
+        self.history.clear();
+        self.stroking = false;
+        self.stroke_state = brush::StrokeState::default();
+        self.voxel_field = None;
+        self.voxel_mode = false;
+        self.reset_detail_to_mesh();
+        self.mark_all_dirty();
+    }
+
     // ---- active object ------------------------------------------------------
 
     pub fn mesh(&self) -> &Mesh {
@@ -285,7 +309,7 @@ impl Sculptor {
             let inv = obj.transform.inverse_matrix();
             StrokeInput {
                 point: inv.transform_point3(world.point),
-                normal: inv.transform_vector3(world.normal).normalize_or(Vec3::Y),
+                normal: obj.transform.matrix().transpose().transform_vector3(world.normal).normalize_or(Vec3::Y),
                 drag: inv.transform_vector3(world.drag),
                 view_dir: inv.transform_vector3(world.view_dir).normalize_or(-Vec3::Z),
                 view_right: inv.transform_vector3(world.view_right).normalize_or(Vec3::X),
@@ -377,7 +401,7 @@ impl Sculptor {
             if deforms {
                 // Normals change one ring further out than the positions did,
                 // and `update_normals` records that wider set itself.
-                mesh.update_normals(&touched);
+                mesh.update_sculpt_normals(&touched);
             } else {
                 mesh.commit_attributes(&touched);
             }
@@ -772,7 +796,7 @@ mod tests {
     }
 
     /// Checks that adjacency agrees with the face array in both directions.
-    fn validate(m: &Mesh) {
+    pub(crate) fn validate(m: &Mesh) {
         assert_eq!(m.pos.len(), m.vfaces.len(), "adjacency length mismatch");
         for (fi, tri) in m.faces.iter().enumerate() {
             for &v in tri {
@@ -908,6 +932,24 @@ mod tests {
             }
         }
         assert!(moved_right > 0, "the solid half of the alpha did nothing");
+    }
+
+    #[test]
+    fn black_alpha_leaves_geometry_and_uploads_untouched() {
+        let mut s = Sculptor::new(primitives::icosphere(3));
+        s.dyntopo_enabled = false;
+        s.symmetry = false;
+        s.alphas.push(std::sync::Arc::new(Alpha::new("black", 2, 2, vec![0.0; 4])));
+        s.brush.alpha = Some((s.alphas.len() - 1) as u32);
+        s.brush.radius = 0.5;
+        let before = s.mesh().pos.clone();
+        s.take_dirty();
+        s.begin_stroke();
+        s.stroke(&StrokeInput { point: Vec3::Y, normal: Vec3::Y, ..Default::default() });
+        s.end_stroke();
+        let (vertices, faces, full) = s.take_dirty();
+        assert_eq!(s.mesh().pos, before);
+        assert!(vertices.is_empty() && faces.is_empty() && !full);
     }
 
     #[test]
@@ -1174,7 +1216,7 @@ mod tests {
         brush.alpha = Some(1);
 
         let alphas = vec!["Ring".to_string(), "Cracks".to_string()];
-        let saved = vec![io::NamedBrush { name: "My chisel".into(), brush }];
+        let saved = vec![io::NamedBrush { name: "My chisel".into(), brush, icon: Some("Clay".into()) }];
         let path = std::env::temp_dir().join("sculpt_rs_roundtrip.brushes");
         io::write_brushes(&saved, &alphas, &path).unwrap();
         let back = io::read_brushes(&path, &alphas).unwrap();
@@ -1182,6 +1224,7 @@ mod tests {
 
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].name, "My chisel");
+        assert_eq!(back[0].icon.as_deref(), Some("Clay"));
         let b = back[0].brush;
         assert_eq!(b.kind, BrushKind::Crease);
         assert!((b.radius - 0.123).abs() < 1e-5);
@@ -1201,7 +1244,7 @@ mod tests {
         let mut brush = Brush::default();
         brush.alpha = Some(0);
         brush.strength = 0.31;
-        let saved = vec![io::NamedBrush { name: "Stamper".into(), brush }];
+        let saved = vec![io::NamedBrush { name: "Stamper".into(), brush, icon: None }];
         let path = std::env::temp_dir().join("sculpt_rs_missing_alpha.brushes");
         io::write_brushes(&saved, &["Scanned stone".to_string()], &path).unwrap();
         let back = io::read_brushes(&path, &[]).unwrap();
@@ -1217,6 +1260,42 @@ mod tests {
         let s = topology::subdivide(&m, true);
         validate(&s);
         assert_eq!(s.face_count(), m.face_count() * 4);
+    }
+
+    #[test]
+    fn uv_sphere_is_closed_outward_and_shares_the_seam() {
+        for (segments, rings) in [(3, 2), (32, 16)] {
+            let mesh = primitives::uv_sphere(segments, rings);
+            validate(&mesh);
+            assert_eq!(mesh.vert_count(), (segments * (rings - 1) + 2) as usize);
+            assert_eq!(mesh.face_count(), (2 * segments * (rings - 1)) as usize);
+            for &[a, b, c] in &mesh.faces {
+                let (a, b, c) = (mesh.pos[a as usize], mesh.pos[b as usize], mesh.pos[c as usize]);
+                assert!((b - a).cross(c - a).dot(a + b + c) > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_face_refit_matches_full_normals_after_sculpting() {
+        for dynamic in [false, true] {
+            let mut s = Sculptor::new(primitives::icosphere(4));
+            s.symmetry = false;
+            s.dyntopo_enabled = dynamic;
+            s.dyntopo.detail = 0.015;
+            s.brush.radius = 0.3;
+            s.begin_stroke();
+            for i in 0..4 {
+                let point = Vec3::new(i as f32 * 0.03, 0.0, 1.0).normalize();
+                s.stroke(&StrokeInput { point, normal: point, ..Default::default() });
+                let actual = s.mesh().nrm.clone();
+                let mut reference = s.mesh().clone();
+                reference.recompute_normals();
+                for (a, b) in actual.iter().zip(&reference.nrm) {
+                    assert!(a.distance(*b) < 1e-4, "normal differs with dynamic={dynamic}: {a:?}, {b:?}");
+                }
+            }
+        }
     }
 
     #[test]

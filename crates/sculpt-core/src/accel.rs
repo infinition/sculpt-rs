@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use crate::query::Hit;
 use glam::Vec3;
 use smallvec::SmallVec;
+use rustc_hash::FxHashSet;
 
 /// A cell holds four elements before it reaches for the heap.
 ///
@@ -52,6 +53,10 @@ pub struct Grid {
     /// Bucket currently holding each vertex, so removal knows where to look.
     vslot: Vec<u32>,
     fslot: Vec<u32>,
+    /// Position inside the bucket, so moving/removing one element is O(1)
+    /// even when a dense patch puts thousands of elements in the same cell.
+    voffset: Vec<u32>,
+    foffset: Vec<u32>,
     /// Largest centroid-to-corner distance of any face inserted so far. Faces
     /// are filed by centroid, so a ray has to look this far to the side.
     face_radius: f32,
@@ -86,6 +91,8 @@ impl Grid {
             fbuckets: vec![Bucket::new(); table],
             vslot: Vec::new(),
             fslot: Vec::new(),
+            voffset: Vec::new(),
+            foffset: Vec::new(),
             face_radius: 0.0,
             lo: Vec3::splat(f32::MAX),
             hi: Vec3::splat(f32::MIN),
@@ -116,6 +123,15 @@ impl Grid {
             || fill(&mut g.vbuckets, &g.vslot),
             || fill(&mut g.fbuckets, &g.fslot),
         );
+        (g.voffset, g.foffset) = rayon::join(
+            || offsets(&g.vbuckets, g.vslot.len()),
+            || offsets(&g.fbuckets, g.fslot.len()),
+        );
+        let extra = mesh.sculpt_growth_headroom();
+        g.vslot.reserve_exact(extra);
+        g.voffset.reserve_exact(extra);
+        g.fslot.reserve_exact(extra * 2);
+        g.foffset.reserve_exact(extra * 2);
 
         if mesh.pos.is_empty() {
             g.lo = Vec3::ZERO;
@@ -181,13 +197,14 @@ impl Grid {
     pub fn push_vertex(&mut self, v: u32, p: Vec3) {
         debug_assert_eq!(self.vslot.len(), v as usize);
         let s = self.slot(p);
+        self.voffset.push(self.vbuckets[s as usize].len() as u32);
         self.vbuckets[s as usize].push(v);
         self.vslot.push(s);
         self.grow(p);
     }
 
-    /// Returns true when the vertex actually changed bucket, which is the only
-    /// case where its incident faces need refiling too.
+    /// Returns true when the vertex changed bucket. Incident faces still need
+    /// refitting when it stays put: their centroid/radius can change either way.
     pub fn move_vertex(&mut self, v: u32, p: Vec3) -> bool {
         self.grow(p);
         let s = self.slot(p);
@@ -195,7 +212,8 @@ impl Grid {
         if s == old {
             return false;
         }
-        remove_from(&mut self.vbuckets[old as usize], v);
+        remove_at(&mut self.vbuckets[old as usize], &mut self.voffset, v);
+        self.voffset[v as usize] = self.vbuckets[s as usize].len() as u32;
         self.vbuckets[s as usize].push(v);
         self.vslot[v as usize] = s;
         true
@@ -206,22 +224,22 @@ impl Grid {
     pub fn swap_remove_vertex(&mut self, v: u32) {
         let last = (self.vslot.len() - 1) as u32;
         let s = self.vslot[v as usize];
-        remove_from(&mut self.vbuckets[s as usize], v);
+        remove_at(&mut self.vbuckets[s as usize], &mut self.voffset, v);
         if v != last {
             let ls = self.vslot[last as usize];
-            for e in self.vbuckets[ls as usize].iter_mut() {
-                if *e == last {
-                    *e = v;
-                }
-            }
+            let offset = self.voffset[last as usize];
+            self.vbuckets[ls as usize][offset as usize] = v;
             self.vslot[v as usize] = ls;
+            self.voffset[v as usize] = offset;
         }
         self.vslot.pop();
+        self.voffset.pop();
     }
 
     pub fn push_face(&mut self, f: u32, centroid: Vec3, radius: f32) {
         debug_assert_eq!(self.fslot.len(), f as usize);
         let s = self.slot(centroid);
+        self.foffset.push(self.fbuckets[s as usize].len() as u32);
         self.fbuckets[s as usize].push(f);
         self.fslot.push(s);
         self.face_radius = self.face_radius.max(radius);
@@ -235,6 +253,7 @@ impl Grid {
     /// and the sentinel tells the flush it was never filed.
     pub fn push_face_slot(&mut self) {
         self.fslot.push(UNFILED);
+        self.foffset.push(0);
     }
 
     pub fn move_face(&mut self, f: u32, centroid: Vec3, radius: f32) {
@@ -243,10 +262,12 @@ impl Grid {
         if old == UNFILED {
             // A face added in the middle of a stroke joins its bucket here,
             // once, when the faces are put back.
+            self.foffset[f as usize] = self.fbuckets[s as usize].len() as u32;
             self.fbuckets[s as usize].push(f);
             self.fslot[f as usize] = s;
         } else if s != old {
-            remove_from(&mut self.fbuckets[old as usize], f);
+            remove_at(&mut self.fbuckets[old as usize], &mut self.foffset, f);
+            self.foffset[f as usize] = self.fbuckets[s as usize].len() as u32;
             self.fbuckets[s as usize].push(f);
             self.fslot[f as usize] = s;
         }
@@ -257,20 +278,18 @@ impl Grid {
         let last = (self.fslot.len() - 1) as u32;
         let s = self.fslot[f as usize];
         if s != UNFILED {
-            remove_from(&mut self.fbuckets[s as usize], f);
+            remove_at(&mut self.fbuckets[s as usize], &mut self.foffset, f);
         }
         if f != last {
             let ls = self.fslot[last as usize];
             if ls != UNFILED {
-                for e in self.fbuckets[ls as usize].iter_mut() {
-                    if *e == last {
-                        *e = f;
-                    }
-                }
+                self.fbuckets[ls as usize][self.foffset[last as usize] as usize] = f;
             }
             self.fslot[f as usize] = ls;
+            self.foffset[f as usize] = self.foffset[last as usize];
         }
         self.fslot.pop();
+        self.foffset.pop();
     }
 
     // ---- queries -----------------------------------------------------------
@@ -325,15 +344,18 @@ impl Grid {
         }
         // A face is filed by its centroid, so widen the corridor by the largest
         // centroid-to-corner distance seen. Too wide and the walk is pointless.
-        let pad = (self.face_radius * self.inv).ceil().max(0.0) as i32;
-        if pad > 3 {
-            return None;
-        }
         let margin = Vec3::splat(self.face_radius + self.cell);
-        let (mut t0, t1) = slab(o, d, self.lo - margin, self.hi + margin)?;
+        // A miss is an answer, not a request for a full-mesh fallback.
+        let Some((mut t0, t1)) = slab(o, d, self.lo - margin, self.hi + margin) else {
+            return Some(None);
+        };
         t0 = t0.max(0.0);
         if t1 < t0 {
             return Some(None);
+        }
+        let pad = (self.face_radius * self.inv).ceil().max(0.0) as i32;
+        if pad > 3 {
+            return None;
         }
 
         let start = o + d * t0;
@@ -363,12 +385,18 @@ impl Grid {
         let mut best: Option<Hit> = None;
         let mut t = t0;
         let slack = self.face_radius + self.cell * 1.75;
+        let mut visited = FxHashSet::default();
 
         for _ in 0..MAX_RAY_STEPS {
             for z in (cz - pad)..=(cz + pad) {
                 for y in (cy - pad)..=(cy + pad) {
                     for x in (cx - pad)..=(cx + pad) {
                         let s = hash_cell(x, y, z, self.mask);
+                        // Adjacent DDA steps overlap, and hashing can alias
+                        // distant cells. Test each bucket just once per ray.
+                        if !visited.insert(s) {
+                            continue;
+                        }
                         for &f in &self.fbuckets[s as usize] {
                             if let Some(h) = crate::query::ray_face(mesh, f, o, d) {
                                 if best.as_ref().is_none_or(|b| h.t < b.t) {
@@ -382,12 +410,12 @@ impl Grid {
             // Everything left to visit is further away than the current hit.
             if let Some(b) = &best {
                 if b.t + slack < t {
-                    break;
+                    return Some(best);
                 }
             }
             t = next.min_element();
             if t > t1 {
-                break;
+                return Some(best);
             }
             if next.x <= next.y && next.x <= next.z {
                 cx += step[0];
@@ -400,7 +428,8 @@ impl Grid {
                 next.z += delta.z;
             }
         }
-        Some(best)
+        // The walk hit its guard before proving the closest intersection.
+        None
     }
 }
 
@@ -447,9 +476,23 @@ fn fill(buckets: &mut [Bucket], slots: &[u32]) {
 }
 
 #[inline]
-fn remove_from(b: &mut Bucket, x: u32) {
-    if let Some(i) = b.iter().position(|&e| e == x) {
-        b.swap_remove(i);
+fn offsets(buckets: &[Bucket], count: usize) -> Vec<u32> {
+    let mut out = vec![0; count];
+    for bucket in buckets {
+        for (offset, &id) in bucket.iter().enumerate() {
+            out[id as usize] = offset as u32;
+        }
+    }
+    out
+}
+
+#[inline]
+fn remove_at(b: &mut Bucket, offsets: &mut [u32], x: u32) {
+    let i = offsets[x as usize] as usize;
+    debug_assert_eq!(b[i], x);
+    b.swap_remove(i);
+    if let Some(&moved) = b.get(i) {
+        offsets[moved as usize] = i as u32;
     }
 }
 
@@ -505,4 +548,103 @@ fn boundary_t(p: f32, d: f32, cell_index: i32, cell: f32, inv_d: f32, t_start: f
         cell_index as f32 * cell
     };
     t_start + (edge - p) * inv_d
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Vertex, primitives, query};
+
+    fn consistent(g: &Grid) {
+        for (buckets, slots, offsets) in [
+            (&g.vbuckets, &g.vslot, &g.voffset),
+            (&g.fbuckets, &g.fslot, &g.foffset),
+        ] {
+            assert_eq!(slots.len(), offsets.len());
+            for (id, &slot) in slots.iter().enumerate() {
+                if slot != UNFILED {
+                    assert_eq!(buckets[slot as usize][offsets[id] as usize], id as u32);
+                }
+            }
+            for (slot, bucket) in buckets.iter().enumerate() {
+                for (offset, &id) in bucket.iter().enumerate() {
+                    assert_eq!(slots[id as usize], slot as u32);
+                    assert_eq!(offsets[id as usize], offset as u32);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_the_box_does_not_request_a_full_scan() {
+        let mesh = primitives::icosphere(2);
+        let grid = Grid::build(&mesh, 0.1);
+        assert!(matches!(grid.raycast(&mesh, Vec3::new(4.0, 0.0, 3.0), -Vec3::Z), Some(None)));
+    }
+
+    #[test]
+    fn bucket_offsets_survive_moves_splits_and_swap_removals() {
+        let mut mesh = primitives::icosphere(3);
+        // Deliberately dense buckets, including swaps inside the same bucket.
+        mesh.ensure_accel(2.0);
+        for i in (0..mesh.vert_count() as u32).step_by(3) {
+            mesh.set_pos(i, mesh.pos[i as usize] + Vec3::new(2.1, 0.03, -0.02));
+        }
+        mesh.flush_refit();
+        consistent(mesh.accel.as_ref().unwrap());
+        for _ in 0..30 {
+            let [a, b, _] = mesh.faces[0];
+            mesh.split_edge(a, b).unwrap();
+            // Includes faces which have not been filed until flush_refit.
+            mesh.remove_face((mesh.face_count() / 2) as u32);
+            consistent(mesh.accel.as_ref().unwrap());
+        }
+        mesh.flush_refit();
+        consistent(mesh.accel.as_ref().unwrap());
+        let first = mesh.add_vertex(Vertex::new(Vec3::splat(0.3)));
+        mesh.add_vertex(Vertex::new(Vec3::splat(0.4)));
+        mesh.remove_vertex(first);
+        consistent(mesh.accel.as_ref().unwrap());
+        mesh.remove_vertex(first);
+        consistent(mesh.accel.as_ref().unwrap());
+    }
+
+    #[test]
+    fn moving_within_a_vertex_cell_still_refits_faces() {
+        let mut mesh = Mesh::from_soup(
+            &[Vec3::new(0.1, 0.1, 0.0), Vec3::new(1.2, 0.2, 0.0), Vec3::new(1.4, 0.8, 0.0)],
+            &[[0, 1, 2]],
+        );
+        mesh.ensure_accel(2.0); // one-unit cells
+        let old = mesh.accel.as_ref().unwrap().fslot[0];
+        mesh.take_dirty();
+        mesh.set_pos(0, Vec3::new(0.8, 0.1, 0.0));
+        mesh.flush_refit();
+        let (center, _) = mesh.face_sphere(0);
+        let grid = mesh.accel.as_ref().unwrap();
+        assert_ne!(old, grid.fslot[0]);
+        assert_eq!(grid.slot(center), grid.fslot[0]);
+        assert!(mesh.take_dirty().1.contains(&0));
+    }
+
+    #[test]
+    fn deduplicated_ray_walk_matches_exhaustive_intersections() {
+        let mut mesh = primitives::icosphere(3);
+        mesh.ensure_accel(0.3);
+        for i in 0..80 {
+            let a = i as f32 * 0.37;
+            let origin = Vec3::new(a.cos(), (a * 1.7).sin(), a.sin()).normalize() * 3.0;
+            let target = Vec3::new((a * 2.3).cos(), a.sin(), 0.0) * 0.8;
+            let dir = (target - origin).normalize();
+            let fast = query::raycast(&mesh, origin, dir);
+            let brute = (0..mesh.face_count() as u32)
+                .filter_map(|f| query::ray_face(&mesh, f, origin, dir))
+                .min_by(|a, b| a.t.total_cmp(&b.t));
+            match (fast, brute) {
+                (Some(a), Some(b)) => assert!((a.t - b.t).abs() < 1e-5),
+                (None, None) => {},
+                other => panic!("ray disagreement: {other:?}"),
+            }
+        }
+    }
 }

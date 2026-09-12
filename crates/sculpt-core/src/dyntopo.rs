@@ -8,6 +8,7 @@ use crate::mesh::Mesh;
 use crate::query;
 use glam::Vec3;
 use rayon::prelude::*;
+use std::{cmp::Reverse, collections::BinaryHeap};
 
 /// Vertices a thread takes at a time when classifying edges.
 ///
@@ -94,6 +95,8 @@ pub struct Dyntopo {
     pub mode: DetailMode,
     pub subdivide: bool,
     pub decimate: bool,
+    /// Spread refinement over more dabs, keeping the requested edge length.
+    pub responsive: bool,
     /// Safety valve: refuse to grow past this vertex count.
     pub max_verts: usize,
 }
@@ -105,12 +108,16 @@ impl Default for Dyntopo {
             mode: DetailMode::Constant,
             subdivide: true,
             decimate: true,
+            responsive: true,
             max_verts: 2_000_000,
         }
     }
 }
 
 impl Dyntopo {
+    fn split_budget(&self) -> usize {
+        if self.responsive { 1024 } else { MAX_SPLITS_PER_DAB }
+    }
     /// The edge length a dab should aim for, in the object's own units.
     ///
     /// `radius` is the brush radius in those same units and `world_per_pixel`
@@ -134,8 +141,9 @@ impl Dyntopo {
 const SPLIT_FACTOR: f32 = 1.0;
 /// Edges shorter than this multiple of `detail` get collapsed.
 const COLLAPSE_FACTOR: f32 = 0.45;
-/// Refinement passes per stroke step.
-const PASSES: usize = 3;
+/// Same split budget as the former three passes, maintained through a local
+/// edge queue instead of rescanning the entire brush region between passes.
+const MAX_SPLITS_PER_DAB: usize = 3 * 1024;
 /// Most edges a pass will cut or close.
 ///
 /// A dab on a dense mesh under a fine detail setting finds tens of thousands of
@@ -198,6 +206,7 @@ fn classify_edges(
     decimate: bool,
     max_len: f32,
     min_len: f32,
+    split_budget: usize,
 ) -> (Vec<(f32, (u32, u32))>, Vec<(u32, u32)>) {
     // Duplicates are left in instead of being hashed away. Taking an edge from
     // its lower-numbered vertex only cuts them from six to two, and the two are
@@ -263,12 +272,21 @@ fn classify_edges(
     // measured, a stroke lands on 7639 new vertices on six cores and 7649 on
     // one, each of them repeatable. Something else in a dab still follows how
     // the work was divided, and it is not this.
-    long.sort_unstable_by_key(|(len, e)| (std::cmp::Reverse(len.to_bits()), *e));
+    // Only a bounded prefix of candidates can be used. Sorting every candidate
+    // paid O(n log n) on high-poly patches. Selection
+    // keeps the exact same prefix with O(n) work, then sorts that small prefix
+    // to preserve the original deterministic application order.
+    let key = |(len, e): &(f32, (u32, u32))| (std::cmp::Reverse(len.to_bits()), *e);
+    if long.len() > split_budget {
+        long.select_nth_unstable_by_key(split_budget, key);
+        long.truncate(split_budget);
+    }
+    long.sort_unstable_by_key(key);
+    if short.len() > MAX_EDGES_PER_PASS {
+        short.select_nth_unstable(MAX_EDGES_PER_PASS);
+        short.truncate(MAX_EDGES_PER_PASS);
+    }
     short.sort_unstable();
-    // The plan is sorted so the worst offenders come first; taking the head
-    // bounds what a single dab does, and what is left waits for the next one.
-    long.truncate(MAX_EDGES_PER_PASS);
-    short.truncate(MAX_EDGES_PER_PASS);
     (long, short)
 }
 
@@ -288,7 +306,7 @@ pub fn plan(mesh: &Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> Plan {
     let max_len = p.detail * SPLIT_FACTOR;
     let min_len = p.detail * COLLAPSE_FACTOR;
     let verts = query::verts_in_sphere(mesh, center, radius * 1.15);
-    let (long, short) = classify_edges(mesh, &verts, can_split, p.decimate, max_len, min_len);
+    let (long, short) = classify_edges(mesh, &verts, can_split, p.decimate, max_len, min_len, p.split_budget());
     Plan { long, short }
 }
 
@@ -298,52 +316,38 @@ pub fn refine(mesh: &mut Mesh, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
     apply(mesh, plan, center, radius, p)
 }
 
-/// Carries out a plan. The first pass reuses what the plan already found; the
-/// later ones have to look again, since splitting makes new edges.
+/// Carries out a plan. Only edges incident to a newly created midpoint need
+/// classifying after a split; every untouched edge keeps its length.
 pub fn apply(mesh: &mut Mesh, todo: Plan, center: Vec3, radius: f32, p: &Dyntopo) -> bool {
     let mut changed = false;
-    let mut first_long = Some(todo.long);
 
     if p.subdivide {
         let max_len = p.detail * SPLIT_FACTOR;
-        for _ in 0..PASSES {
-            if mesh.vert_count() >= p.max_verts {
+        let mut edges: BinaryHeap<_> = todo.long.into_iter()
+            .map(|(len, edge)| (len.to_bits(), Reverse(edge)))
+            .collect();
+        let r2 = (radius * 1.15).powi(2);
+        let mut splits = 0;
+        while splits < p.split_budget() && mesh.vert_count() < p.max_verts {
+            let Some((bits, Reverse((a, b)))) = edges.pop() else { break };
+            if f32::from_bits(bits) <= max_len {
                 break;
             }
-            let long = match first_long.take() {
-                Some(found) => found,
-                None => {
-                    // Splitting makes new edges, so the later passes have to
-                    // look again. Only the splitting half is wanted here.
-                    let again = Dyntopo { decimate: false, ..*p };
-                    plan(mesh, center, radius, &again).long
+            let Some(mid) = mesh.split_edge(a, b) else { continue };
+            splits += 1;
+            changed = true;
+            // Splitting doesn't move existing vertices. The new edges are
+            // exactly the midpoint's ring; every other queued length is valid.
+            for v in mesh.neighbors(mid) {
+                let edge = (v.min(mid), v.max(mid));
+                // Match plan's brush-border rule (lower-index endpoint).
+                if mesh.pos[edge.0 as usize].distance_squared(center) > r2 {
+                    continue;
                 }
-            };
-            if long.is_empty() {
-                break;
-            }
-            // The length was measured when the plan was made, and a split never
-            // moves its two endpoints, so it is still true when the edge is
-            // reached. Re-measuring would be two random reads per candidate for
-            // the same answer.
-            let mut split_any = false;
-            for (len, (a, b)) in long {
-                if mesh.vert_count() >= p.max_verts {
-                    break;
-                }
+                let len = mesh.edge_len(edge.0, edge.1);
                 if len > max_len {
-                    if mesh.split_edge(a, b).is_some() {
-                        split_any = true;
-                        changed = true;
-                    }
+                    edges.push((len.to_bits(), Reverse(edge)));
                 }
-            }
-            // Splitting is what makes the new edges a later pass would find. If
-            // a pass cut nothing, the region is at its target density and the
-            // next pass would replan and cut nothing again, so it is skipped
-            // rather than paying for a classification it cannot use.
-            if !split_any {
-                break;
             }
         }
     }
@@ -376,6 +380,36 @@ pub fn apply(mesh: &mut Mesh, todo: Plan, center: Vec3, radius: f32, p: &Dyntopo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_local_queue_refines_new_edges_to_the_target() {
+        let mut mesh = crate::primitives::icosphere(1);
+        mesh.ensure_accel(3.0);
+        let params = Dyntopo { detail: 0.2, decimate: false, responsive: false, ..Default::default() };
+        assert!(refine(&mut mesh, Vec3::ZERO, 3.0, &params));
+        mesh.flush_refit();
+        crate::tests::validate(&mesh);
+        for &[a, b, c] in &mesh.faces {
+            for (x, y) in [(a, b), (b, c), (c, a)] {
+                assert!(mesh.edge_len(x, y) <= params.detail * 1.00001);
+            }
+        }
+    }
+
+    #[test]
+    fn refinement_keeps_its_work_and_vertex_budgets() {
+        for extra in [17, MAX_SPLITS_PER_DAB + 100] {
+            let mut mesh = crate::primitives::icosphere(1);
+            let before = mesh.vert_count();
+            let params = Dyntopo {
+                detail: 1e-4, decimate: false, responsive: false, max_verts: before + extra,
+                ..Default::default()
+            };
+            refine(&mut mesh, Vec3::ZERO, 3.0, &params);
+            assert_eq!(mesh.vert_count() - before, extra.min(MAX_SPLITS_PER_DAB));
+            crate::tests::validate(&mesh);
+        }
+    }
 
     /// Chaque mode lit le même nombre dans son unité, et aucun ne peut rendre
     /// une longueur nulle: une cible à zéro demanderait une subdivision

@@ -296,6 +296,8 @@ pub struct Brush {
     pub radius: f32,
     /// 0..1.
     pub strength: f32,
+    /// Distance between dabs as a fraction of the brush radius.
+    pub spacing: f32,
     /// Inverts the brush (ctrl in most sculpting apps).
     pub negative: bool,
     pub falloff: Falloff,
@@ -341,6 +343,7 @@ impl Default for Brush {
             kind: BrushKind::Clay,
             radius: 0.18,
             strength: 0.4,
+            spacing: 0.25,
             negative: false,
             falloff: Falloff::Smooth,
             culling: false,
@@ -529,7 +532,7 @@ impl StrokeInput {
 /// Screen-aligned by default, so the image keeps the orientation it has in the
 /// brush palette wherever on the model it lands, and turned to the direction of
 /// travel when the brush is set to follow, which is what a scratch wants.
-fn stamp_basis(b: &Brush, input: &StrokeInput) -> (Vec3, Vec3) {
+pub fn stamp_basis(b: &Brush, input: &StrokeInput) -> (Vec3, Vec3) {
     let n = input.normal.normalize_or(Vec3::Y);
     let along = if b.alpha_follow && input.drag.length_squared() > 1e-12 {
         input.drag
@@ -567,10 +570,6 @@ pub fn apply(
         return verts;
     }
 
-    // Kept as they are before anything is written, which is the whole point
-    // of it. The mesh decides whether a stroke is being recorded at all.
-    mesh.log_verts(&verts);
-
     let sign = if b.negative && b.kind.has_negative() { -1.0 } else { 1.0 };
     let inv_r = 1.0 / radius.max(1e-6);
     let amp = strength * radius * 0.25 * sign;
@@ -578,7 +577,7 @@ pub fn apply(
     // Falloff, pre-multiplied by the protection mask and by the stamp.
     let stamp = alpha.map(|a| (a, stamp_basis(b, input)));
     let masked_none = mesh.mask_is_clear();
-    let weights: Vec<f32> = verts
+    let mut weights: Vec<f32> = verts
         .par_iter()
         .map(|&v| {
             let d = mesh.pos[v as usize] - input.point;
@@ -604,6 +603,21 @@ pub fn apply(
             b.falloff.eval(t) * m * s
         })
         .collect();
+
+    // Black stamp pixels and protected vertices do not deform or paint. Do
+    // not put them into undo, normal updates, spatial refits or GPU uploads.
+    let mut kept = 0;
+    for read in 0..verts.len() {
+        if weights[read] > 0.0 {
+            verts[kept] = verts[read];
+            weights[kept] = weights[read];
+            kept += 1;
+        }
+    }
+    verts.truncate(kept);
+    weights.truncate(kept);
+    if verts.is_empty() { return verts; }
+    mesh.log_verts(&verts);
 
     match b.kind {
         BrushKind::Paint => {

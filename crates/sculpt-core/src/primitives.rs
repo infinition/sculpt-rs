@@ -102,32 +102,33 @@ pub fn icosphere(subdivisions: u32) -> Mesh {
 
 /// Latitude/longitude sphere.
 pub fn uv_sphere(segments: u32, rings: u32) -> Mesh {
-    let mut pos = Vec::new();
-    let mut faces = Vec::new();
-    for r in 0..=rings {
-        let v = r as f32 / rings as f32;
-        let phi = v * PI;
-        for s in 0..=segments {
-            let u = s as f32 / segments as f32;
-            let theta = u * TAU;
-            pos.push(Vec3::new(
-                phi.sin() * theta.cos(),
-                phi.cos(),
-                phi.sin() * theta.sin(),
-            ));
-        }
+    // Share the seam and poles by construction. Hash welding a 40M triangle
+    // sphere allocates several additional full-mesh arrays and a giant table.
+    let segments = segments.max(3);
+    let rings = rings.max(2);
+    let vertices = u64::from(segments) * u64::from(rings - 1) + 2;
+    assert!(vertices <= u32::MAX as u64, "sphere exceeds vertex index range");
+    let mut pos = Vec::with_capacity(vertices as usize);
+    pos.push(Vec3::Y);
+    let longitude: Vec<_> = (0..segments).map(|s| (s as f32 / segments as f32 * TAU).sin_cos()).collect();
+    for r in 1..rings {
+        let (sin, cos) = (r as f32 / rings as f32 * PI).sin_cos();
+        for &(z, x) in &longitude { pos.push(Vec3::new(sin * x, cos, sin * z)); }
     }
-    let stride = segments + 1;
+    let south = pos.len() as u32;
+    pos.push(-Vec3::Y);
+    let index = |r: u32, s: u32| {
+        if r == 0 { 0 } else if r == rings { south } else { 1 + (r - 1) * segments + s % segments }
+    };
+    let mut faces = Vec::with_capacity(segments as usize * (rings - 1) as usize * 2);
     for r in 0..rings {
         for s in 0..segments {
-            let a = r * stride + s;
-            let b = a + stride;
-            faces.push([a, b, a + 1]);
-            faces.push([a + 1, b, b + 1]);
+            let (a, b, c, d) = (index(r, s), index(r + 1, s), index(r, s + 1), index(r + 1, s + 1));
+            if a != c { faces.push([a, c, b]); }
+            if b != d { faces.push([c, d, b]); }
         }
     }
-    let (p, f) = weld(&pos, &faces, 1e-5);
-    Mesh::from_soup(&p, &f)
+    Mesh::from_soup(&pos, &faces)
 }
 
 /// Subdivided cube, welded along the seams.

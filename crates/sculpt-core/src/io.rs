@@ -776,6 +776,8 @@ pub fn save(mesh: &Mesh, path: &Path) -> IoResult<()> {
 pub struct NamedBrush {
     pub name: String,
     pub brush: Brush,
+    /// Optional tool label, or a portable 64x64 RGBA icon encoded as hex.
+    pub icon: Option<String>,
 }
 
 /// Extension for a saved set of brushes.
@@ -792,15 +794,23 @@ pub const BRUSH_EXTENSION: &str = "brushes";
 pub fn write_brushes(brushes: &[NamedBrush], alphas: &[String], path: &Path) -> IoResult<()> {
     let f = File::create(path).map_err(err)?;
     let mut w = BufWriter::new(f);
+    write_brushes_to(brushes, alphas, &mut w)
+}
+
+pub fn write_brushes_to(brushes: &[NamedBrush], alphas: &[String], mut w: impl Write) -> IoResult<()> {
     writeln!(w, "sculpt-brushes 1").map_err(err)?;
     for nb in brushes {
         let b = &nb.brush;
         // Names run to the end of their line and are never quoted, so a newline
         // in one would split the file. Nothing else can get in.
         writeln!(w, "brush {}", nb.name.replace(['\n', '\r'], " ")).map_err(err)?;
+        if let Some(icon) = &nb.icon {
+            writeln!(w, "  icon {}", icon.replace(['\n', '\r'], " ")).map_err(err)?;
+        }
         writeln!(w, "  kind {}", b.kind.label()).map_err(err)?;
         writeln!(w, "  radius {:.6}", b.radius).map_err(err)?;
         writeln!(w, "  strength {:.6}", b.strength).map_err(err)?;
+        writeln!(w, "  spacing {:.6}", b.spacing).map_err(err)?;
         writeln!(w, "  negative {}", b.negative).map_err(err)?;
         writeln!(w, "  falloff {}", b.falloff.label()).map_err(err)?;
         writeln!(w, "  culling {}", b.culling).map_err(err)?;
@@ -845,7 +855,10 @@ pub fn write_brushes(brushes: &[NamedBrush], alphas: &[String], path: &Path) -> 
 /// version still opens with whatever this one understands.
 pub fn read_brushes(path: &Path, alphas: &[String]) -> IoResult<Vec<NamedBrush>> {
     let f = File::open(path).map_err(err)?;
-    let reader = BufReader::new(f);
+    read_brushes_from(BufReader::new(f), alphas)
+}
+
+pub fn read_brushes_from(reader: impl BufRead, alphas: &[String]) -> IoResult<Vec<NamedBrush>> {
     let mut out: Vec<NamedBrush> = Vec::new();
     let mut current: Option<NamedBrush> = None;
 
@@ -868,6 +881,7 @@ pub fn read_brushes(path: &Path, alphas: &[String]) -> IoResult<Vec<NamedBrush>>
                 current = Some(NamedBrush {
                     name: if rest.is_empty() { "Brush".to_string() } else { rest.to_string() },
                     brush: Brush::default(),
+                    icon: None,
                 });
             }
             "end" => {
@@ -878,9 +892,10 @@ pub fn read_brushes(path: &Path, alphas: &[String]) -> IoResult<Vec<NamedBrush>>
             _ => {
                 let Some(nb) = current.as_mut() else { continue };
                 let b = &mut nb.brush;
-                let num = || rest.parse::<f32>().ok();
+                let num = || rest.parse::<f32>().ok().filter(|v| v.is_finite());
                 let flag = || matches!(rest, "true" | "1" | "yes");
                 match key {
+                    "icon" => nb.icon = Some(rest.to_string()),
                     "kind" => {
                         if let Some(k) = BrushKind::from_label(rest) {
                             b.kind = k;
@@ -888,6 +903,7 @@ pub fn read_brushes(path: &Path, alphas: &[String]) -> IoResult<Vec<NamedBrush>>
                     }
                     "radius" => b.radius = num().unwrap_or(b.radius),
                     "strength" => b.strength = num().unwrap_or(b.strength),
+                    "spacing" => b.spacing = num().unwrap_or(b.spacing).clamp(0.02, 1.0),
                     "negative" => b.negative = flag(),
                     "falloff" => {
                         if let Some(f) = Falloff::from_label(rest) {

@@ -539,6 +539,7 @@ impl Mesh {
             Some(g) => g.wants_rebuild(radius),
         };
         if rebuild {
+            self.reserve_sculpt_growth();
             self.accel = Some(Grid::build(self, crate::accel::ideal_cell(radius)));
         }
     }
@@ -552,8 +553,36 @@ impl Mesh {
     /// radius is settled before the stroke starts.
     pub fn ensure_accel_if_missing(&mut self, radius: f32) {
         if self.accel.is_none() {
+            self.reserve_sculpt_growth();
             self.accel = Some(Grid::build(self, crate::accel::ideal_cell(radius)));
         }
+    }
+
+    /// Pay for initial growth while preparing the mesh, not on the first split.
+    /// Bounded headroom avoids doubling every multi-million-element array at
+    /// once. Later exhaustion can still allocate; this is not chunked storage.
+    fn reserve_sculpt_growth(&mut self) {
+        let extra = self.sculpt_growth_headroom();
+        NORMALS_MARK.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let len = self.pos.len();
+            if scratch.0.len() < len {
+                scratch.0.resize(len, 0);
+            }
+            scratch.0.reserve_exact(extra);
+        });
+        self.pos.reserve_exact(extra);
+        self.nrm.reserve_exact(extra);
+        self.vfaces.reserve_exact(extra);
+        self.faces.reserve_exact(extra * 2);
+        self.col.reserve_exact(extra);
+        self.mask.reserve_exact(extra);
+        self.rough.reserve_exact(extra);
+        self.metal.reserve_exact(extra);
+    }
+
+    pub(crate) fn sculpt_growth_headroom(&self) -> usize {
+        (self.pos.len() / 8).clamp(16_384, 1_048_576)
     }
 
     pub fn invalidate_accel(&mut self) {
@@ -567,7 +596,7 @@ impl Mesh {
         let pb = self.pos[b as usize];
         let pc = self.pos[c as usize];
         let mid = (pa + pb + pc) / 3.0;
-        (mid, pa.distance(mid).max(pb.distance(mid)).max(pc.distance(mid)))
+        (mid, pa.distance_squared(mid).max(pb.distance_squared(mid)).max(pc.distance_squared(mid)).sqrt())
     }
 
     /// Refiles a vertex and notes the faces around it for later.
@@ -580,13 +609,17 @@ impl Mesh {
     /// core. Nothing reads a face cell in between.
     fn refile(&mut self, v: u32) {
         self.touch_vert(v);
+        // Culling bounds and face spheres change even if all vertex IDs and
+        // hash buckets stay the same (ordinary fixed-topology sculpting).
         if self.accel.is_none() {
+            if !self.fully_dirty {
+                self.dirty_faces.extend_from_slice(&self.vfaces[v as usize]);
+            }
             return;
         }
         let p = self.pos[v as usize];
-        let moved = self.accel.as_mut().map(|g| g.move_vertex(v, p)).unwrap_or(false);
-        if !moved {
-            return;
+        if let Some(g) = &mut self.accel {
+            g.move_vertex(v, p);
         }
         self.stale_faces.extend_from_slice(&self.vfaces[v as usize]);
     }
@@ -600,11 +633,11 @@ impl Mesh {
             self.stale_faces.clear();
             return;
         }
+        self.prepare_stale_faces();
         let mut stale = std::mem::take(&mut self.stale_faces);
-        stale.sort_unstable();
-        stale.dedup();
-        let n = self.faces.len() as u32;
-        stale.retain(|f| *f < n);
+        if !self.fully_dirty {
+            self.dirty_faces.extend_from_slice(&stale);
+        }
         // Where each face has ended up, worked out across the cores; the
         // filing itself is a scatter into one structure and stays here.
         let spheres: Vec<(Vec3, f32)> = stale
@@ -621,6 +654,19 @@ impl Mesh {
         self.stale_faces = stale;
     }
 
+    fn prepare_stale_faces(&mut self) {
+        if !self.stale_faces.is_sorted() {
+            if self.stale_faces.len() >= PARALLEL_MIN {
+                self.stale_faces.par_sort_unstable();
+            } else {
+                self.stale_faces.sort_unstable();
+            }
+        }
+        self.stale_faces.dedup();
+        let n = self.faces.len() as u32;
+        self.stale_faces.truncate(self.stale_faces.partition_point(|f| *f < n));
+    }
+
     /// Moves one vertex, keeping the spatial index correct.
     pub fn set_pos(&mut self, v: u32, p: Vec3) {
         self.log_vert(v);
@@ -632,12 +678,6 @@ impl Mesh {
     /// batch their writes and call this once, which is much cheaper than going
     /// through [`Mesh::set_pos`] per vertex.
     pub fn commit_moves(&mut self, moved: &[u32]) {
-        if !self.fully_dirty {
-            self.dirty_verts.extend_from_slice(moved);
-        }
-        if self.accel.is_none() {
-            return;
-        }
         for &v in moved {
             self.refile(v);
         }
@@ -1037,6 +1077,18 @@ impl Mesh {
     }
 
     pub fn update_normals(&mut self, touched: &[u32]) -> Vec<u32> {
+        self.update_normals_inner(touched, false)
+    }
+
+    /// Brush moves have already recorded incident faces through commit_moves.
+    /// Deduplicate them once, then share that list with the spatial refit.
+    pub fn update_sculpt_normals(&mut self, touched: &[u32]) -> Vec<u32> {
+        let tracked = self.accel.is_some() && !self.stale_faces.is_empty();
+        if tracked { self.prepare_stale_faces(); }
+        self.update_normals_inner(touched, tracked)
+    }
+
+    fn update_normals_inner(&mut self, touched: &[u32], tracked: bool) -> Vec<u32> {
         if touched.is_empty() {
             return Vec::new();
         }
@@ -1063,32 +1115,38 @@ impl Mesh {
         let mut set: Vec<u32> = Vec::new();
         NORMALS_MARK.with(|c| {
             let (mark, generation) = &mut *c.borrow_mut();
-            let g = generation.wrapping_add(1);
-            *generation = g;
-            if g == 0 {
+            *generation = generation.wrapping_add(1);
+            if *generation == 0 {
                 // The generation wrapped around, so a stale stamp could read
                 // as fresh. Clearing the array makes the test below sound
                 // again; the sweep is once per four billion rounds.
                 mark.fill(0);
                 *generation = 1;
-            } else if mark.len() < self.pos.len() {
+            }
+            if mark.len() < self.pos.len() {
                 mark.resize(self.pos.len(), 0);
             }
+            let g = *generation;
+            let mut insert = |v: u32| {
+                if mark[v as usize] != g {
+                    mark[v as usize] = g;
+                    set.push(v);
+                }
+            };
+            if tracked {
+                for &f in &self.stale_faces {
+                    for &v in &faces[f as usize] { insert(v); }
+                }
+            }
             for &v in touched {
-                for &f in &vfaces[v as usize] {
-                    for &x in &faces[f as usize] {
-                        let xi = x as usize;
-                        if mark[xi] != g {
-                            mark[xi] = g;
-                            set.push(x);
+                if !tracked {
+                    for &f in &vfaces[v as usize] {
+                        for &x in &faces[f as usize] {
+                            insert(x);
                         }
                     }
                 }
-                let vi = v as usize;
-                if mark[vi] != g {
-                    mark[vi] = g;
-                    set.push(v);
-                }
+                insert(v);
             }
         });
 

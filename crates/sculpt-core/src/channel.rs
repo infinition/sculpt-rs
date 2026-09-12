@@ -126,6 +126,13 @@ impl<T: Copy + PartialEq> Channel<T> {
         }
     }
 
+    /// Reserve growth without allocating a dormant attribute.
+    pub(crate) fn reserve_exact(&mut self, additional: usize) {
+        if let Some(data) = &mut self.data {
+            data.reserve_exact(additional);
+        }
+    }
+
     /// Mirrors `Vec::swap_remove`, and stays dormant if it was.
     pub fn swap_remove(&mut self, i: usize) {
         debug_assert!(i < self.len);

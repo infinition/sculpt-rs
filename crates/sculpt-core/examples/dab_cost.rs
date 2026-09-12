@@ -17,15 +17,16 @@ fn main() {
         .and_then(|a| a.parse().ok())
         .unwrap_or(8);
 
-    let mut mesh = primitives::icosphere(level);
+    let mut mesh = if std::env::args().nth(1).as_deref() == Some("40m") { primitives::uv_sphere(4096, 5121) } else { primitives::icosphere(level) };
     println!(
-        "icosphère {level}: {} sommets, {} faces",
+        "maillage: {} sommets, {} faces",
         mesh.vert_count(),
         mesh.face_count()
     );
     println!("threads rayon: {}\n", rayon::current_num_threads());
 
-    let radius = 0.12f32;
+    let radius = 0.15f32;
+    let fixed = std::env::args().any(|a| a == "fixed");
     let params = Dyntopo {
         detail: mesh.mean_edge_len() * 0.5,
         subdivide: true,
@@ -33,25 +34,25 @@ fn main() {
         max_verts: 40_000_000,
         ..Default::default()
     };
-    let b = Brush { kind: BrushKind::Draw, radius, strength: 0.6, ..Brush::default() };
+    let b = Brush { kind: BrushKind::Clay, radius, strength: 0.6, ..Brush::default() };
     let mut state = brush::StrokeState::default();
 
     mesh.ensure_accel(radius);
-    let mut totals = [0f64; 4];
+    let mut totals = [0f64; 5];
     let mut edges = 0usize;
     let mut moved = 0usize;
     const DABS: usize = 10;
 
     for i in 0..DABS {
-        let at = Vec3::new(i as f32 * 0.01, 1.0, 0.0).normalize();
+        let at = Vec3::new(i as f32 * 0.004, 0.0, 1.0).normalize();
 
         let t = Instant::now();
-        let plan = dyntopo::plan(&mesh, at, radius, &params);
+        let plan = (!fixed).then(|| dyntopo::plan(&mesh, at, radius, &params));
         totals[0] += t.elapsed().as_secs_f64() * 1000.0;
-        edges += plan.len();
+        edges += plan.as_ref().map_or(0, |p| p.len());
 
         let t = Instant::now();
-        dyntopo::apply(&mut mesh, plan, at, radius, &params);
+        if let Some(plan) = plan { dyntopo::apply(&mut mesh, plan, at, radius, &params); }
         totals[1] += t.elapsed().as_secs_f64() * 1000.0;
 
         let input = StrokeInput { point: at, normal: at, ..Default::default() };
@@ -61,10 +62,12 @@ fn main() {
         moved += touched.len();
 
         let t = Instant::now();
-        mesh.update_normals(&touched);
+        mesh.update_sculpt_normals(&touched);
         totals[3] += t.elapsed().as_secs_f64() * 1000.0;
 
+        let t = Instant::now();
         mesh.flush_refit();
+        totals[4] += t.elapsed().as_secs_f64() * 1000.0;
     }
 
     let names = [
@@ -72,6 +75,7 @@ fn main() {
         "couper et fusionner (apply)",
         "déplacer les sommets (brosse)",
         "refaire les normales",
+        "remettre les faces dans l'index",
     ];
     let total: f64 = totals.iter().sum();
     println!("{:<40} {:>9} {:>8}", "", "ms/coup", "part");
